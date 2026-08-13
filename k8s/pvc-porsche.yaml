@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: saycorn-volume
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: persistent-workspace
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: openebs-hostpath
+  volumeMode: Filesystem
+  resources:
+    requests:
+      # This workspace's full storage quota. PVC resize is not assumed.
+      storage: 250Gi

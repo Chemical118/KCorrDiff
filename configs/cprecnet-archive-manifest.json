@@ -1,0 +1,25 @@
+{
+  "dataset": "CPrecNet HSR SEOUL NON_UNI event-conditioned archive",
+  "persistent_id": "doi:10.7910/DVN/88HAIG",
+  "verified_at": "2026-08-13",
+  "verification": "all compressed MD5 values recomputed locally and matched Dataverse manifests; every target/condition pair has identical timestamp keys",
+  "unique_common_timestamps": 138236,
+  "files": [
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2020_1-2_9-12.npz", "bytes": 553679731, "md5": "6edd8f9ec236cb3b96416aac3a61dc81"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2020_1-2_9-12_cond.npz", "bytes": 563737891, "md5": "92bb88fd726fce21d952c71e35b50649"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2020_3-8.npz", "bytes": 757266491, "md5": "59b1b79bcc9f533a7bee814aeb607a37"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2020_3-8_cond.npz", "bytes": 802910117, "md5": "9532f2dbc4288728710f39a0be55088f"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2021_1-2_9-12.npz", "bytes": 422536984, "md5": "209a07c613f28091d230387bef6c40f6"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2021_1-2_9-12_cond.npz", "bytes": 455214148, "md5": "f1af388f232cf27e46048ba7f10727ef"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2021_3-8.npz", "bytes": 701977114, "md5": "96ba8a0de420fc00fdc9bbfb00f11b33"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2021_3-8_cond.npz", "bytes": 729863456, "md5": "b7b98876131ae5cbc97a0a69a018a455"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2022_1-2_9-12.npz", "bytes": 397968871, "md5": "428f6af19a4c7fff5760659b888dcc73"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2022_1-2_9-12_cond.npz", "bytes": 425850489, "md5": "79875794fae0f1b43d07782945049bfa"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2022_3-8.npz", "bytes": 685849704, "md5": "65615c378ed8c0893c4305514debed4f"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2022_3-8_cond.npz", "bytes": 688476273, "md5": "f30f707e9139b65f5461a039c6b1c838"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2023_1-2_9-12.npz", "bytes": 537742475, "md5": "a4348a9d08780de9f059e4e0c53ec581"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2023_1-2_9-12_cond.npz", "bytes": 565156505, "md5": "c594bf35a9c62a8911e26bda1eef4d80"},
+    {"source": "target", "name": "hsr_22_SEOUL_NON_UNI_2023_3-8.npz", "bytes": 936671911, "md5": "4055bc743ae490011e89c28c0fec0dc4"},
+    {"source": "condition", "name": "hsr_22_SEOUL_NON_UNI_2023_3-8_cond.npz", "bytes": 955493089, "md5": "741a301b3aae8874652502f0d9cb1cd8"}
+  ]
+}

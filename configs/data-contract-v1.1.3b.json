@@ -1,0 +1,73 @@
+{
+  "protocol_version": "v1.1.3b",
+  "research_track": "cprecnet_event_conditioned_era5_full_trajectory_oracle",
+  "radar": {
+    "archive_timezone": "Asia/Seoul",
+    "model_index_timezone": "UTC",
+    "scan_semantics": {
+      "checked_at": "2026-08-13T00:00:00+09:00",
+      "checked_by": "Codex",
+      "document": "KMA Radar Composite Data (500 m resolution, 5 min cycle) Format Information",
+      "document_creation_date": "2024-03-29",
+      "local_document_sha256": "4d46ca9d0aa0d8e6814962e1aa6a8631bda022e2afd453fada26292ee7899f86",
+      "timestamp_interpretation": "instantaneous_composite_reflectivity_observation_time",
+      "selected_accumulation_rule": "trapezoid",
+      "note": "The format calls HSR a 5-minute-cycle reflectivity composite and labels the header time as radar observation time; it is not a precipitation accumulation product."
+    },
+    "raw_format": {
+      "header_bytes": 1024,
+      "shape": [2881, 2305],
+      "dtype": "little_endian_int16",
+      "reflectivity_scale": "raw_value / 100 = dBZ",
+      "null_sentinels": [-30000, -25000],
+      "display_minimum_not_null": -20000,
+      "sample": {
+        "name": "RDR_CMP_HSR_PUB_202201020200.bin.gz",
+        "compressed_md5": "3061c906396bdc6822b83796f49d2c92",
+        "payload_bytes": 13282434,
+        "sentinel_counts": {"-30000": 3966565, "-25000": 2420801},
+        "minimum": -30000,
+        "maximum": 3999
+      }
+    },
+    "cprecnet": {
+      "dynamic_validity": false,
+      "target_mask_policy": "static_coverage_only",
+      "zero_semantics": "no_echo_or_below_10_dBZ_or_preprocessing_missingness",
+      "estimand": "event_conditioned_only"
+    },
+    "accumulation": {
+      "scan_count": 7,
+      "scan_interval_minutes": 5,
+      "a_wet_mm_per_30min": 0.1,
+      "a0_mm": 1.0
+    }
+  },
+  "geometry": {
+    "target_static_sha256": "ac919f2fdf94dee82dec801ba9cced3bced82704a78f2662139d99f84402a2ff",
+    "condition_coordinates_sha256": "7ea1d02c8136a8cf59713b5d07ccd40806ee38ca660a8c19ccfb6a6ab3693065",
+    "target_coordinates_sha256": "76ab36d56fbc6f9a626164ffe818ef5dc553b2a897a0185efb7617878a59a912",
+    "target_center_longitude_degrees_east": 127.25330141,
+    "common_position_scale_m": 100000.0
+  },
+  "era5": {
+    "role": "retrospective_oracle_upper_bound",
+    "channels": 24,
+    "native_hour_tokens": 8,
+    "grid_shape": [33, 33],
+    "tp_canonical_unit": "mm_per_1h",
+    "tp_interval": "(valid_time - 1h, valid_time]"
+  },
+  "governance": {
+    "stage0_e1_relative_margin": 0.05,
+    "stage0_e2_absolute_margin": -0.02,
+    "dispersion_margin": 0.05,
+    "residual_variance_interpretation_threshold": 0.9,
+    "fallback_mass_threshold": 0.01,
+    "deployment_training_seed": 11103,
+    "low_support_minimum_independent_event_blocks": 20,
+    "status": "defaults_recorded_from_v1.1.3b; user-requested implementation run",
+    "approved_at": "2026-08-13",
+    "approved_by": "user objective adopting KCorrDiff/docs implementation"
+  }
+}

@@ -1,0 +1,68 @@
+protocol_version: v1.1.3b
+track: cprecnet_event_conditioned_era5_full_trajectory_oracle
+
+radar:
+  timezone: Asia/Seoul
+  history_frames: 12
+  interval_minutes: 5
+  target_scans: 7
+  accumulation: trapezoid
+  a_wet_mm: 0.1
+  a0_mm: 1.0
+  cprecnet_dynamic_validity: unavailable
+
+era5:
+  provider: era5
+  provider_version: cds-era5-reanalysis
+  oracle: true
+  condition_signature: era5_oracle:era=1:tp=1:full_trajectory
+  access_mode: full_trajectory
+  native_hours: 8
+  shape: [33, 33]
+  channels: 24
+  tp_unit: mm_per_1h
+  tp_interval: left_open_right_closed
+
+geometry:
+  target_shape: [256, 256]
+  target_spacing_m: 500.0
+  context_shape: [256, 256]
+  common_position_scale_m: 100000.0
+  center_longitude_degrees_east: 127.25330141
+
+manifest:
+  leads_hours: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0]
+  boundary_embargo_hours: 7
+  event_merge_gap_hours: 12
+  event_guard_hours: 7
+  context_active_threshold_mm_h: 0.153765
+  context_active_min_pixels: 64
+  significant_component_min_pixels: 4
+  significant_component_max_threshold_mm: 1.0
+  # CPrecNet is label-selected and cannot recover a continuous-timeline
+  # estimand. Within its declared event-archive support, the target item
+  # distribution and block-balanced draw are nevertheless explicit.
+  target_distribution: event_conditioned_archive
+  split_intervals:
+    - {name: outer_train, start: "2020-01-01T00:00:00Z", end: "2022-01-01T00:00:00Z"}
+    - {name: model_selection, start: "2022-01-01T00:00:00Z", end: "2023-01-01T00:00:00Z"}
+    - {name: calibration, start: "2023-01-01T00:00:00Z", end: "2023-09-01T00:00:00Z"}
+    - {name: final_test, start: "2023-09-01T00:00:00Z", end: "2024-01-01T00:00:00Z"}
+
+sampling:
+  stage: initial_small_data
+  target_policy: eligible_items_uniform
+  draw_policy: block-balanced
+  draws: 8192
+  seed: 11103
+  purpose_id: cprecnet-event-pretraining-initial-v1
+  fold_seed: 11103
+  maximum_oof_bytes: 8589934592  # 8 GiB hard preflight ceiling
+  weight_clipping: null
+
+cache:
+  format: npy-shards-v1
+  dtype: float32
+  shard: source_archive
+  atomic_build: true
+  verify_sha256: true

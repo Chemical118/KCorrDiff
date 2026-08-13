@@ -1,0 +1,185 @@
+# Draft workload. The expected CLI contract is documented in k8s/README.md;
+# it intentionally fails its preflight until that module and full-width config
+# have been staged on the PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-benchmark-loader-fullwidth
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: loader-benchmark
+    app.kubernetes.io/instance: fullwidth-v1-1-3b
+spec:
+  # Drafts are inert even if accidentally applied. Remove this only after the
+  # CLI/config/data preconditions in README.md have been verified.
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: loader-benchmark
+        app.kubernetes.io/instance: fullwidth-v1-1-3b
+    spec:
+      serviceAccountName: kcorrdiff-porsche-trainer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: benchmark
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/KCorrDiff
+          command: ["/bin/bash", "-ceu"]
+          args:
+            - |
+              source_root=/workspace/KCorrDiff
+              config_path=${source_root}/configs/stage2-full-width.yaml
+              radar_cache_root=/workspace/data/cache/radar-v1
+              era5_cache_root=/workspace/data/cache/era5-v1
+              draw_manifest=/workspace/data/manifests/event-pretrain-initial-v1/training-draw-manifest.jsonl
+              static_path=/workspace/data/static/target_static.npz
+              run_root=/workspace/benchmarks/loader/${RUN_ID}
+              output_json=${run_root}/loader-benchmark.json
+              log_file=${run_root}/benchmark.log
+
+              install -d -m 0770 "${run_root}" "${run_root}/wandb"
+              exec > >(tee -a "${log_file}") 2>&1
+
+              test -f "${source_root}/pyproject.toml"
+              test -f "${source_root}/kcorrdiff/training/benchmark_loader.py"
+              test -f "${config_path}"
+              test -f "${radar_cache_root}/manifest.json"
+              test -f "${era5_cache_root}/manifest.json"
+              test -f "${draw_manifest}"
+              test -f "${static_path}"
+              python -c 'import numpy, scipy, torch, yaml, wandb'
+              nvidia-smi -L
+              python -c 'import torch; count = torch.cuda.device_count(); assert count == 1, f"expected exactly one visible benchmark GPU, got {count}"'
+
+              export WANDB_DIR="${run_root}/wandb"
+              export WANDB_NAME="${RUN_ID}"
+              export WANDB_RUN_ID="${RUN_ID}"
+              export WANDB_RESUME=never
+
+              exec python -m kcorrdiff.training.benchmark_loader \
+                --config "${config_path}" \
+                --radar-cache-root "${radar_cache_root}" \
+                --era5-cache-root "${era5_cache_root}" \
+                --draw-manifest "${draw_manifest}" \
+                --static-path "${static_path}" \
+                --output-json "${output_json}" \
+                --device cuda \
+                --precision float32 \
+                --disable-tf32 \
+                --target-widths 64,128,256,384,512 \
+                --context-widths 32,64,128,256,384 \
+                --era-latent-channels 128 \
+                --era-grid-size 33 \
+                --batch-sizes 1,2,4,8,16 \
+                --worker-counts 0,4,8,12,16,24 \
+                --prefetch-factors 2,4 \
+                --warmup-batches 20 \
+                --measured-batches 100 \
+                --fail-on-fallback
+          env:
+            - name: RUN_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PYTHONPATH
+              value: /workspace/KCorrDiff
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONPYCACHEPREFIX
+              value: /tmp/pycache
+            - name: TMPDIR
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/cache
+            - name: TORCH_EXTENSIONS_DIR
+              value: /tmp/torch-extensions
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NVIDIA_TF32_OVERRIDE
+              value: "0"
+            - name: KCORRDIFF_REQUIRE_FULL_WIDTH
+              value: "1"
+            - name: KCORRDIFF_REQUIRE_PRECISION
+              value: float32
+            - name: KCORRDIFF_REQUIRE_ERA_GRID_SIZE
+              value: "33"
+            - name: KCORRDIFF_ALLOW_CPU_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_PRECISION_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_ERA_GRID_FALLBACK
+              value: "0"
+            - name: WANDB_PROJECT
+              value: kcorrdiff
+            - name: WANDB_JOB_TYPE
+              value: loader-benchmark
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api
+                  key: WANDB_API_KEY
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "32"
+              memory: 96Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi

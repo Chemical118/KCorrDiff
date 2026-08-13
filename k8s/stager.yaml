@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kcorrdiff-stager
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: pvc-stager
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 10
+  nodeSelector:
+    # saycorn-volume is provisioned as a porsche-local RWO volume.
+    kubernetes.io/hostname: porsche
+  securityContext:
+    runAsUser: 1035
+    runAsGroup: 1035
+    runAsNonRoot: true
+    fsGroup: 1035
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: stager
+      image: debian:bookworm-slim
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc", "exec sleep infinity"]
+      resources:
+        requests:
+          cpu: "0"
+          memory: "0"
+          ephemeral-storage: "0"
+        limits:
+          cpu: "8"
+          memory: 24Gi
+          ephemeral-storage: 2Gi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: saycorn-volume
