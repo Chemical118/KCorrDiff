@@ -218,33 +218,37 @@ class DistributedRuntime:
         return self.rank == 0
 
     def barrier(self) -> None:
-        if self.initialized:
+        if self.initialized and self.world_size > 1:
             distributed.barrier()
 
     def reduce_sum(self, value: Tensor) -> Tensor:
         result = value.detach().clone()
-        if self.initialized:
+        if self.initialized and self.world_size > 1:
             distributed.all_reduce(result, op=distributed.ReduceOp.SUM)
         return result
 
     def reduce_max(self, value: Tensor) -> Tensor:
         result = value.detach().clone()
-        if self.initialized:
+        if self.initialized and self.world_size > 1:
             distributed.all_reduce(result, op=distributed.ReduceOp.MAX)
         return result
 
     def all_gather_objects(self, value: object) -> tuple[object, ...]:
-        if not self.initialized:
+        if not self.initialized or self.world_size == 1:
             return (value,)
         output: list[object] = [None] * self.world_size
         distributed.all_gather_object(output, value)
         return tuple(output)
 
     def broadcast_model(self, model: nn.Module) -> None:
-        if not self.initialized:
+        if not self.initialized or self.world_size == 1:
             return
-        for value in (*model.parameters(), *model.buffers()):
-            distributed.broadcast(value, src=0)
+        # Initial synchronization is state assignment, not a differentiable
+        # model operation.  Keeping it outside autograd avoids attaching a
+        # c10d::broadcast node to parameters before the first backward pass.
+        with torch.no_grad():
+            for value in (*model.parameters(), *model.buffers()):
+                distributed.broadcast(value, src=0)
 
     def close(self) -> None:
         if self.initialized and distributed.is_initialized():

@@ -512,6 +512,26 @@ def test_execution_topology_rejects_non_power_of_two_microbatch() -> None:
         )
 
 
+def test_single_rank_skips_model_broadcast_and_multi_rank_is_no_grad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    def broadcast(_value: torch.Tensor, *, src: int) -> None:
+        assert src == 0
+        calls.append(torch.is_grad_enabled())
+
+    monkeypatch.setattr(distributed, "broadcast", broadcast)
+    model = nn.Linear(2, 2)
+    single = DistributedRuntime(0, 0, 1, torch.device("cpu"), True)
+    single.broadcast_model(model)
+    assert calls == []
+
+    multi = DistributedRuntime(0, 0, 2, torch.device("cpu"), True)
+    multi.broadcast_model(model)
+    assert calls and calls == [False] * len(calls)
+
+
 def test_launch_contract_binds_loader_tuning_and_selection_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
