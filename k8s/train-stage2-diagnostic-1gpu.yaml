@@ -1,0 +1,215 @@
+# Bounded one-GPU Stage 2 regression run over every 2020 production-draw item.
+# This trains one deployment regression model for one complete epoch at B12;
+# it never publishes a complete Stage 2 release and is isolated from production.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-stage2-2020-b12-1gpu
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-regression-diagnostic
+    app.kubernetes.io/instance: year-2020-b12-1gpu-v1
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: stage2-regression-diagnostic
+        app.kubernetes.io/instance: year-2020-b12-1gpu-v1
+    spec:
+      serviceAccountName: kcorrdiff-porsche-trainer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 300
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/code/stage2-2020-b12-1gpu-v1
+          command: ["/bin/bash", "-ceu"]
+          args:
+            - |
+              source_root=/workspace/code/stage2-2020-b12-1gpu-v1
+              run_root=/workspace/runs/stage2-bounded/stage2-regression-2020-b12-1gpu-v1
+              launch_identity=${run_root}/provenance/launch-identity.json
+              log_file=${run_root}/logs/train.log
+
+              test -r /run/secrets/kcorrdiff-oof/credentials.env
+              test -r /run/secrets/kcorrdiff-oof/server.crt
+              install -d -m 0770 "${run_root}/logs" "${run_root}/wandb" \
+                "${run_root}/oof"
+              exec > >(tee -a "${log_file}") 2>&1
+
+              nvidia-smi -L
+              python -c 'import torch; assert torch.cuda.device_count() == 1'
+              if [[ ! -e "${launch_identity}" ]]; then
+                python -m kcorrdiff.training.launch_identity create \
+                  --source-root "${source_root}" \
+                  --container-image-digest sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4 \
+                  --runtime-report /workspace/envs/stage2-python-v1/pip-report.json \
+                  --data-contract "${source_root}/configs/data-contract-v1.1.3b.json" \
+                  --output "${launch_identity}"
+              fi
+              launch_identity_sha256="$(sha256sum "${launch_identity}" | awk '{print $1}')"
+              [[ "${launch_identity_sha256}" =~ ^[0-9a-f]{64}$ ]]
+              export WANDB_DIR="${run_root}/wandb"
+              export WANDB_NAME="${RUN_ID}"
+              export WANDB_RUN_ID="${RUN_ID}"
+              export WANDB_RESUME=allow
+
+              exec torchrun \
+                --standalone \
+                --nnodes=1 \
+                --nproc-per-node=1 \
+                -m kcorrdiff.training.train_stage2 \
+                --source-root "${source_root}" \
+                --config "${source_root}/configs/stage2-full-width.yaml" \
+                --launch-identity "${launch_identity}" \
+                --launch-identity-sha256 "${launch_identity_sha256}" \
+                --container-image-digest sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4 \
+                --runtime-report /workspace/envs/stage2-python-v1/pip-report.json \
+                --radar-cache-root /workspace/data/cache/radar-v1 \
+                --era5-cache-root /workspace/data/cache/era5-v1 \
+                --draw-manifest /workspace/data/manifests/event-pretrain-production-v1/training-draw-manifest.jsonl \
+                --candidate-manifest /workspace/data/manifests/event-pretrain-production-v1/candidate-manifest.json \
+                --bundle-metadata /workspace/data/manifests/event-pretrain-production-v1/bundle-metadata.json \
+                --data-contract "${source_root}/configs/data-contract-v1.1.3b.json" \
+                --static-path /workspace/data/static/target_static.npz \
+                --output-dir "${run_root}" \
+                --oof-output-dir "${run_root}/oof" \
+                --oof-remote-credentials /run/secrets/kcorrdiff-oof/credentials.env \
+                --oof-remote-ca-certificate /run/secrets/kcorrdiff-oof/server.crt \
+                --require-world-size 1 \
+                --precision float32 \
+                --disable-tf32 \
+                --target-widths 64,128,256,384,512 \
+                --context-widths 32,64,128,256,384 \
+                --era-latent-channels 128 \
+                --era-grid-size 33 \
+                --per-rank-microbatch-size 12 \
+                --gradient-accumulation-steps 1 \
+                --num-workers 12 \
+                --prefetch-factor 2 \
+                --fail-on-fallback \
+                --bounded-training-year 2020 \
+                --expected-training-items 220260 \
+                --phases deployment \
+                --roles deployment \
+                --wandb-mode online \
+                --run-id "${RUN_ID}" \
+                --storage-reserve-gib 10
+          env:
+            - name: RUN_ID
+              value: stage2-regression-2020-b12-1gpu-v1
+            - name: PYTHONPATH
+              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-2020-b12-1gpu-v1
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONPYCACHEPREFIX
+              value: /tmp/pycache
+            - name: TMPDIR
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/cache
+            - name: TORCH_EXTENSIONS_DIR
+              value: /tmp/torch-extensions
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: NCCL_DEBUG
+              value: WARN
+            - name: NVIDIA_TF32_OVERRIDE
+              value: "0"
+            - name: CUBLAS_WORKSPACE_CONFIG
+              value: ":4096:8"
+            - name: PYTHONHASHSEED
+              value: "11103"
+            - name: KCORRDIFF_REQUIRE_FULL_WIDTH
+              value: "1"
+            - name: KCORRDIFF_REQUIRE_PRECISION
+              value: float32
+            - name: KCORRDIFF_REQUIRE_ERA_GRID_SIZE
+              value: "33"
+            - name: KCORRDIFF_ALLOW_CPU_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_PRECISION_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_ERA_GRID_FALLBACK
+              value: "0"
+            - name: WANDB_PROJECT
+              value: kcorrdiff
+            - name: WANDB_JOB_TYPE
+              value: stage2-regression-2020-full-epoch
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api
+                  key: WANDB_API_KEY
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "32"
+              memory: 64Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+            - name: oof-remote
+              mountPath: /run/secrets/kcorrdiff-oof
+              readOnly: true
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi
+        - name: oof-remote
+          secret:
+            secretName: kcorrdiff-oof-remote
+            defaultMode: 0440

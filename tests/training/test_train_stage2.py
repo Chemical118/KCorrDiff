@@ -422,6 +422,8 @@ def _launch_arguments() -> SimpleNamespace:
         num_workers=12,
         prefetch_factor=2,
         max_optimizer_steps=1,
+        bounded_training_year=None,
+        expected_training_items=None,
         phases=("crossfit",),
         roles=("fold:0",),
         run_id="bounded-tune",
@@ -509,6 +511,67 @@ def test_execution_topology_rejects_non_power_of_two_microbatch() -> None:
             world_size=1,
             per_rank_microbatch_size=3,
             gradient_accumulation_steps=2,
+        )
+
+
+def test_bounded_2020_deployment_accepts_b12_without_accumulation() -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    arguments = _launch_arguments()
+    arguments.require_world_size = 1
+    arguments.per_rank_microbatch_size = 12
+    arguments.gradient_accumulation_steps = 1
+    arguments.max_optimizer_steps = None
+    arguments.phases = ("deployment",)
+    arguments.roles = ("deployment",)
+    arguments.bounded_training_year = 2020
+    arguments.expected_training_items = 220_260
+    selection = validate_launch_arguments(
+        arguments,
+        config,
+        environ={
+            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
+            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
+            "KCORRDIFF_REQUIRE_PRECISION": "float32",
+            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
+            "NVIDIA_TF32_OVERRIDE": "0",
+        },
+    )
+    execution = execution_config_for_topology(
+        config,
+        world_size=1,
+        per_rank_microbatch_size=12,
+        gradient_accumulation_steps=1,
+        allow_bounded_microbatch_override=True,
+    )
+    assert selection.partial is True
+    assert selection.bounded_training_year == 2020
+    assert execution.optimization.per_rank_microbatch_size == 12
+    assert execution.optimization.gradient_accumulation_steps == 1
+    assert execution.optimization.global_effective_batch_size == 12
+    assert execution.raw["loader_tuning"]["selected_batch_size_per_rank"] == 12
+
+
+def test_bounded_year_override_rejects_crossfit_or_accumulation() -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    arguments = _launch_arguments()
+    arguments.require_world_size = 1
+    arguments.per_rank_microbatch_size = 12
+    arguments.gradient_accumulation_steps = 1
+    arguments.bounded_training_year = 2020
+    arguments.expected_training_items = 220_260
+    with pytest.raises(ValueError, match="deployment-only"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    with pytest.raises(ValueError, match="no accumulation"):
+        execution_config_for_topology(
+            config,
+            world_size=1,
+            per_rank_microbatch_size=12,
+            gradient_accumulation_steps=2,
+            allow_bounded_microbatch_override=True,
         )
 
 

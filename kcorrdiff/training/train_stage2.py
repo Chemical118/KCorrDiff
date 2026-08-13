@@ -15,6 +15,7 @@ import argparse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 import hashlib
 import json
 import math
@@ -342,6 +343,7 @@ def execution_config_for_topology(
     world_size: int,
     per_rank_microbatch_size: int,
     gradient_accumulation_steps: int,
+    allow_bounded_microbatch_override: bool = False,
 ) -> Stage2Config:
     """Bind a CLI topology while preserving the preregistered global batch.
 
@@ -359,29 +361,60 @@ def execution_config_for_topology(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
-    if per_rank_microbatch_size & (per_rank_microbatch_size - 1):
-        raise ValueError("per-rank microbatch size must be a power of two")
-    if per_rank_microbatch_size != config.optimization.per_rank_microbatch_size:
-        raise ValueError(
-            "execution microbatch must retain the benchmark-selected value"
-        )
     observed_global = (
         world_size
         * per_rank_microbatch_size
         * gradient_accumulation_steps
     )
-    if observed_global != config.optimization.global_effective_batch_size:
-        raise ValueError(
-            "execution topology must preserve the configured global effective "
-            f"batch {config.optimization.global_effective_batch_size}; got "
-            f"{observed_global}"
+    if allow_bounded_microbatch_override:
+        if world_size != 1 or gradient_accumulation_steps != 1:
+            raise ValueError(
+                "bounded microbatch override requires one GPU and no accumulation"
+            )
+        # The immutable production selection remains B8/global16.  A bounded,
+        # non-publishable year run may use an explicitly requested diagnostic
+        # B (including B12), and records the resulting topology in its partial
+        # manifest/checkpoint provenance.  Mirror the typed override in raw so
+        # loader validation and W&B config report the actual execution.
+        execution_raw = json.loads(json.dumps(config.raw))
+        execution_optimization = _mapping(
+            execution_raw.get("optimization"), name="execution optimization"
         )
+        execution_optimization["per_rank_microbatch_size"] = (
+            per_rank_microbatch_size
+        )
+        execution_optimization["gradient_accumulation_steps"] = (
+            gradient_accumulation_steps
+        )
+        execution_optimization["global_effective_batch_size"] = observed_global
+        execution_loader = _mapping(
+            execution_raw.get("loader_tuning"), name="execution loader tuning"
+        )
+        execution_loader["selected_batch_size_per_rank"] = (
+            per_rank_microbatch_size
+        )
+    else:
+        if per_rank_microbatch_size & (per_rank_microbatch_size - 1):
+            raise ValueError("per-rank microbatch size must be a power of two")
+        if per_rank_microbatch_size != config.optimization.per_rank_microbatch_size:
+            raise ValueError(
+                "execution microbatch must retain the benchmark-selected value"
+            )
+        if observed_global != config.optimization.global_effective_batch_size:
+            raise ValueError(
+                "execution topology must preserve the configured global effective "
+                f"batch {config.optimization.global_effective_batch_size}; got "
+                f"{observed_global}"
+            )
+        execution_raw = config.raw
     result = replace(
         config,
+        raw=execution_raw,
         optimization=replace(
             config.optimization,
             per_rank_microbatch_size=per_rank_microbatch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            global_effective_batch_size=observed_global,
         ),
     )
     result.validate_topology(world_size=world_size)
@@ -514,6 +547,8 @@ class RunSelection:
     phases: tuple[str, ...]
     roles: tuple[str, ...]
     max_optimizer_steps: int | None
+    bounded_training_year: int | None = None
+    expected_training_items: int | None = None
 
     def __post_init__(self) -> None:
         unknown_phases = sorted(set(self.phases) - set(_ALL_PHASES))
@@ -549,6 +584,24 @@ class RunSelection:
             or self.max_optimizer_steps <= 0
         ):
             raise ValueError("max_optimizer_steps must be a positive integer")
+        if (self.bounded_training_year is None) != (
+            self.expected_training_items is None
+        ):
+            raise ValueError(
+                "bounded training year and expected item count are required together"
+            )
+        if self.bounded_training_year is not None:
+            if (
+                isinstance(self.bounded_training_year, bool)
+                or not 1970 <= self.bounded_training_year <= 9999
+            ):
+                raise ValueError("bounded training year is invalid")
+            if (
+                isinstance(self.expected_training_items, bool)
+                or not isinstance(self.expected_training_items, int)
+                or self.expected_training_items <= 0
+            ):
+                raise ValueError("expected bounded training items must be positive")
 
     @property
     def partial(self) -> bool:
@@ -556,6 +609,7 @@ class RunSelection:
             self.max_optimizer_steps is not None
             or self.phases != _ALL_PHASES
             or bool(self.roles)
+            or self.bounded_training_year is not None
         )
 
     def includes_role(self, role: str, fold_id: int | None = None) -> bool:
@@ -583,6 +637,73 @@ def _selected_training_role_count(
         if phase in selection.phases and selection.includes_role(role):
             count += 1
     return count
+
+
+def _bounded_training_year_factory(
+    factory: KCorrDiffDataFactory,
+    *,
+    year: int,
+    expected_items: int,
+) -> KCorrDiffDataFactory:
+    """Select one UTC issue year without mutating the immutable source bundle.
+
+    The production manifest is fully validated first.  The derived rows are
+    then re-indexed only for the bounded training plan; the semantic digest
+    binds every original manifest position and sample identity so this subset
+    cannot be mistaken for the source draw or a complete Stage 2 release.
+    """
+
+    selected: list[tuple[int, DrawRow]] = []
+    for original_position, row in enumerate(factory.artifacts.rows):
+        issue_time = datetime.fromisoformat(row.t0_utc)
+        if issue_time.tzinfo is None or issue_time.utcoffset() is None:
+            raise ValueError("draw row t0 must be timezone-aware")
+        if issue_time.astimezone(UTC).year == year:
+            selected.append((original_position, row))
+    if len(selected) != expected_items:
+        raise ValueError(
+            "bounded training year item count mismatch: "
+            f"expected {expected_items}, found {len(selected)}"
+        )
+    if not selected:
+        raise ValueError("bounded training year selected no rows")
+
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "format_version": "kcorrdiff.bounded-training-subset.v1",
+                "source_draw_manifest_sha256": (
+                    factory.artifacts.artifact_hashes["draw_manifest"]
+                ),
+                "utc_issue_year": year,
+                "items": len(selected),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    rows: list[DrawRow] = []
+    for derived_position, (original_position, row) in enumerate(selected):
+        digest.update(b"\n")
+        digest.update(str(original_position).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(row.sample_id.encode("utf-8"))
+        rows.append(replace(row, global_example_index=derived_position))
+
+    artifact_hashes = dict(factory.artifacts.artifact_hashes)
+    artifact_hashes["bounded_training_subset"] = digest.hexdigest()
+    artifacts = replace(
+        factory.artifacts,
+        rows=tuple(rows),
+        artifact_hashes=artifact_hashes,
+    )
+    return KCorrDiffDataFactory(
+        factory.config,
+        factory.inputs,
+        artifacts,
+        dependencies=factory.dependencies,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2722,6 +2843,8 @@ def run_stage2(
                 "phases": list(selection.phases),
                 "roles": list(selection.roles),
                 "max_optimizer_steps": selection.max_optimizer_steps,
+                "bounded_training_year": selection.bounded_training_year,
+                "expected_training_items": selection.expected_training_items,
             },
             "config_sha256": config.sha256,
             "launch_identity": launch_identity.provenance(),
@@ -2837,6 +2960,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fail-on-fallback", action="store_true")
     parser.add_argument("--verify-cache-hashes", action="store_true")
     parser.add_argument("--max-optimizer-steps", type=int)
+    parser.add_argument("--bounded-training-year", type=int)
+    parser.add_argument("--expected-training-items", type=int)
     parser.add_argument("--phases", type=_csv, default=_ALL_PHASES)
     parser.add_argument("--roles", type=_csv, default=())
     parser.add_argument(
@@ -2900,11 +3025,31 @@ def validate_launch_arguments(
         raise ValueError("Stage 2 config must be the source-tree production config")
     if arguments.data_contract.resolve() != source_root / "configs/data-contract-v1.1.3b.json":
         raise ValueError("Stage 2 data contract must be the source-tree contract")
+    selection = RunSelection(
+        phases=tuple(arguments.phases),
+        roles=tuple(arguments.roles),
+        max_optimizer_steps=arguments.max_optimizer_steps,
+        bounded_training_year=arguments.bounded_training_year,
+        expected_training_items=arguments.expected_training_items,
+    )
+    bounded_year_run = selection.bounded_training_year is not None
+    if bounded_year_run and (
+        selection.phases != ("deployment",)
+        or selection.roles != ("deployment",)
+        or selection.max_optimizer_steps is not None
+        or arguments.require_world_size != 1
+        or arguments.gradient_accumulation_steps != 1
+    ):
+        raise ValueError(
+            "bounded year run requires deployment-only, one GPU, no accumulation, "
+            "and no optimizer-step truncation"
+        )
     execution_config_for_topology(
         config,
         world_size=arguments.require_world_size,
         per_rank_microbatch_size=arguments.per_rank_microbatch_size,
         gradient_accumulation_steps=arguments.gradient_accumulation_steps,
+        allow_bounded_microbatch_override=bounded_year_run,
     )
     if arguments.precision != "float32" or arguments.precision != config.runtime.precision:
         raise ValueError("Stage 2 precision must remain config-bound float32")
@@ -2920,6 +3065,8 @@ def validate_launch_arguments(
         "per_rank_microbatch_size": config.optimization.per_rank_microbatch_size,
     }
     for name, value in expected.items():
+        if name == "per_rank_microbatch_size" and bounded_year_run:
+            continue
         actual = getattr(arguments, name)
         if isinstance(value, tuple):
             actual = tuple(actual)
@@ -2992,11 +3139,7 @@ def validate_launch_arguments(
         raise ValueError("--max-optimizer-steps must be explicitly positive")
     if not arguments.run_id:
         raise ValueError("run ID is required via --run-id/WANDB_RUN_ID/RUN_ID")
-    return RunSelection(
-        phases=tuple(arguments.phases),
-        roles=tuple(arguments.roles),
-        max_optimizer_steps=arguments.max_optimizer_steps,
-    )
+    return selection
 
 
 def _factory_inputs_from_arguments(
@@ -3050,6 +3193,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         world_size=arguments.require_world_size,
         per_rank_microbatch_size=arguments.per_rank_microbatch_size,
         gradient_accumulation_steps=arguments.gradient_accumulation_steps,
+        allow_bounded_microbatch_override=(
+            selection.bounded_training_year is not None
+        ),
     )
     launch_identity = load_stage2_launch_identity(
         arguments.launch_identity,
@@ -3075,6 +3221,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError("ranks observed different immutable launch identities")
         inputs = _factory_inputs_from_arguments(arguments, config)
         factory = build_data_factory(config, inputs)
+        if selection.bounded_training_year is not None:
+            assert selection.expected_training_items is not None
+            factory = _bounded_training_year_factory(
+                factory,
+                year=selection.bounded_training_year,
+                expected_items=selection.expected_training_items,
+            )
         loader_tuning = _mapping(
             config.raw.get("loader_tuning"), name="loader tuning config"
         )
