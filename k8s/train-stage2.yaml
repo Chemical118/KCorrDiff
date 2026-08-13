@@ -1,5 +1,5 @@
-# Future Stage 2 full-width regression/OOF training workload. See README.md for
-# the expected (not yet implemented) module and config contract.
+# Suspended Stage 2 full-width regression/OOF production workload.  Publish and
+# normalize the immutable production bundle before explicitly unsuspending it.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -46,20 +46,29 @@ spec:
           command: ["/bin/bash", "-ceu"]
           args:
             - |
-              source_root=/workspace/KCorrDiff
+              # Immutable source snapshot; never repoint this path during a run.
+              source_root=/workspace/code/stage2-production-v1
               config_path=${source_root}/configs/stage2-full-width.yaml
               radar_cache_root=/workspace/data/cache/radar-v1
               era5_cache_root=/workspace/data/cache/era5-v1
-              draw_manifest=/workspace/data/manifests/event-pretrain-initial-v1/training-draw-manifest.jsonl
+              draw_manifest=/workspace/data/manifests/event-pretrain-production-v1/training-draw-manifest.jsonl
+              candidate_manifest=/workspace/data/manifests/event-pretrain-production-v1/candidate-manifest.json
+              bundle_metadata=/workspace/data/manifests/event-pretrain-production-v1/bundle-metadata.json
+              data_contract=${source_root}/configs/data-contract-v1.1.3b.json
               static_path=/workspace/data/static/target_static.npz
               run_root=/workspace/runs/stage2/${RUN_ID}
-              checkpoint_dir=${run_root}/checkpoints
               oof_output_dir=${run_root}/oof
               log_file=${run_root}/train.log
+              provenance_dir=${run_root}/provenance
+              launch_identity=${provenance_dir}/launch-identity.json
+              runtime_report=/workspace/envs/stage2-python-v1/pip-report.json
+              container_image_digest=sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+              oof_remote_credentials=/run/secrets/kcorrdiff-oof/credentials.env
+              oof_remote_ca=/run/secrets/kcorrdiff-oof/server.crt
 
               install -d -m 0770 \
-                "${checkpoint_dir}" "${oof_output_dir}" \
-                "${run_root}/logs" "${run_root}/wandb"
+                "${run_root}/checkpoints" "${oof_output_dir}" \
+                "${run_root}/logs" "${run_root}/wandb" "${provenance_dir}"
               exec > >(tee -a "${log_file}") 2>&1
 
               test -f "${source_root}/pyproject.toml"
@@ -68,7 +77,12 @@ spec:
               test -f "${radar_cache_root}/manifest.json"
               test -f "${era5_cache_root}/manifest.json"
               test -f "${draw_manifest}"
+              test -f "${candidate_manifest}"
+              test -f "${bundle_metadata}"
+              test -f "${data_contract}"
               test -f "${static_path}"
+              test -r "${oof_remote_credentials}"
+              test -r "${oof_remote_ca}"
               python -c 'import numpy, scipy, torch, yaml, wandb'
               nvidia-smi -L
               python -c 'import torch; count = torch.cuda.device_count(); assert count == 2, f"expected exactly two visible training GPUs, got {count}"'
@@ -76,20 +90,41 @@ spec:
               export WANDB_DIR="${run_root}/wandb"
               export WANDB_NAME="${RUN_ID}"
               export WANDB_RUN_ID="${RUN_ID}"
-              export WANDB_RESUME=never
+              if [[ ! -e "${launch_identity}" ]]; then
+                python -m kcorrdiff.training.launch_identity create \
+                  --source-root "${source_root}" \
+                  --container-image-digest "${container_image_digest}" \
+                  --runtime-report "${runtime_report}" \
+                  --data-contract "${data_contract}" \
+                  --output "${launch_identity}"
+              fi
+              launch_identity_sha256="$(sha256sum "${launch_identity}" | awk '{print $1}')"
+              [[ "${launch_identity_sha256}" =~ ^[0-9a-f]{64}$ ]]
+
+              export WANDB_RESUME=allow
 
               exec torchrun \
                 --standalone \
                 --nnodes=1 \
                 --nproc-per-node=2 \
                 -m kcorrdiff.training.train_stage2 \
+                --source-root "${source_root}" \
                 --config "${config_path}" \
+                --launch-identity "${launch_identity}" \
+                --launch-identity-sha256 "${launch_identity_sha256}" \
+                --container-image-digest "${container_image_digest}" \
+                --runtime-report "${runtime_report}" \
                 --radar-cache-root "${radar_cache_root}" \
                 --era5-cache-root "${era5_cache_root}" \
                 --draw-manifest "${draw_manifest}" \
+                --candidate-manifest "${candidate_manifest}" \
+                --bundle-metadata "${bundle_metadata}" \
+                --data-contract "${data_contract}" \
                 --static-path "${static_path}" \
-                --output-dir "${checkpoint_dir}" \
+                --output-dir "${run_root}" \
                 --oof-output-dir "${oof_output_dir}" \
+                --oof-remote-credentials "${oof_remote_credentials}" \
+                --oof-remote-ca-certificate "${oof_remote_ca}" \
                 --require-world-size 2 \
                 --precision float32 \
                 --disable-tf32 \
@@ -97,18 +132,19 @@ spec:
                 --context-widths 32,64,128,256,384 \
                 --era-latent-channels 128 \
                 --era-grid-size 33 \
-                --per-rank-microbatch-size 1 \
-                --gradient-accumulation-steps 4 \
+                --per-rank-microbatch-size 8 \
+                --gradient-accumulation-steps 1 \
                 --num-workers 12 \
-                --prefetch-factor 4 \
-                --fail-on-fallback
+                --prefetch-factor 2 \
+                --fail-on-fallback \
+                --wandb-mode online \
+                --run-id "${RUN_ID}" \
+                --storage-reserve-gib 10
           env:
             - name: RUN_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
+              value: stage2-fullwidth-production-v1
             - name: PYTHONPATH
-              value: /workspace/KCorrDiff
+              value: /workspace/envs/stage2-python-v1:/workspace/KCorrDiff
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -168,7 +204,7 @@ spec:
               nvidia.com/gpu: 2
             limits:
               cpu: "32"
-              memory: 128Gi
+              memory: 104Gi
               ephemeral-storage: 8Gi
               nvidia.com/gpu: 2
           securityContext:
@@ -185,6 +221,9 @@ spec:
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
+            - name: oof-remote
+              mountPath: /run/secrets/kcorrdiff-oof
+              readOnly: true
       volumes:
         - name: workspace
           persistentVolumeClaim:
@@ -196,3 +235,7 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 8Gi
+        - name: oof-remote
+          secret:
+            secretName: kcorrdiff-oof-remote
+            defaultMode: 0440

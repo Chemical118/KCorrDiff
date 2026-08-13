@@ -130,3 +130,51 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
 - ERA5 mmap 6년 shard SHA-256, all-hour mask 및 raw GRIB 36시각 bitwise parity
 - 실제 NON_UNI 좌표에서 sparse regrid affine reproduction 최대 오차
   `7.11e-14`
+
+## Stage 2 — full-width regression/cross-fit/OOF 구현 및 학습 준비
+
+### 모델과 학습 경계
+
+- Target/Context temporal encoder, ERA encoder, physical cross-attention,
+  causal advection, hurdle occurrence/positive-amount regression과 direct
+  physical mean/q50 arm을 원 설계 폭 그대로 구현했다. Production hurdle
+  system은 62,008,276 trainable FP32 parameter이며 TF32와 모든 width/grid/
+  precision fallback을 금지한다.
+- 3-fold grouped cross-fit, deployment/direct checkpoint, exact global weighted
+  SUM gradient, rank padding, atomic resume/RNG, OOF inference, residual scale과
+  complete manifest를 하나의 two-rank orchestration으로 묶었다. Future target
+  validity와 label은 loss/target 경계 밖으로 나오지 않는다.
+- A100-40GB에서 2의 제곱 batch만 검사했다. B=8/rank, workers=12,
+  prefetch=2를 선택했고 B=16은 fit하지만 global batch와 memory headroom 때문에
+  채택하지 않았으며 B=32는 OOM으로 거부됐다. B=8 full-width 32-step endurance는
+  5.72 sample/s, peak allocated/reserved 18.68/21.21 GB로 fallback 없이 끝났고
+  W&B run은 `kcorrdiff-stage2-b8-endurance-20260813-1`이다.
+
+### Production draw와 OOF 저장
+
+- 초기 8,192 draw를 최종 학습으로 오인하지 않도록 outer-train 431,400 item을
+  seed 11103 hash shuffle로 정확히 한 번 방문하는 no-replacement production
+  bundle을 별도 게시했다. Condition signature는 label과 독립적으로 frozen
+  50/25/25 정책(ERA+tp / ERA tp-off / whole-ERA null)에서 하나를 선택한다.
+- Production candidate/draw/bundle SHA-256은 각각 `4f3210…0566`,
+  `839071…03c`, `c09ed5…b2de`다. Train-only normalization은 전체 cache payload
+  hash를 다시 검증한 artifact만 production factory가 수용한다.
+- 431,400개의 두 FP32 OOF field 논리 크기는 226,177,843,200 byte다. Shard는
+  bitwise-lossless byte-shuffle+DEFLATE로 기록하고 총 compressed cap/ratio를
+  계속 강제한다. PVC는 hot tier로 쓰되 OOF 뒤 checkpoint까지 고려해 14 GiB를
+  남긴다. 임계점에서는 oldest sealed shard 하나를 인증된 1047 HTTPS 서버로
+  전송하고, 전체 GET SHA-256이 일치한 durable receipt 뒤에만 로컬 파일을 지운다.
+  Stage 3는 원격 shard 하나만 bounded cache에 받아 검증·복원 후 즉시 지운다.
+- 실제 porsche→1047 smoke에서 OOF v3 upload/read-back/local-delete/re-download와
+  uint32 bit-pattern equality를 확인했다. 비밀번호는 git/YAML에 넣지 않고
+  `.env`와 CA를 `kcorrdiff-oof-remote` Kubernetes Secret으로 0440 mount한다.
+
+### 현재 검증과 실행 상태
+
+- 전체 repository suite: `464 passed, 7 skipped`(CUDA/pin allocator host-only skip)
+- OOF/remote/Stage 3 lazy reader 집중 회귀, compile, `git diff --check`, 모든
+  Stage 2/3 YAML parse와 embedded bash `bash -n`, Kubernetes client/server dry-run 통과
+- porsche A100 1개는 `porsche-gpu-0`이 계속 확보하고 있고 두 번째 shell은 Pending이다.
+  현재 node의 8 GPU가 모두 할당되어 정식 exact 2-GPU Job은 아직 스케줄할 수 없다.
+  실측 기반 Stage 2 순수 학습 예상은 2 GPU 약 52시간, 1 GPU 환산 약 105시간이며
+  OOF inference/compression/overflow 시간이 추가된다.

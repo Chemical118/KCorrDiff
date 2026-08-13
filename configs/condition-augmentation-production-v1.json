@@ -1,0 +1,26 @@
+{
+  "entries": [
+    {
+      "condition_signature": "era5_oracle:era=1:tp=0:full_trajectory",
+      "draw_probability": 0.25,
+      "target_probability": 0.25
+    },
+    {
+      "condition_signature": "era5_oracle:era=1:tp=1:full_trajectory",
+      "draw_probability": 0.5,
+      "target_probability": 0.5
+    },
+    {
+      "condition_signature": "null_provider:era=0:tp=0:no_era_access",
+      "draw_probability": 0.25,
+      "target_probability": 0.25
+    }
+  ],
+  "format_version": "kcorrdiff.condition-augmentation-policy.v1",
+  "policy_id": "era5-full-dropout-50-25-25-v1",
+  "protocol_version": "v1.1.3b",
+  "selection_order": "base_sample_then_one_condition_signature",
+  "source_condition_signature": "era5_oracle:era=1:tp=1:full_trajectory",
+  "temporal_access_strategy": "matched_arm",
+  "weight_clipping": null
+}

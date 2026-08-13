@@ -1,0 +1,101 @@
+# Disposable single-GPU shell for CUDA correctness and memory probes when two
+# GPUs are not simultaneously available. Persistent artifacts stay on the
+# porsche-local PVC; delete this Pod immediately after the bounded probe.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kcorrdiff-gpu-probe
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: gpu-correctness-probe
+spec:
+  serviceAccountName: kcorrdiff-porsche-trainer
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 30
+  nodeSelector:
+    kubernetes.io/hostname: porsche
+  securityContext:
+    runAsUser: 1035
+    runAsGroup: 1035
+    runAsNonRoot: true
+    fsGroup: 1035
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: shell
+      image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+      imagePullPolicy: IfNotPresent
+      workingDir: /workspace/KCorrDiff
+      command: ["/bin/bash", "-lc", "exec sleep infinity"]
+      env:
+        - name: PYTHONPATH
+          value: /workspace/envs/stage2-python-v1:/workspace/KCorrDiff
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: PYTHONPYCACHEPREFIX
+          value: /tmp/pycache
+        - name: TMPDIR
+          value: /tmp
+        - name: XDG_CACHE_HOME
+          value: /tmp/cache
+        - name: TORCH_EXTENSIONS_DIR
+          value: /tmp/torch-extensions
+        - name: TORCHINDUCTOR_CACHE_DIR
+          value: /tmp/torchinductor
+        - name: TRITON_CACHE_DIR
+          value: /tmp/triton
+        - name: NVIDIA_TF32_OVERRIDE
+          value: "0"
+        - name: WANDB_PROJECT
+          value: kcorrdiff
+        - name: WANDB_JOB_TYPE
+          value: stage2-fullwidth-model-probe
+        - name: WANDB_MODE
+          value: online
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api
+              key: WANDB_API_KEY
+      resources:
+        requests:
+          cpu: "0"
+          memory: "0"
+          ephemeral-storage: "0"
+          nvidia.com/gpu: 1
+        limits:
+          cpu: "32"
+          memory: 96Gi
+          ephemeral-storage: 10Gi
+          nvidia.com/gpu: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: dshm
+          mountPath: /dev/shm
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: saycorn-volume
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+    - name: tmp
+      emptyDir:
+        sizeLimit: 10Gi

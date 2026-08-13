@@ -1,0 +1,1 @@
+"""Focused model-contract tests."""

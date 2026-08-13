@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Sequence, TypeAlias
+from typing import Literal, Sequence, TypeAlias, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+import torch
 
 from .radar_values import (
     A0_MM,
@@ -45,6 +46,73 @@ class AccumulationTarget:
     wet: NDArray[np.bool_]
     z: NDArray[np.float64]
     valid_mask: NDArray[np.bool_]
+
+
+@overload
+def trapezoidal_accumulation_mm(
+    rain_rate_mm_per_hour: NDArray[np.generic], *, time_axis: int = 0
+) -> NDArray[np.generic]: ...
+
+
+@overload
+def trapezoidal_accumulation_mm(
+    rain_rate_mm_per_hour: torch.Tensor, *, time_axis: int = 0
+) -> torch.Tensor: ...
+
+
+def trapezoidal_accumulation_mm(
+    rain_rate_mm_per_hour: NDArray[np.generic] | torch.Tensor,
+    *,
+    time_axis: int = 0,
+) -> NDArray[np.generic] | torch.Tensor:
+    """Integrate exactly seven instantaneous rates with the frozen rule.
+
+    This is the common numerical primitive used by observed targets and by
+    causal-advection baselines.  It deliberately performs no censoring or
+    validity renormalization: callers apply their own all-seven-scans mask and
+    the common wet threshold after integration.
+
+    NumPy and Torch inputs retain their backend, device, and floating dtype.
+    Integer and non-floating inputs are rejected so an accidental unit/count
+    tensor cannot silently truncate the half endpoint weights.
+    """
+
+    if isinstance(rain_rate_mm_per_hour, torch.Tensor):
+        values = rain_rate_mm_per_hour
+        if values.ndim == 0:
+            raise ValueError("rain rates must have a seven-scan time axis")
+        if not values.is_floating_point():
+            raise TypeError("rain rates must use a floating Torch dtype")
+        if not -values.ndim <= time_axis < values.ndim:
+            raise ValueError("time_axis is outside the rain-rate tensor")
+        axis = time_axis % values.ndim
+        if values.shape[axis] != TARGET_SCAN_COUNT:
+            raise ValueError(
+                f"time axis must contain exactly {TARGET_SCAN_COUNT} scans"
+            )
+        moved = values.movedim(axis, 0)
+        weights = values.new_tensor(TRAPEZOID_WEIGHTS).reshape(
+            TARGET_SCAN_COUNT, *((1,) * (moved.ndim - 1))
+        )
+        return SCAN_INTERVAL_HOURS * torch.sum(moved * weights, dim=0)
+
+    values = np.asarray(rain_rate_mm_per_hour)
+    if values.ndim == 0:
+        raise ValueError("rain rates must have a seven-scan time axis")
+    if not np.issubdtype(values.dtype, np.floating):
+        raise TypeError("rain rates must use a floating NumPy dtype")
+    if not -values.ndim <= time_axis < values.ndim:
+        raise ValueError("time_axis is outside the rain-rate array")
+    axis = time_axis % values.ndim
+    if values.shape[axis] != TARGET_SCAN_COUNT:
+        raise ValueError(
+            f"time axis must contain exactly {TARGET_SCAN_COUNT} scans"
+        )
+    moved = np.moveaxis(values, axis, 0)
+    weights = TRAPEZOID_WEIGHTS.astype(values.dtype, copy=False).reshape(
+        TARGET_SCAN_COUNT, *((1,) * (moved.ndim - 1))
+    )
+    return np.asarray(SCAN_INTERVAL_HOURS * np.sum(moved * weights, axis=0))
 
 
 def _scan_sequence(scans: Sequence[Scan] | NDArray[np.generic]) -> tuple[Scan, ...]:
@@ -183,9 +251,7 @@ def build_accumulation_target(
         rain_rate = np.where(validity, raw_stack, 0.0)
 
     target_valid = np.asarray(coverage & np.all(validity, axis=0), dtype=np.bool_)
-    accumulated = SCAN_INTERVAL_HOURS * np.tensordot(
-        TRAPEZOID_WEIGHTS, rain_rate, axes=(0, 0)
-    )
+    accumulated = trapezoidal_accumulation_mm(rain_rate, time_axis=0)
     # A partially accumulated invalid pixel must not masquerade as a target.
     accumulated = np.where(target_valid, accumulated, 0.0)
     censored = censor_accumulation(
@@ -208,4 +274,5 @@ __all__ = [
     "InputEncoding",
     "MissingTimestampError",
     "build_accumulation_target",
+    "trapezoidal_accumulation_mm",
 ]

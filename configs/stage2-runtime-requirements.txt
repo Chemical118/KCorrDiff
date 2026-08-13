@@ -1,0 +1,5 @@
+# Top-level runtime layer pinned for the immutable PyTorch 2.13/CUDA 12.6 image.
+# pip-report.json inside the published directory records every resolved
+# transitive wheel, version, URL, and hash.
+scipy==1.18.0
+wandb==0.28.2

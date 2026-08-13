@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -264,6 +264,54 @@ def test_era5_window_values_times_masks_presence_and_provenance_are_wired() -> N
     assert era.lead_hours == sample.conditions.lead_hours
     assert era.provenance.provider_id == "era5"
     assert era.provenance.condition_signature == era.condition_signature
+
+
+def test_row_level_tp_and_whole_source_dropout_drive_distinct_presence_masks() -> None:
+    tp_off = "era5_oracle:era=1:tp=0:full_trajectory"
+    null = "null_provider:era=0:tp=0:no_era_access"
+    base = direct_row()
+    rows_override = [
+        base,
+        replace(
+            base,
+            global_example_index=1,
+            sample_id="tp-off",
+            condition_signature=tp_off,
+        ),
+        replace(
+            base,
+            global_example_index=2,
+            sample_id="era-null",
+            condition_signature=null,
+        ),
+    ]
+    era_cache = RecordingEra5Cache()
+    dataset = make_dataset(
+        era5_cache=era_cache,
+        rows_override=rows_override,
+    )
+
+    full_sample, tp_off_sample, null_sample = (
+        dataset[index] for index in range(3)
+    )
+    assert full_sample.conditions.era5.era_present is True
+    assert full_sample.conditions.era5.tp_present is True
+    assert tp_off_sample.conditions.era5.era_present is True
+    assert tp_off_sample.conditions.era5.tp_present is False
+    assert null_sample.conditions.era5.era_present is False
+    assert null_sample.conditions.era5.tp_present is False
+    np.testing.assert_array_equal(
+        tp_off_sample.conditions.era5.values[:, -1], 0.0
+    )
+    np.testing.assert_array_equal(null_sample.conditions.era5.values, 0.0)
+    np.testing.assert_array_equal(
+        null_sample.conditions.era5.temporal_access_mask, False
+    )
+    assert [call[2].key for call in era_cache.calls] == [
+        base.condition_signature,
+        tp_off,
+        null,
+    ]
 
 
 def test_era_provenance_signature_mismatch_fails_closed() -> None:

@@ -1,0 +1,24 @@
+{
+  "decision_status": "frozen_before_condition_dropout_training_or_validation",
+  "format_version": "kcorrdiff.condition-augmentation-preregistration.v1",
+  "policy_file": "condition-augmentation-production-v1.json",
+  "policy_file_sha256": "680af4db862f21c8b71c5862e5ba522731b8182c525e9963426f85849c35e243",
+  "policy_semantic_sha256": "813d7395ac59897a7a258ed07205fff289c262b7e8df93cd2cef4deeace9c9f8",
+  "production_sampling": {
+    "draw_policy": "full-coverage-shuffled",
+    "expected_outer_train_base_candidates": 431400,
+    "planned_epochs": 1,
+    "replacement": false,
+    "seed": 11103,
+    "source_draw_purpose_id": "cprecnet-event-production-full-coverage-v1",
+    "signature_purpose_id": "cprecnet-event-production-condition-signature-v1"
+  },
+  "protocol_version": "v1.1.3b",
+  "rationale": {
+    "era5_full_trajectory": "retain the matched official whole-trajectory ERA arm at 0.50",
+    "era5_tp_dropout": "train a separate same-provider whole-trajectory tp-off state at 0.25",
+    "null_provider": "train whole-source ERA absence as the canonical radar-only state at 0.25",
+    "temporal_access": "do not mix the target-end-causal arm into this matched-arm production run"
+  },
+  "target_or_validation_label_fields_used": []
+}

@@ -1,0 +1,91 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-build-stage2-env-v1
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-runtime-environment
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: stage2-runtime-environment
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: builder
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/KCorrDiff
+          command: ["/bin/bash", "-ceu"]
+          args:
+            - |
+              destination=/workspace/envs/stage2-python-v1
+              temporary=/workspace/envs/.stage2-python-v1.incomplete
+              requirements=/workspace/KCorrDiff/configs/stage2-runtime-requirements.txt
+
+              test -f "${requirements}"
+              test ! -e "${destination}"
+              test ! -e "${temporary}"
+              install -d -m 0770 "${temporary}"
+              python -m pip install \
+                --no-cache-dir --no-deps --target "${temporary}" scipy==1.18.0
+              python -m pip install \
+                --no-cache-dir --target "${temporary}" \
+                --report "${temporary}/pip-report.json" wandb==0.28.2
+              PYTHONPATH="${temporary}:/workspace/KCorrDiff" python -c \
+                'import numpy, scipy, torch, wandb; assert scipy.__version__ == "1.18.0"; assert wandb.__version__ == "0.28.2"'
+              chmod -R a-w "${temporary}"
+              mv "${temporary}" "${destination}"
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PIP_DISABLE_PIP_VERSION_CHECK
+              value: "1"
+            - name: TMPDIR
+              value: /tmp
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+            limits:
+              cpu: "8"
+              memory: 16Gi
+              ephemeral-storage: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi

@@ -57,7 +57,9 @@ sampling:
   seed: 11103
   purpose_id: cprecnet-event-pretraining-initial-v1
   fold_seed: 11103
-  maximum_oof_bytes: 8589934592  # 8 GiB hard preflight ceiling
+  # Full 431,400-row logical FP32 two-field ceiling; persistent Stage 2 OOF
+  # uses the separately capped lossless compressed representation.
+  maximum_oof_bytes: 226177843200
   weight_clipping: null
 
 cache:

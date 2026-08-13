@@ -1,0 +1,145 @@
+protocol_version: v1.1.3b
+stage: deterministic_regression_crossfit_oof
+research_track: cprecnet_event_conditioned_era5_full_trajectory_oracle
+seed: 11103
+
+runtime:
+  target_widths: [64, 128, 256, 384, 512]
+  context_widths: [32, 64, 128, 256, 384]
+  era_latent_channels: 128
+  era_grid_size: 33
+  precision: float32
+  tf32: false
+  allow_cpu_fallback: false
+  allow_model_width_fallback: false
+  allow_precision_fallback: false
+  allow_era_grid_fallback: false
+
+data:
+  radar_timezone: Asia/Seoul
+  history_frames: 12
+  future_target_frames: 7
+  target_shape: [256, 256]
+  context_shape: [256, 256]
+  era_shape: [33, 33]
+  target_coordinates: /workspace/data/raw/hsr_targets/hsr_22_SEOUL_target_grid_coordinates.npz
+  context_coordinates: /workspace/data/raw/hsr_conditions/hsr_22_SEOUL_NON_UNI_condition_grid_coordinates.npz
+  normalization: /workspace/data/manifests/event-pretrain-production-v1/normalization.json
+  condition_signature: era5_oracle:era=1:tp=1:full_trajectory
+  condition_augmentation:
+    format_version: kcorrdiff.condition-augmentation-policy.v1
+    policy_id: era5-full-dropout-50-25-25-v1
+    protocol_version: v1.1.3b
+    source_condition_signature: era5_oracle:era=1:tp=1:full_trajectory
+    temporal_access_strategy: matched_arm
+    entries:
+      - condition_signature: era5_oracle:era=1:tp=0:full_trajectory
+        target_probability: 0.25
+        draw_probability: 0.25
+      - condition_signature: era5_oracle:era=1:tp=1:full_trajectory
+        target_probability: 0.50
+        draw_probability: 0.50
+      - condition_signature: null_provider:era=0:tp=0:no_era_access
+        target_probability: 0.25
+        draw_probability: 0.25
+    selection_order: base_sample_then_one_condition_signature
+    weight_clipping: null
+  context_detail_mode: local_max
+  context_wet_threshold_mm_per_hour: 0.0
+  mmap_lazy_per_worker: true
+  pin_memory: true
+  persistent_workers: true
+
+model:
+  condition_dimension: 512
+  activation_checkpoint: true
+  physical_attention_query_chunk_size: 128
+  advection:
+    trajectory_mode: streaming
+    flow_pyramid_levels: 4
+    flow_warps_per_level: 3
+    flow_irls_iterations: 2
+    flow_window_size: 7
+    maximum_speed_km_per_hour: 150.0
+  regression:
+    occurrence_head: true
+    wet_amount_support: z_wet_plus_softplus
+    transformed_mean: probability_times_wet_amount
+    direct_physical_mean_checkpoint: true
+    direct_physical_q50_checkpoint: true
+
+loss:
+  lambda_occurrence: 1.0
+  lambda_positive: 1.0
+  lambda_mean: 0.05
+  mean_warmup_steps: 128
+  detach_probability_in_mean: false
+  importance_weight_clipping: null
+
+optimization:
+  optimizer: AdamW
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  gradient_clip_norm: 1.0
+  epochs: 1
+  scheduler: cosine
+  scheduler_minimum_ratio: 0.05
+  per_rank_microbatch_size: 8
+  gradient_accumulation_steps: 1
+  global_effective_batch_size: 16
+  checkpoint_every_optimizer_steps: 250
+  log_every_optimizer_steps: 10
+
+crossfit:
+  folds: 3
+  fold_group: manifest_block
+  train_split: outer_train
+  train_fold_models: true
+  train_deployment_model: true
+  held_out_inference_distributed: true
+  oof_dtype: float32
+  oof_fields: [occurrence_probability, mu_z]
+  oof_storage_encoding: npz-deflate-byte-shuffle-lossless-float32
+  oof_shard_items: 32
+  # Full 431,400-row two-field FP32 logical payload: 226,177,843,200 bytes.
+  maximum_oof_bytes: 226177843200
+  # Actual compressed archives are hard-stopped before crossing 140 GiB.
+  maximum_oof_compressed_bytes: 150323855360
+  maximum_oof_compression_ratio: 0.70
+  oof_compression_probe_bytes: 8589934592
+  # Keep the PVC hot tier full while reserving 10 GiB final free space plus a
+  # conservative 4 GiB for the deployment/direct checkpoints written after
+  # OOF publication. A sealed shard crosses this watermark only after an
+  # authenticated HTTPS upload and full SHA-256 GET read-back.
+  oof_remote_spill:
+    endpoint: https://168.188.119.187:1047
+    remote_prefix: /kcorrdiff/oof
+    local_reserve_bytes: 15032385536
+    timeout_seconds: 600.0
+  epsilon_residual_scale: 0.001
+
+loader_tuning:
+  selection_artifact: configs/stage2-loader-selection.json
+  selection_artifact_sha256: e827181ba72946f0f3b29266ccff41a35b92f4ba6eb8853648a7d51b92d110c6
+  selected_batch_size_per_rank: 8
+  selected_num_workers: 12
+  selected_prefetch_factor: 2
+  candidates:
+    batch_sizes: [1, 2, 4, 8, 16, 32]
+    worker_counts: [0, 4, 8, 12, 16, 24]
+    prefetch_factors: [2, 4]
+
+tracking:
+  backend: wandb
+  project: kcorrdiff
+  job_type: stage2-regression-fullwidth
+  mode: online
+  log_gpu_system_metrics: true
+
+publication:
+  require_all_fold_checkpoints: true
+  require_complete_oof: true
+  require_residual_scales: true
+  atomic_stage_manifest: true
+  immutable_release_requires_manual_promotion: true

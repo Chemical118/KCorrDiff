@@ -41,6 +41,9 @@ kcorrdiff-build-manifest = "kcorrdiff.data.split_manifest:main"
 kcorrdiff-build-event-index = "kcorrdiff.data.event_manifest:event_index_main"
 kcorrdiff-audit-manifest = "kcorrdiff.data.split_manifest:audit_main"
 kcorrdiff-era5-cache = "kcorrdiff.data.era5_cache_cli:main"
+kcorrdiff-build-normalization = "kcorrdiff.training.build_normalization:main"
+kcorrdiff-augment-condition-bundle = "kcorrdiff.data.condition_bundle:main"
+kcorrdiff-benchmark-loader = "kcorrdiff.training.benchmark_loader:main"
 
 [tool.setuptools.packages.find]
 include = ["kcorrdiff*"]

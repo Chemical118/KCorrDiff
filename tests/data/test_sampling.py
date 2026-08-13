@@ -14,6 +14,7 @@ from kcorrdiff.data.sampling import (
     bounded_draw_manifest,
     canonical_counter,
     enforce_byte_budget,
+    full_coverage_shuffled_draw_manifest,
     oof_dense_byte_budget,
     read_draw_manifest,
     write_draw_manifest,
@@ -181,3 +182,42 @@ def test_empty_draw_manifest_is_not_a_valid_training_artifact(tmp_path: Path) ->
     path.write_text("", encoding="utf-8")
     with pytest.raises(ValueError, match="empty"):
         read_draw_manifest(path)
+
+
+def test_full_coverage_shuffle_is_exact_order_independent_and_prefix_free() -> None:
+    template = candidates()[0]
+    base = [
+        replace(
+            template,
+            sample_id=f"s{index}",
+            t0_utc=f"2022-01-{index + 1:02d}T00:00:00+00:00",
+            block_id=f"event-{index}",
+            p_target=0.1,
+        )
+        for index in range(10)
+    ]
+    first = full_coverage_shuffled_draw_manifest(
+        base, seed=11103, purpose_id="whole-support-production-v1"
+    )
+    reordered = full_coverage_shuffled_draw_manifest(
+        base[::-1], seed=11103, purpose_id="whole-support-production-v1"
+    )
+    changed = full_coverage_shuffled_draw_manifest(
+        base, seed=11103, purpose_id="whole-support-production-v2"
+    )
+
+    assert first == reordered
+    assert {row.sample_id for row in first} == {item.sample_id for item in base}
+    assert len(first) == len({row.sample_id for row in first}) == len(base)
+    assert [row.global_example_index for row in first] == list(range(len(base)))
+    assert all(row.p_draw == row.p_target and row.omega == 1.0 for row in first)
+    assert [row.sample_id for row in first] != [row.sample_id for row in changed]
+
+    nonuniform = [
+        replace(item, p_target=0.2 if index == 0 else 0.8 / 9)
+        for index, item in enumerate(base)
+    ]
+    with pytest.raises(ValueError, match="item-uniform"):
+        full_coverage_shuffled_draw_manifest(
+            nonuniform, seed=11103, purpose_id="whole-support-production-v1"
+        )

@@ -10,6 +10,11 @@ import pytest
 import yaml
 
 from kcorrdiff.data.availability import LEADS_HOURS, format_radar_timestamp
+from kcorrdiff.data.condition_augmentation import (
+    ConditionAugmentationPolicy,
+    ConditionAugmentationProvenance,
+    ConditionMixtureEntry,
+)
 from kcorrdiff.data.event_manifest import (
     ALL_12_LEADS_MASK,
     EventIndexRow,
@@ -306,6 +311,138 @@ def test_bundle_is_atomic_hashed_folded_and_budgeted(tmp_path: Path) -> None:
             protocol_version="v1.1.3b",
         )
     assert not rejected.exists()
+
+
+def test_bundle_materializes_sample_first_condition_signatures(tmp_path: Path) -> None:
+    rows, event_audit = build_event_pretrain_index(
+        _three_event_timestamps(), outer_interval()
+    )
+    full = "era5_oracle:era=1:tp=1:full_trajectory"
+    tp_off = "era5_oracle:era=1:tp=0:full_trajectory"
+    null = "null_provider:era=0:tp=0:no_era_access"
+    policy = ConditionAugmentationPolicy(
+        policy_id="event-full-dropout-test-v1",
+        protocol_version="v1.1.3b",
+        source_condition_signature=full,
+        temporal_access_strategy="matched_arm",
+        entries=(
+            ConditionMixtureEntry(full, 0.6, 0.5),
+            ConditionMixtureEntry(tp_off, 0.25, 0.25),
+            ConditionMixtureEntry(null, 0.15, 0.25),
+        ),
+    )
+    output = tmp_path / "augmented-bundle"
+    result = write_event_training_bundle(
+        output,
+        rows,
+        event_audit,
+        outer_interval(),
+        draw_count=80,
+        draw_policy="block-balanced",
+        seed=17,
+        purpose_id="base-regression-v1",
+        signature_purpose_id="condition-signature-v1",
+        condition_augmentation=policy,
+        maximum_oof_bytes=100_000_000,
+        config_sha256="a" * 64,
+        protocol_version="v1.1.3b",
+    )
+
+    assert result.candidates == 72 * 3
+    source = read_draw_manifest(
+        output / "source-training-draw-manifest.jsonl"
+    )
+    augmented = read_draw_manifest(output / "training-draw-manifest.jsonl")
+    assert len(source) == len(augmented) == 80
+    assert all(row.condition_signature == full for row in source)
+    assert {
+        row.condition_signature for row in augmented
+    } == {full, tp_off, null}
+    for base, selected in zip(source, augmented, strict=True):
+        assert selected.global_example_index == base.global_example_index
+        assert selected.t0_utc == base.t0_utc
+        assert selected.lead_hours == base.lead_hours
+        assert selected.block_id == base.block_id
+        assert selected.fold_id == base.fold_id
+
+    candidate = json.loads((output / "candidate-manifest.json").read_text())
+    assert candidate["metadata"]["condition_augmentation_policy_sha256"] == (
+        policy.semantic_sha256
+    )
+    assert sum(
+        item["p_target"] for item in candidate["items"]
+    ) == pytest.approx(1.0)
+    assert sum(item["p_draw"] for item in candidate["items"]) == pytest.approx(
+        1.0
+    )
+
+    metadata = json.loads((output / "bundle-metadata.json").read_text())
+    provenance = ConditionAugmentationProvenance.from_mapping(
+        metadata["condition_augmentation"]
+    )
+    assert metadata["condition_signatures"] == list(
+        provenance.supported_signatures
+    )
+    assert metadata["condition_augmentation_policy_sha256"] == (
+        policy.semantic_sha256
+    )
+    assert metadata["condition_augmentation_provenance_sha256"] == (
+        provenance.semantic_sha256
+    )
+    assert metadata["sampling"]["condition_selection_order"] == (
+        "base_sample_then_one_condition_signature"
+    )
+    assert sum(dict(provenance.signature_counts).values()) == 80
+    assert metadata["artifacts"]["source_training_draw_manifest"][
+        "purpose_id"
+    ] == "base-regression-v1"
+
+
+def test_full_coverage_bundle_visits_each_outer_train_base_once(tmp_path: Path) -> None:
+    rows, event_audit = build_event_pretrain_index(
+        _three_event_timestamps(), outer_interval()
+    )
+    output = tmp_path / "whole-support-bundle"
+    base_support = event_audit.expanded_lead_items
+    result = write_event_training_bundle(
+        output,
+        rows,
+        event_audit,
+        outer_interval(),
+        draw_count=base_support,
+        draw_policy="full-coverage-shuffled",
+        seed=17,
+        purpose_id="whole-support-production-v1",
+        maximum_oof_bytes=100_000_000,
+        config_sha256="a" * 64,
+        protocol_version="v1.1.3b",
+    )
+
+    draws = read_draw_manifest(output / "training-draw-manifest.jsonl")
+    assert result.draws == base_support
+    assert len({row.sample_id for row in draws}) == base_support
+    assert all(row.p_target == row.p_draw and row.omega == 1.0 for row in draws)
+    metadata = json.loads((output / "bundle-metadata.json").read_text())
+    assert metadata["sampling"]["coverage"] == (
+        "all_outer_train_base_candidates_once"
+    )
+    assert metadata["sampling"]["replacement"] is False
+    assert metadata["sampling"]["base_candidate_count"] == base_support
+
+    with pytest.raises(ValueError, match="draw_count must equal"):
+        write_event_training_bundle(
+            tmp_path / "incomplete-whole-support",
+            rows,
+            event_audit,
+            outer_interval(),
+            draw_count=base_support - 1,
+            draw_policy="full-coverage-shuffled",
+            seed=17,
+            purpose_id="whole-support-production-v1",
+            maximum_oof_bytes=100_000_000,
+            config_sha256="a" * 64,
+            protocol_version="v1.1.3b",
+        )
 
 
 def test_installed_manifest_cli_builds_from_configured_sampler(tmp_path: Path) -> None:

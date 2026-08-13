@@ -33,12 +33,19 @@ from .availability import (
     require_five_minute_slot,
 )
 from .cache import paired_archives
+from .condition_augmentation import (
+    ConditionAugmentationPolicy,
+    canonical_draw_rows_sha256,
+    expand_manifest_condition_support,
+    materialize_condition_signatures,
+)
 from .event_groups import Interval, containing_event, merge_event_intervals
 from .sampling import (
     CandidateItem,
     DrawRow,
     bounded_draw_manifest,
     enforce_byte_budget,
+    full_coverage_shuffled_draw_manifest,
     oof_dense_byte_budget,
     write_draw_manifest,
 )
@@ -60,7 +67,7 @@ ALL_12_LEADS_MASK = (1 << 12) - 1
 EVENT_STRATUM = "event"
 OUTER_TRAIN_FOLDS = 3
 BUNDLE_FORMAT_VERSION = "kcorrdiff.event-training-bundle.v1"
-DrawPolicy = Literal["uniform", "block-balanced"]
+DrawPolicy = Literal["uniform", "block-balanced", "full-coverage-shuffled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,7 +270,11 @@ def expand_event_candidates(
     population is manufactured.
     """
 
-    if draw_policy not in ("uniform", "block-balanced"):
+    if draw_policy not in (
+        "uniform",
+        "block-balanced",
+        "full-coverage-shuffled",
+    ):
         raise ValueError(f"unsupported draw policy: {draw_policy}")
     canonical_rows = _canonical_event_rows(rows)
     if not canonical_rows:
@@ -282,7 +293,7 @@ def expand_event_candidates(
     for row in canonical_rows:
         for lead in _masked_leads(row.available_leads_mask):
             p_target = 1.0 / split_sizes[row.split]
-            if draw_policy == "uniform":
+            if draw_policy in ("uniform", "full-coverage-shuffled"):
                 p_draw = p_target
             else:
                 p_draw = 1.0 / (
@@ -649,47 +660,125 @@ def write_event_training_bundle(
     oof_fields: int = 2,
     oof_bytes_per_value: int = 4,
     source_event_index: Path | None = None,
+    condition_augmentation: ConditionAugmentationPolicy | None = None,
+    signature_purpose_id: str | None = None,
 ) -> TrainingBundleResult:
     """Audit and atomically publish an end-to-end event training bundle."""
 
     canonical_rows = _canonical_event_rows(rows)
-    items = expand_event_candidates(
+    base_items = expand_event_candidates(
         canonical_rows,
         draw_policy=draw_policy,
         folds=OUTER_TRAIN_FOLDS,
         fold_seed=fold_seed,
     )
     eligible_ids = eligible_sample_ids_from_event_index(canonical_rows)
-    candidate_audit = audit_manifest(
-        items,
+    base_candidate_audit = audit_manifest(
+        base_items,
         split_intervals,
         eligible_sample_ids=eligible_ids,
         expected_outer_folds=OUTER_TRAIN_FOLDS,
         validate_split_probabilities=True,
     )
-    if candidate_audit["unassigned_eligible_item_fraction"] != 0.0:
+    if base_candidate_audit["unassigned_eligible_item_fraction"] != 0.0:
         raise AssertionError("independent eligible-universe audit did not close")
-    if any(item.stratum != EVENT_STRATUM for item in items):
+    if any(item.stratum != EVENT_STRATUM for item in base_items):
         raise AssertionError("CPrecNet bundle contains a manufactured non-event stratum")
-    if len(items) != event_audit.expanded_lead_items:
+    if len(base_items) != event_audit.expanded_lead_items:
         raise ValueError(
             "event audit/candidate expansion mismatch: "
-            f"{event_audit.expanded_lead_items} != {len(items)}"
+            f"{event_audit.expanded_lead_items} != {len(base_items)}"
         )
 
-    candidates = draw_candidates_for_split(items, "outer_train")
+    candidates = draw_candidates_for_split(base_items, "outer_train")
     draw_probabilities = [
         item.p_draw
-        for item in items
+        for item in base_items
         if item.split == "outer_train"
     ]
-    draw_rows = bounded_draw_manifest(
-        candidates,
-        draws=draw_count,
-        seed=seed,
-        purpose_id=purpose_id,
-        draw_probabilities=draw_probabilities,
-    )
+    if draw_policy == "full-coverage-shuffled":
+        if draw_count != len(candidates):
+            raise ValueError(
+                "full-coverage-shuffled draw_count must equal the complete "
+                f"outer_train support ({len(candidates)})"
+            )
+        source_draw_rows = full_coverage_shuffled_draw_manifest(
+            candidates,
+            seed=seed,
+            purpose_id=purpose_id,
+        )
+    else:
+        source_draw_rows = bounded_draw_manifest(
+            candidates,
+            draws=draw_count,
+            seed=seed,
+            purpose_id=purpose_id,
+            draw_probabilities=draw_probabilities,
+        )
+    condition_result = None
+    if condition_augmentation is None:
+        if signature_purpose_id is not None:
+            raise ValueError(
+                "signature_purpose_id requires a condition augmentation policy"
+            )
+        items = base_items
+        draw_rows = source_draw_rows
+        candidate_audit = base_candidate_audit
+        candidate_eligible_ids = eligible_ids
+        supported_signatures = tuple(
+            sorted({row.condition_signature for row in canonical_rows})
+        )
+    else:
+        if condition_augmentation.protocol_version != protocol_version:
+            raise ValueError("condition augmentation protocol disagrees with bundle")
+        event_signatures = {row.condition_signature for row in canonical_rows}
+        if event_signatures != {
+            condition_augmentation.source_signature.key
+        }:
+            raise ValueError(
+                "event index source signature disagrees with condition policy"
+            )
+        if not isinstance(signature_purpose_id, str) or not signature_purpose_id:
+            raise ValueError(
+                "condition augmentation requires an explicit signature_purpose_id"
+            )
+        expanded_outer = expand_manifest_condition_support(
+            tuple(item for item in base_items if item.split == "outer_train"),
+            policy=condition_augmentation,
+        )
+        items = tuple(
+            sorted(
+                (
+                    *expanded_outer,
+                    *(item for item in base_items if item.split != "outer_train"),
+                ),
+                key=lambda item: (
+                    item.t0_utc,
+                    item.lead_hours,
+                    item.condition_signature,
+                ),
+            )
+        )
+        expanded_eligible_ids = tuple(item.sample_id for item in items)
+        candidate_eligible_ids = expanded_eligible_ids
+        candidate_audit = audit_manifest(
+            items,
+            split_intervals,
+            eligible_sample_ids=expanded_eligible_ids,
+            expected_outer_folds=OUTER_TRAIN_FOLDS,
+            validate_split_probabilities=True,
+        )
+        source_draw_hash = canonical_draw_rows_sha256(source_draw_rows)
+        condition_result = materialize_condition_signatures(
+            source_draw_rows,
+            policy=condition_augmentation,
+            training_seed=seed,
+            source_draw_purpose_id=purpose_id,
+            signature_purpose_id=signature_purpose_id,
+            source_draw_manifest_sha256=source_draw_hash,
+        )
+        draw_rows = condition_result.rows
+        supported_signatures = condition_result.provenance.supported_signatures
     required_bytes = oof_dense_byte_budget(
         draw_rows,
         height=oof_height,
@@ -734,7 +823,7 @@ def write_event_training_bundle(
         }
         for row in canonical_rows
     )
-    eligible_sha256 = _semantic_sha256(eligible_ids)
+    eligible_sha256 = _semantic_sha256(candidate_eligible_ids)
     candidate_semantic_sha256 = _semantic_sha256(asdict(item) for item in items)
     fold_map = sorted(
         {
@@ -765,27 +854,43 @@ def write_event_training_bundle(
         event_index_dir = temporary / "event-index"
         write_event_index(event_index_dir, canonical_rows, event_audit)
         candidate_path = temporary / "candidate-manifest.json"
+        candidate_metadata = {
+            "protocol_version": protocol_version,
+            "estimand": event_audit.estimand,
+            "population": "cprecnet_event_conditioned_archive",
+            "strata": [EVENT_STRATUM],
+            "probability_scope": "within_split",
+            "target_policy": "eligible_items_uniform",
+            "draw_policy": draw_policy,
+            "outer_train_folds": OUTER_TRAIN_FOLDS,
+            "fold_seed": fold_seed,
+            "split_intervals": _split_interval_records(split_intervals),
+            "config_sha256": config_sha256,
+            "event_index_semantic_sha256": event_semantic_sha256,
+            "eligible_universe_sample_ids_sha256": eligible_sha256,
+            "candidate_semantic_sha256": candidate_semantic_sha256,
+            "fold_map_sha256": fold_map_sha256,
+        }
+        if condition_augmentation is not None:
+            candidate_metadata["condition_augmentation_policy_sha256"] = (
+                condition_augmentation.semantic_sha256
+            )
         candidate_hash = write_manifest(
             candidate_path,
             items,
-            metadata={
-                "protocol_version": protocol_version,
-                "estimand": event_audit.estimand,
-                "population": "cprecnet_event_conditioned_archive",
-                "strata": [EVENT_STRATUM],
-                "probability_scope": "within_split",
-                "target_policy": "eligible_items_uniform",
-                "draw_policy": draw_policy,
-                "outer_train_folds": OUTER_TRAIN_FOLDS,
-                "fold_seed": fold_seed,
-                "split_intervals": _split_interval_records(split_intervals),
-                "config_sha256": config_sha256,
-                "event_index_semantic_sha256": event_semantic_sha256,
-                "eligible_universe_sample_ids_sha256": eligible_sha256,
-                "candidate_semantic_sha256": candidate_semantic_sha256,
-                "fold_map_sha256": fold_map_sha256,
-            },
+            metadata=candidate_metadata,
         )
+        source_draw_path: Path | None = None
+        source_draw_hash: str | None = None
+        if condition_result is not None:
+            source_draw_path = temporary / "source-training-draw-manifest.jsonl"
+            source_draw_hash = write_draw_manifest(
+                source_draw_path, source_draw_rows
+            )
+            if source_draw_hash != (
+                condition_result.provenance.source_draw_manifest_sha256
+            ):
+                raise AssertionError("source draw writer/provenance hash mismatch")
         draw_path = temporary / "training-draw-manifest.jsonl"
         draw_hash = write_draw_manifest(draw_path, draw_rows)
         if candidate_hash != _sha256_file(candidate_path):
@@ -809,15 +914,64 @@ def write_event_training_bundle(
                 draw_path, temporary, rows=len(draw_rows)
             ),
         }
+        if source_draw_path is not None:
+            source_record = _artifact_metadata(
+                source_draw_path, temporary, rows=len(source_draw_rows)
+            )
+            source_record["purpose_id"] = purpose_id
+            artifacts["source_training_draw_manifest"] = source_record
+        sampling_metadata = {
+            "draw_split": "outer_train",
+            "target_policy": "eligible_items_uniform",
+            "probability_scope": "within_split",
+            "draw_policy": draw_policy,
+            "draw_count": draw_count,
+            "seed": seed,
+            "purpose_id": purpose_id,
+            "weight_clipping": None,
+            "omega_min": float(np.min(weights)),
+            "omega_median": float(np.median(weights)),
+            "omega_p95": float(np.percentile(weights, 95)),
+            "omega_max": float(np.max(weights)),
+            "weighted_sample_ess": weight_ess,
+        }
+        if draw_policy == "full-coverage-shuffled":
+            sampling_metadata.update(
+                {
+                    "coverage": "all_outer_train_base_candidates_once",
+                    "replacement": False,
+                    "base_candidate_count": len(candidates),
+                    "shuffle_key": "sha256(seed,purpose_id,sample_id)",
+                }
+            )
+        condition_metadata: dict[str, object] = {}
+        if condition_result is not None:
+            sampling_metadata.update(
+                {
+                    "condition_selection_order": (
+                        "base_sample_then_one_condition_signature"
+                    ),
+                    "signature_purpose_id": signature_purpose_id,
+                }
+            )
+            condition_metadata = {
+                "condition_augmentation_policy_sha256": (
+                    condition_augmentation.semantic_sha256
+                ),
+                "condition_augmentation_provenance_sha256": (
+                    condition_result.provenance.semantic_sha256
+                ),
+                "condition_augmentation": (
+                    condition_result.provenance.to_json()
+                ),
+            }
         metadata = {
             "format_version": BUNDLE_FORMAT_VERSION,
             "protocol_version": protocol_version,
             "estimand": event_audit.estimand,
             "population": "cprecnet_event_conditioned_archive",
             "strata": [EVENT_STRATUM],
-            "condition_signatures": sorted(
-                {row.condition_signature for row in canonical_rows}
-            ),
+            "condition_signatures": list(supported_signatures),
             "config_sha256": config_sha256,
             "event_index_semantic_sha256": event_semantic_sha256,
             "eligible_universe_sample_ids_sha256": eligible_sha256,
@@ -825,21 +979,7 @@ def write_event_training_bundle(
             "fold_map_sha256": fold_map_sha256,
             "source_event_index": source_event_index_metadata,
             "candidate_audit": candidate_audit,
-            "sampling": {
-                "draw_split": "outer_train",
-                "target_policy": "eligible_items_uniform",
-                "probability_scope": "within_split",
-                "draw_policy": draw_policy,
-                "draw_count": draw_count,
-                "seed": seed,
-                "purpose_id": purpose_id,
-                "weight_clipping": None,
-                "omega_min": float(np.min(weights)),
-                "omega_median": float(np.median(weights)),
-                "omega_p95": float(np.percentile(weights, 95)),
-                "omega_max": float(np.max(weights)),
-                "weighted_sample_ess": weight_ess,
-            },
+            "sampling": sampling_metadata,
             "folds": {
                 "split": "outer_train",
                 "count": OUTER_TRAIN_FOLDS,
@@ -859,6 +999,7 @@ def write_event_training_bundle(
                 "maximum_bytes": maximum_oof_bytes,
             },
             "artifacts": artifacts,
+            **condition_metadata,
         }
         metadata_path = temporary / "bundle-metadata.json"
         metadata_payload = (
@@ -935,7 +1076,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--sampler-policy",
         "--draw-policy",
         dest="draw_policy",
-        choices=("uniform", "block-balanced"),
+        choices=("uniform", "block-balanced", "full-coverage-shuffled"),
         help="override config sampling.draw_policy",
     )
     parser.add_argument("--seed", type=int, help="override config sampling.seed")
@@ -1099,7 +1240,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             default="uniform",
         )
     ).replace("_", "-")
-    if draw_policy_value not in ("uniform", "block-balanced"):
+    if draw_policy_value not in (
+        "uniform",
+        "block-balanced",
+        "full-coverage-shuffled",
+    ):
         raise ValueError(f"unsupported draw policy: {draw_policy_value}")
     seed = int(
         _resolved_setting(arguments.seed, sampling_config, "seed", default=11103)
@@ -1119,6 +1264,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             "fold_seed",
             default=11103,
         )
+    )
+    raw_condition_augmentation = era5_config.get("condition_augmentation")
+    condition_augmentation = (
+        ConditionAugmentationPolicy.from_mapping(raw_condition_augmentation)
+        if isinstance(raw_condition_augmentation, Mapping)
+        else None
+    )
+    if raw_condition_augmentation is not None and (
+        condition_augmentation is None
+    ):
+        raise TypeError("era5.condition_augmentation must be a mapping")
+    signature_purpose_raw = sampling_config.get("signature_purpose_id")
+    signature_purpose_id = (
+        str(signature_purpose_raw)
+        if signature_purpose_raw is not None
+        else None
     )
     intervals = split_intervals_from_config(config)
     if arguments.event_index is not None:
@@ -1186,6 +1347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         protocol_version=str(config.get("protocol_version", "unknown")),
         fold_seed=fold_seed,
         source_event_index=source_event_index,
+        condition_augmentation=condition_augmentation,
+        signature_purpose_id=signature_purpose_id,
     )
     print(
         json.dumps(

@@ -171,6 +171,74 @@ def bounded_draw_manifest(
     return tuple(rows)
 
 
+def full_coverage_shuffled_draw_manifest(
+    candidates: Sequence[CandidateItem],
+    *,
+    seed: int,
+    purpose_id: str,
+) -> tuple[DrawRow, ...]:
+    """Visit every base candidate exactly once in a canonical shuffled order.
+
+    Ordering uses a SHA-256 key over ``(seed, purpose_id, sample_id)`` and is
+    therefore independent of input ordering and training topology.  This is
+    the production whole-support policy, distinct from with-replacement pilot
+    sampling.  It currently requires item-uniform ``P_target`` so the exact
+    no-replacement epoch has ``P_draw=P_target`` and unit importance weight.
+    """
+
+    if not candidates:
+        raise ValueError("at least one candidate is required")
+    canonical_counter(seed, purpose_id, 0)
+    sample_ids = [item.sample_id for item in candidates]
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError("candidate sample_id values must be unique")
+    identities = [
+        (item.t0_utc, item.lead_hours, item.condition_signature)
+        for item in candidates
+    ]
+    if len(identities) != len(set(identities)):
+        raise ValueError("candidate (t0, lead, signature) identities must be unique")
+    if any(
+        item.fold_id is not None
+        and (
+            isinstance(item.fold_id, bool)
+            or not isinstance(item.fold_id, int)
+            or item.fold_id < 0
+        )
+        for item in candidates
+    ):
+        raise ValueError("candidate fold IDs must be non-negative integers or null")
+    expected_probability = 1.0 / len(candidates)
+    if any(
+        not math.isfinite(item.p_target)
+        or not math.isclose(
+            item.p_target,
+            expected_probability,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        for item in candidates
+    ):
+        raise ValueError(
+            "full-coverage-shuffled requires an item-uniform target distribution"
+        )
+
+    def shuffle_key(item: CandidateItem) -> tuple[bytes, str]:
+        payload = f"{seed}\0{purpose_id}\0{item.sample_id}".encode("utf-8")
+        return (hashlib.sha256(payload).digest(), item.sample_id)
+
+    ordered = sorted(candidates, key=shuffle_key)
+    return tuple(
+        DrawRow(
+            global_example_index=index,
+            **asdict(item),
+            p_draw=expected_probability,
+            omega=1.0,
+        )
+        for index, item in enumerate(ordered)
+    )
+
+
 def oof_dense_byte_budget(
     rows: Sequence[DrawRow],
     *,
@@ -266,6 +334,7 @@ __all__ = [
     "bounded_draw_manifest",
     "canonical_counter",
     "enforce_byte_budget",
+    "full_coverage_shuffled_draw_manifest",
     "oof_dense_byte_budget",
     "read_draw_manifest",
     "write_draw_manifest",

@@ -91,11 +91,11 @@ spec:
                 --context-widths 32,64,128,256,384 \
                 --era-latent-channels 128 \
                 --era-grid-size 33 \
-                --batch-sizes 1,2,4,8,16 \
+                --batch-sizes 1,2,4,8 \
                 --worker-counts 0,4,8,12,16,24 \
                 --prefetch-factors 2,4 \
-                --warmup-batches 20 \
-                --measured-batches 100 \
+                --warmup-batches 5 \
+                --measured-batches 25 \
                 --fail-on-fallback
           env:
             - name: RUN_ID
@@ -103,7 +103,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: PYTHONPATH
-              value: /workspace/KCorrDiff
+              value: /workspace/envs/stage2-python-v1:/workspace/KCorrDiff
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE

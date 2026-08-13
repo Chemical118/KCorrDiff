@@ -1,0 +1,189 @@
+# Exact Stage 2 full-width training-step benchmark. Unlike the loader-only
+# benchmark, every cell executes forward, masked hurdle loss, backward,
+# gradient clipping, and AdamW in strict FP32/no-TF32 mode.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-benchmark-stage2-model
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-model-benchmark
+    app.kubernetes.io/instance: fullwidth-v1-1-3b
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: stage2-model-benchmark
+        app.kubernetes.io/instance: fullwidth-v1-1-3b
+    spec:
+      serviceAccountName: kcorrdiff-porsche-trainer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: benchmark
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/KCorrDiff
+          command: ["/bin/bash", "-ceu"]
+          args:
+            - |
+              bundle_root=/workspace/data/manifests/event-pretrain-initial-v1
+              run_root=/workspace/benchmarks/stage2-model/${RUN_ID}
+              output_json=${run_root}/stage2-model-benchmark.json
+              log_file=${run_root}/benchmark.log
+
+              install -d -m 0770 "${run_root}" "${run_root}/wandb"
+              exec > >(tee -a "${log_file}") 2>&1
+
+              test -f /workspace/KCorrDiff/kcorrdiff/training/model_benchmark.py
+              test -f /workspace/data/cache/radar-v1/manifest.json
+              test -f /workspace/data/cache/era5-v1/manifest.json
+              test -f "${bundle_root}/candidate-manifest.json"
+              test -f "${bundle_root}/training-draw-manifest.jsonl"
+              test -f "${bundle_root}/bundle-metadata.json"
+              python -c 'import numpy, scipy, torch, yaml, wandb'
+              nvidia-smi -L
+              python -c 'import torch; count=torch.cuda.device_count(); assert count == 1, f"expected one visible benchmark GPU, got {count}"'
+
+              export WANDB_DIR="${run_root}/wandb"
+              export WANDB_NAME="${RUN_ID}"
+              export WANDB_RUN_ID="${RUN_ID}"
+              export WANDB_RESUME=never
+
+              exec python -m kcorrdiff.training.model_benchmark \
+                --config /workspace/KCorrDiff/configs/stage2-full-width.yaml \
+                --radar-cache-root /workspace/data/cache/radar-v1 \
+                --era5-cache-root /workspace/data/cache/era5-v1 \
+                --target-static /workspace/data/static/target_static.npz \
+                --candidate-manifest "${bundle_root}/candidate-manifest.json" \
+                --candidate-manifest-sha256 badbef862715cab0a1f19606bebe0496e849aa540ad4c1466da192c04f43c318 \
+                --draw-manifest "${bundle_root}/training-draw-manifest.jsonl" \
+                --draw-manifest-sha256 a6ec13fbf9ffbafc5ef4e3d0122b0de437f923d2390268a5fa6b4ffb32cf2a91 \
+                --bundle-metadata "${bundle_root}/bundle-metadata.json" \
+                --bundle-metadata-sha256 243ee0a74a7ea15654aedd3916281635e62a048007306e627438e26d6dfa16b4 \
+                --target-coordinates-sha256 76ab36d56fbc6f9a626164ffe818ef5dc553b2a897a0185efb7617878a59a912 \
+                --context-coordinates-sha256 7ea1d02c8136a8cf59713b5d07ccd40806ee38ca660a8c19ccfb6a6ab3693065 \
+                --output-json "${output_json}" \
+                --device cuda:0 \
+                --precision float32 \
+                --disable-tf32 \
+                --fail-on-fallback \
+                --pin-memory \
+                --batch-sizes 1,2,4,8,16,32 \
+                --warmup-steps 1 \
+                --measured-steps 3 \
+                --worker-count 12 \
+                --prefetch-factor 2 \
+                --maximum-grid-cells 6 \
+                --maximum-host-pipeline-bytes 85899345920 \
+                --maximum-shm-pipeline-bytes 30064771072 \
+                --payload-safety-factor 1.25 \
+                --logical-world-size 2 \
+                --rank 0 \
+                --role deployment \
+                --wandb-mode online
+          env:
+            - name: RUN_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PYTHONPATH
+              value: /workspace/envs/stage2-python-v1:/workspace/KCorrDiff
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONPYCACHEPREFIX
+              value: /tmp/pycache
+            - name: TMPDIR
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/cache
+            - name: TORCH_EXTENSIONS_DIR
+              value: /tmp/torch-extensions
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NVIDIA_TF32_OVERRIDE
+              value: "0"
+            - name: KCORRDIFF_REQUIRE_FULL_WIDTH
+              value: "1"
+            - name: KCORRDIFF_REQUIRE_PRECISION
+              value: float32
+            - name: KCORRDIFF_REQUIRE_ERA_GRID_SIZE
+              value: "33"
+            - name: KCORRDIFF_ALLOW_CPU_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_PRECISION_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_ERA_GRID_FALLBACK
+              value: "0"
+            - name: WANDB_PROJECT
+              value: kcorrdiff
+            - name: WANDB_JOB_TYPE
+              value: stage2-fullwidth-model-benchmark
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api
+                  key: WANDB_API_KEY
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "32"
+              memory: 96Gi
+              ephemeral-storage: 10Gi
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 10Gi
