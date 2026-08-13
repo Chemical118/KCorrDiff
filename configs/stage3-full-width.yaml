@@ -1,0 +1,187 @@
+protocol_version: v1.1.3b
+stage: residual_edm_independent_calibration_inference
+research_track: cprecnet_event_conditioned_era5_full_trajectory_oracle
+seed: 11103
+
+runtime:
+  target_widths: [64, 128, 256, 384, 512]
+  context_widths: [32, 64, 128, 256, 384]
+  era_latent_channels: 128
+  era_grid_size: 33
+  target_grid_size: 256
+  target_spacing_km: 0.5
+  precision: float32
+  tf32: false
+  allow_cpu_fallback: false
+  allow_model_width_fallback: false
+  allow_precision_fallback: false
+  allow_era_grid_fallback: false
+
+data:
+  radar_timezone: Asia/Seoul
+  target_coordinates: /workspace/data/raw/hsr_targets/hsr_22_SEOUL_target_grid_coordinates.npz
+  context_coordinates: /workspace/data/raw/hsr_conditions/hsr_22_SEOUL_NON_UNI_condition_grid_coordinates.npz
+  target_static: /workspace/data/static/target_static.npz
+  normalization: /workspace/data/manifests/event-pretrain-production-v1/normalization.json
+  draw_manifest: /workspace/data/manifests/event-pretrain-production-v1/training-draw-manifest.jsonl
+  candidate_manifest: /workspace/data/manifests/event-pretrain-production-v1/candidate-manifest.json
+  bundle_metadata: /workspace/data/manifests/event-pretrain-production-v1/bundle-metadata.json
+  condition_augmentation_policy_sha256: 813d7395ac59897a7a258ed07205fff289c262b7e8df93cd2cef4deeace9c9f8
+  condition_signatures:
+    - era5_oracle:era=1:tp=0:full_trajectory
+    - era5_oracle:era=1:tp=1:full_trajectory
+    - null_provider:era=0:tp=0:no_era_access
+  oof_dtype: float32
+  oof_fields: [occurrence_probability, mu_z]
+  target_builder_version: kcorrdiff.accumulation.v1.1.3b-trapezoid
+  mmap_lazy_per_worker: true
+  pin_memory: true
+  persistent_workers: true
+
+stage2_contract:
+  require_complete_stage_manifest: true
+  require_three_fold_checkpoints: true
+  require_deployment_checkpoint: true
+  require_complete_oof: true
+  require_residual_scales: true
+  require_float32_oof: true
+  freeze_deployment_condition_encoder: true
+
+model:
+  condition_dimension: 512
+  target_widths: [64, 128, 256, 384, 512]
+  activation_checkpoint: true
+  sigma_data: 1.0
+  state_channels: 1
+  regression_condition_channels: [mu_z, probability_wet]
+  raw_positive_amount_condition: false
+  target_grid_residual_state: true
+  diffusion_specific_condition_adapters: true
+  diffusion_specific_qkv: true
+  physical_attention_levels: [3, 4]
+  physical_attention_heads: 8
+  physical_attention_dimension: 256
+  physical_attention_query_chunk_size: 128
+  cache_source_kv_per_lead_signature: true
+  source_kv_depends_on_sigma: false
+  source_gate_depends_on_sigma: true
+  candidates:
+    - name: edm_a
+      deployment_encoder_pyramid: false
+      static_and_advection_conditions: true
+    - name: edm_b
+      deployment_encoder_pyramid: true
+      static_and_advection_conditions: true
+  selection_decision_file: /workspace/releases/stage3/model-selection-decision.json
+
+noise:
+  distribution: lognormal
+  log_sigma_mean: -1.2
+  log_sigma_standard_deviation: 1.2
+  minimum_sigma: 0.002
+  maximum_sigma: 80.0
+  purpose_id: edm-training-noise-v1
+  invalid_clean_residual_fill: 0.0
+  gaussian_noise_full_grid: true
+
+loss:
+  masked_edm: true
+  sigma_data: 1.0
+  full_item_importance_weight: true
+  target_validity_loss_only: true
+  distributed_global_numerator_denominator: true
+
+optimization:
+  optimizer: AdamW
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  gradient_clip_norm: 1.0
+  epochs: 1
+  scheduler: cosine
+  scheduler_minimum_ratio: 0.05
+  per_rank_microbatch_size: 1
+  gradient_accumulation_steps: 4
+  global_effective_batch_size: 8
+  checkpoint_every_optimizer_steps: 250
+  log_every_optimizer_steps: 10
+
+loader_tuning:
+  selected_batch_size_per_rank: 1
+  selected_num_workers: 12
+  selected_prefetch_factor: 4
+  require_production_pipeline_benchmark: true
+
+sampling_profiles:
+  development_smoke:
+    members: 4
+    edm_steps: 6
+  selection_signature:
+    members: 16
+    edm_steps: 8
+  final_primary_signature:
+    members: 32
+    edm_steps: 12
+  operational_transition_signature:
+    members: 8
+    edm_steps: 4
+    distilled_only: true
+  solver: heun
+  sigma_schedule: karras_rho7
+  minimum_sigma: 0.002
+  maximum_sigma: 80.0
+  rho: 7.0
+
+model_selection:
+  split: model_selection
+  labels_never_fit_calibration_parameters: true
+  candidates: [edm_a, edm_b]
+  sampler_bias_d_candidates: [disabled, enabled]
+  profile: selection_signature
+  decision_file_required_before_calibration: true
+
+calibration:
+  split: calibration
+  require_frozen_model_selection_decision: true
+  order: [oof_scale_restore, location_b, total_scale_c, optional_sampler_d, spread_gamma, probability_maps]
+  fold_mixture_weights: oof_weighted_valid_mass
+  variance: weighted_population
+  d_default_when_disabled: 0.0
+  gamma_preserve_member_mean: true
+  probability_family: monotone_logit_linear
+  probability_clip: 0.000001
+  p_thresholds_mm: [0.1]
+  q_thresholds_mm: [0.1, 1.0, 5.0]
+  pooling_order:
+    - lead_provider_era_present
+    - lead_provider
+    - lead_only
+  minimum_independent_blocks: 30
+  minimum_block_ess: 20.0
+  minimum_positive_support_blocks: 20
+  minimum_negative_support_blocks: 20
+
+inference:
+  output_grid: [256, 256]
+  inverse_transform_a0_mm: 1.0
+  censor_threshold_mm: 0.1
+  ensemble_mean_after_member_inverse: true
+  ensemble_median: empirical_lower
+  output_each_lead_independently: true
+  cross_lead_member_trajectory_claim: false
+
+tracking:
+  backend: wandb
+  project: kcorrdiff
+  job_type: stage3-residual-edm-fullwidth
+  mode: online
+  log_gpu_system_metrics: true
+
+publication:
+  require_stage2_hash_lineage: true
+  require_model_selection_decision_hash: true
+  require_edm_checkpoint: true
+  require_independent_calibration: true
+  require_sampling_profile_smoke: true
+  atomic_stage_manifest: true
+  immutable_release_requires_manual_promotion: true

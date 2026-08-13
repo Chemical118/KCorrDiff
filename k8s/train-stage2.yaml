@@ -42,7 +42,7 @@ spec:
         - name: trainer
           image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace/KCorrDiff
+          workingDir: /workspace/code/stage2-production-v1
           command: ["/bin/bash", "-ceu"]
           args:
             - |
@@ -144,7 +144,7 @@ spec:
             - name: RUN_ID
               value: stage2-fullwidth-production-v1
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/KCorrDiff
+              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-production-v1
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE

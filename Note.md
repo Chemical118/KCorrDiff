@@ -178,3 +178,52 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   현재 node의 8 GPU가 모두 할당되어 정식 exact 2-GPU Job은 아직 스케줄할 수 없다.
   실측 기반 Stage 2 순수 학습 예상은 2 GPU 약 52시간, 1 GPU 환산 약 105시간이며
   OOF inference/compression/overflow 시간이 추가된다.
+
+## Stage 3 — residual EDM, 독립 평가 및 calibration 경계
+
+### 모델·데이터 계약
+
+- Stage 2의 complete manifest, 세 fold checkpoint, deployment checkpoint, 최종 OOF,
+  residual scale 및 다섯 launch-identity hash를 모두 검증한 뒤에만 Stage 3 data
+  factory를 연다. Partial OOF나 partial residual state는 입력으로 허용하지 않는다.
+  OOF v3 remote shard는 worker-local bounded cache에 하나씩 받아 SHA-256과 lossless
+  float32 복원을 확인하고 사용 직후 삭제한다.
+- Stage 3 config도 초기 8,192-row artifact가 아니라 production 431,400-row bundle과
+  frozen condition augmentation semantic SHA-256 `813d73…9c9f8`에 결박했다. 각 draw
+  row의 ERA+tp, ERA tp-off, whole-ERA null signature를 그대로 재생하며 Stage 2와
+  signature/hash가 하나라도 다르면 실행을 중단한다.
+- EDM-A는 Stage 2 deployment pyramid를 제외하고, EDM-B는 detach한 deployment
+  pyramid를 condition으로 사용한다. 두 모델 모두 residual state와 `(mu_z,p)`만
+  입력받고 diffusion-owned adapter/QKV/gate, L3/L4 physical attention, sigma-independent
+  source KV cache와 exact source-absence 경로를 사용한다. FP32 parameter 수는
+  EDM-A 52,111,457개(약 198.8 MiB), EDM-B 52,605,025개(약 200.7 MiB)이며 정밀도나
+  원래 폭을 줄이지 않는다.
+
+### 학습·평가·게시 경계
+
+- Exact two-rank NCCL, FP32/no-TF32, global masked-EDM numerator/denominator, manual
+  gradient SUM, accumulation padding, stateless Philox noise, atomic optimizer/scheduler/
+  rank별 RNG checkpoint와 W&B resume를 구현했다. Per-rank batch는 양의 2의 제곱만
+  허용하며 현재 production 시작값은 B=1, accumulation=4, global batch=8이다.
+- 실행은 `screen`, `finalists`, `bind-decision` 세 개의 suspended Job으로 분리했다.
+  Seed 11103 EDM-A/B screening 뒤 외부 model-selection evidence 없이는 finalist를
+  학습할 수 없고, 외부 frozen decision 없이는 final 선택을 게시할 수 없다.
+  Finalist는 seed 11103/11105/11106을 사용한다. Calibration은 선택이 동결된 뒤
+  별도 artifact layer에서만 수행하며 training loss로 후보를 고르는 경로는 없다.
+- Sampling은 fixed Karras rho-7 schedule과 deterministic Heun을 사용하며 4×6,
+  16×8, 32×12 및 distilled 8×4 profile을 고정했다. Calibration artifact는 b/c,
+  optional d, spread gamma, monotone probability map과 pooling provenance를 immutable
+  canonical JSON/SHA-256으로 게시한다.
+
+### Stage 3 검증 및 현재 상태
+
+- 전체 repository suite: `465 passed, 7 skipped`; host에서 skip된 CUDA 전용 7개
+  경로를 porsche A100에서 재실행해 모두 통과했다. Triton/Torch cache는 read-only
+  root가 아닌 `/tmp`로 고정한다.
+- Stage 2 Job은 immutable `/workspace/code/stage2-production-v1`에서만 import하도록
+  `workingDir`와 `PYTHONPATH`를 수정해 suspended 상태로 클러스터에 등록했다.
+  Stage 3 Job도 향후 immutable `/workspace/code/stage3-production-v1` snapshot만 본다.
+- Stage 3 본학습은 complete Stage 2 OOF/checkpoint가 선행되어야 하므로 아직 W&B에
+  시작하지 않았다. 현재 online W&B run은 Stage 2 B=8 endurance 검증이며, production
+  Stage 2 Job은 porsche의 두 번째 GPU가 확보되는 즉시 shell Pod 두 개와 원자적으로
+  전환해 시작한다.
