@@ -124,6 +124,8 @@ def test_cli_help_exposes_training_step_and_provenance_contract(capsys) -> None:
         "--target-coordinates-sha256",
         "--context-coordinates-sha256",
         "--fail-on-fallback",
+        "--diagnostic-non-power-of-two",
+        "--torch-compile-mode",
         "--wandb-mode",
     ):
         assert option in output
@@ -190,6 +192,43 @@ def test_strict_contract_rejects_fallback_environment_and_reordered_grid(
     argv = _cli_args(tmp_path)
     argv[argv.index("--batch-sizes") + 1] = "1,2,3,4"
     with pytest.raises(ValueError, match="powers of two"):
+        validate_strict_arguments(
+            model_benchmark._parse_args(argv), environ=_strict_environment()
+        )
+
+
+def test_bounded_diagnostic_accepts_one_explicit_non_power_of_two_batch(
+    tmp_path: Path,
+) -> None:
+    argv = _cli_args(tmp_path)
+    argv[argv.index("--batch-sizes") + 1] = "12"
+    argv[argv.index("--maximum-grid-cells") + 1] = "1"
+    argv[argv.index("--worker-count") + 1] = "16"
+    argv.extend(
+        [
+            "--diagnostic-non-power-of-two",
+            "--torch-compile-mode",
+            "reduce-overhead",
+        ]
+    )
+    contract = validate_strict_arguments(
+        model_benchmark._parse_args(argv), environ=_strict_environment()
+    )
+    assert contract.grid.batch_sizes == (12,)
+    assert contract.grid.allow_non_power_of_two is True
+    assert contract.diagnostic_non_power_of_two is True
+    assert contract.torch_compile_mode == "reduce-overhead"
+
+    repository = Path(__file__).resolve().parents[2]
+    config = load_stage2_config(repository / "configs" / "stage2-full-width.yaml")
+    _, validated = validate_stage2_contract(config, contract)
+    loader = validated["loader"]
+    assert loader["diagnostic_requested_batch_sizes"] == [12]
+    assert loader["diagnostic_changes_production_training_config"] is False
+    assert loader["candidate_grid"]["batch_sizes"] == (8,)
+
+    argv[argv.index("--batch-sizes") + 1] = "8"
+    with pytest.raises(ValueError, match="requires exactly one non-power"):
         validate_strict_arguments(
             model_benchmark._parse_args(argv), environ=_strict_environment()
         )
@@ -373,6 +412,9 @@ def test_cpu_injected_candidate_executes_forward_backward_and_adamw() -> None:
     assert result["adamw_step_seconds"]["max"] >= 0.0
     assert result["gpu_memory_allocated_peak_bytes"] == 0
     assert result["fallback_used"] is False
+    assert result["torch_compile_enabled"] is False
+    assert result["torch_compile_mode"] == "eager"
+    assert result["gpu_telemetry"] is None
     assert not torch.equal(created[0].weight.detach(), initial[0])
 
 

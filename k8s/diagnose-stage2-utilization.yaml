@@ -1,0 +1,197 @@
+# Short, isolated one-GPU comparison of Stage 2 eager/compile execution.  It
+# writes only benchmark records and never publishes a training checkpoint.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-diagnose-stage2-utilization
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-utilization-diagnostic
+    app.kubernetes.io/instance: 20260813-v1
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: stage2-utilization-diagnostic
+        app.kubernetes.io/instance: 20260813-v1
+    spec:
+      serviceAccountName: kcorrdiff-porsche-trainer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: diagnostic
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/code/stage2-utilization-diagnostic-v1
+          command: ["/bin/bash", "-ceu"]
+          args:
+            - |
+              source_root=/workspace/code/stage2-utilization-diagnostic-v1
+              bundle_root=/workspace/data/manifests/event-pretrain-production-v1
+              run_root=/workspace/benchmarks/stage2-utilization/20260813-v1
+              install -d -m 0770 "${run_root}" "${run_root}/wandb"
+              exec > >(tee -a "${run_root}/diagnostic.log") 2>&1
+
+              test -f "${source_root}/kcorrdiff/training/model_benchmark.py"
+              test -f /workspace/data/cache/radar-v1/manifest.json
+              test -f /workspace/data/cache/era5-v1/manifest.json
+              nvidia-smi -L
+              python -c 'import torch; assert torch.cuda.device_count() == 1'
+
+              run_case() {
+                local case_name="$1"
+                local batch_size="$2"
+                local workers="$3"
+                local compile_mode="$4"
+                local diagnostic_flag="$5"
+                local case_root="${run_root}/${case_name}"
+                install -d -m 0770 "${case_root}" "${case_root}/wandb"
+                export WANDB_DIR="${case_root}/wandb"
+                export WANDB_NAME="stage2-util-${case_name}"
+                export WANDB_RUN_ID="stage2-util-${case_name}-20260813-v1"
+                export WANDB_RESUME=never
+                python -m kcorrdiff.training.model_benchmark \
+                  --config "${source_root}/configs/stage2-full-width.yaml" \
+                  --radar-cache-root /workspace/data/cache/radar-v1 \
+                  --era5-cache-root /workspace/data/cache/era5-v1 \
+                  --target-static /workspace/data/static/target_static.npz \
+                  --candidate-manifest "${bundle_root}/candidate-manifest.json" \
+                  --candidate-manifest-sha256 4f321077767f47591e0686f2913938c94e53786ebaf525626e794da4c01c0566 \
+                  --draw-manifest "${bundle_root}/training-draw-manifest.jsonl" \
+                  --draw-manifest-sha256 83907188044ed3f5f0964090f4b7b4de5fd666791d7aed85db31a435bffc603c \
+                  --bundle-metadata "${bundle_root}/bundle-metadata.json" \
+                  --bundle-metadata-sha256 c09ed583d401adba90c38547ca3beda573fc53f517da0c7a92676b64f6e7b2de \
+                  --target-coordinates-sha256 76ab36d56fbc6f9a626164ffe818ef5dc553b2a897a0185efb7617878a59a912 \
+                  --context-coordinates-sha256 7ea1d02c8136a8cf59713b5d07ccd40806ee38ca660a8c19ccfb6a6ab3693065 \
+                  --output-json "${case_root}/summary.json" \
+                  --device cuda:0 \
+                  --precision float32 \
+                  --disable-tf32 \
+                  --fail-on-fallback \
+                  --pin-memory \
+                  --batch-sizes "${batch_size}" \
+                  ${diagnostic_flag} \
+                  --torch-compile-mode "${compile_mode}" \
+                  --warmup-steps 3 \
+                  --measured-steps 8 \
+                  --worker-count "${workers}" \
+                  --prefetch-factor 2 \
+                  --maximum-grid-cells 1 \
+                  --maximum-host-pipeline-bytes 53687091200 \
+                  --maximum-shm-pipeline-bytes 16106127360 \
+                  --payload-safety-factor 1.25 \
+                  --logical-world-size 2 \
+                  --rank 0 \
+                  --role deployment \
+                  --wandb-mode online
+              }
+
+              run_case eager-b8-w12 8 12 eager ""
+              run_case eager-b12-w12 12 12 eager --diagnostic-non-power-of-two
+              run_case eager-b12-w16 12 16 eager --diagnostic-non-power-of-two
+              compile_status=0
+              run_case compile-b12-w16 12 16 reduce-overhead --diagnostic-non-power-of-two || compile_status=$?
+              if (( compile_status != 0 )); then
+                printf '%s\n' "${compile_status}" > "${run_root}/compile-b12-w16.exit-code"
+              fi
+          env:
+            - name: PYTHONPATH
+              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-utilization-diagnostic-v1
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONPYCACHEPREFIX
+              value: /tmp/pycache
+            - name: TMPDIR
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/cache
+            - name: TORCH_EXTENSIONS_DIR
+              value: /tmp/torch-extensions
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NVIDIA_TF32_OVERRIDE
+              value: "0"
+            - name: KCORRDIFF_REQUIRE_FULL_WIDTH
+              value: "1"
+            - name: KCORRDIFF_REQUIRE_PRECISION
+              value: float32
+            - name: KCORRDIFF_REQUIRE_ERA_GRID_SIZE
+              value: "33"
+            - name: KCORRDIFF_ALLOW_CPU_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_PRECISION_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_ERA_GRID_FALLBACK
+              value: "0"
+            - name: WANDB_PROJECT
+              value: kcorrdiff
+            - name: WANDB_JOB_TYPE
+              value: stage2-utilization-diagnostic
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api
+                  key: WANDB_API_KEY
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "40"
+              memory: 64Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi

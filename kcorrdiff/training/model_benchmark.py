@@ -26,7 +26,9 @@ import os
 from pathlib import Path
 import re
 import socket
+import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Protocol
 
@@ -140,13 +142,14 @@ class ModelBenchmarkGrid:
     batch_sizes: tuple[int, ...]
     warmup_steps: int
     measured_steps: int
+    allow_non_power_of_two: bool = False
 
     def __post_init__(self) -> None:
         if not self.batch_sizes:
             raise ValueError("model benchmark batch-size grid cannot be empty")
         for value in self.batch_sizes:
             _positive_integer(value, name="batch_sizes item")
-            if value & (value - 1):
+            if not self.allow_non_power_of_two and value & (value - 1):
                 raise ValueError(
                     "model benchmark batch_sizes must be powers of two"
                 )
@@ -184,6 +187,8 @@ class StrictModelBenchmarkContract:
     maximum_grid_cells: int
     grid: ModelBenchmarkGrid
     payload_limits: PipelinePayloadLimits
+    diagnostic_non_power_of_two: bool
+    torch_compile_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +279,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fail-on-fallback", action="store_true")
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--batch-sizes", type=_positive_csv, required=True)
+    parser.add_argument(
+        "--diagnostic-non-power-of-two",
+        action="store_true",
+        help=(
+            "allow exactly one explicitly requested non-power-of-two batch "
+            "for a bounded diagnostic; production candidate grids stay unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--torch-compile-mode",
+        choices=("eager", "default", "reduce-overhead"),
+        default="eager",
+    )
     parser.add_argument("--warmup-steps", type=int, required=True)
     parser.add_argument("--measured-steps", type=int, required=True)
     parser.add_argument("--worker-count", type=int, required=True)
@@ -337,7 +355,16 @@ def validate_strict_arguments(
         batch_sizes=tuple(arguments.batch_sizes),
         warmup_steps=arguments.warmup_steps,
         measured_steps=arguments.measured_steps,
+        allow_non_power_of_two=bool(arguments.diagnostic_non_power_of_two),
     )
+    if arguments.diagnostic_non_power_of_two:
+        if len(grid.batch_sizes) != 1 or not any(
+            value & (value - 1) for value in grid.batch_sizes
+        ):
+            raise ValueError(
+                "--diagnostic-non-power-of-two requires exactly one "
+                "non-power-of-two batch size"
+            )
     maximum_cells = _positive_integer(
         arguments.maximum_grid_cells, name="maximum_grid_cells"
     )
@@ -380,6 +407,10 @@ def validate_strict_arguments(
         maximum_grid_cells=maximum_cells,
         grid=grid,
         payload_limits=limits,
+        diagnostic_non_power_of_two=bool(
+            arguments.diagnostic_non_power_of_two
+        ),
+        torch_compile_mode=str(arguments.torch_compile_mode),
     )
 
 
@@ -389,6 +420,14 @@ def validate_stage2_contract(
 ) -> tuple[ModelContract, dict[str, object]]:
     """Bind the model grid to the exact Stage 2 data/model/optimizer config."""
 
+    validated_batch_sizes = contract.grid.batch_sizes
+    if contract.diagnostic_non_power_of_two:
+        # Validate the immutable production loader contract with its selected
+        # batch.  The one-off diagnostic batch is recorded separately and is
+        # never added to the preregistered candidate grid.
+        validated_batch_sizes = (
+            config.optimization.per_rank_microbatch_size,
+        )
     loader_contract = StrictBenchmarkContract(
         device=contract.device,
         precision=contract.precision,
@@ -400,7 +439,7 @@ def validate_stage2_contract(
         role=contract.role,
         fold_id=contract.fold_id,
         grid=ProductionBenchmarkGrid(
-            batch_sizes=contract.grid.batch_sizes,
+            batch_sizes=validated_batch_sizes,
             worker_counts=(contract.worker_count,),
             prefetch_factors=(contract.prefetch_factor,),
             warmup_batches=contract.grid.warmup_steps,
@@ -409,6 +448,14 @@ def validate_stage2_contract(
         payload_limits=contract.payload_limits,
     )
     validated_loader = validate_config_contract(config, loader_contract)
+    if contract.diagnostic_non_power_of_two:
+        validated_loader = {
+            **validated_loader,
+            "diagnostic_requested_batch_sizes": list(
+                contract.grid.batch_sizes
+            ),
+            "diagnostic_changes_production_training_config": False,
+        }
     model_contract = regression_system_config_from_stage2(config)
     if not model_contract.system.activation_checkpoint:
         raise ValueError("production activation checkpointing must remain enabled")
@@ -485,6 +532,118 @@ def _distribution(values: Sequence[float]) -> dict[str, float]:
         "p95": float(np.percentile(array, 95)),
         "max": float(array.max()),
     }
+
+
+class _NvidiaSmiSampler:
+    """Sample device utilization during the measured optimizer window only."""
+
+    _QUERY_FIELDS = (
+        "utilization.gpu",
+        "utilization.memory",
+        "memory.used",
+        "power.draw",
+    )
+
+    def __init__(self, *, device_index: int, interval_ms: int = 200) -> None:
+        _nonnegative_integer(device_index, name="device_index")
+        _positive_integer(interval_ms, name="interval_ms")
+        self.device_index = device_index
+        self.interval_ms = interval_ms
+        self._process: subprocess.Popen[str] | None = None
+        self._thread: threading.Thread | None = None
+        self._samples: list[tuple[float, float, float, float]] = []
+        self._read_error: BaseException | None = None
+
+    def start(self) -> None:
+        if self._process is not None:
+            raise RuntimeError("GPU utilization sampler is already running")
+        self._process = subprocess.Popen(
+            [
+                "nvidia-smi",
+                f"--id={self.device_index}",
+                "--query-gpu=" + ",".join(self._QUERY_FIELDS),
+                "--format=csv,noheader,nounits",
+                f"--loop-ms={self.interval_ms}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._thread = threading.Thread(
+            target=self._read_stdout,
+            name="kcorrdiff-nvidia-smi-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _read_stdout(self) -> None:
+        try:
+            process = self._process
+            if process is None or process.stdout is None:
+                raise RuntimeError("GPU utilization sampler has no stdout")
+            for line in process.stdout:
+                pieces = tuple(piece.strip() for piece in line.split(","))
+                if len(pieces) != len(self._QUERY_FIELDS):
+                    continue
+                try:
+                    sample = tuple(float(piece) for piece in pieces)
+                except ValueError:
+                    continue
+                self._samples.append(sample)  # type: ignore[arg-type]
+        except BaseException as error:  # pragma: no cover - defensive thread boundary
+            self._read_error = error
+
+    def stop(self) -> dict[str, object]:
+        process = self._process
+        thread = self._thread
+        if process is None or thread is None:
+            raise RuntimeError("GPU utilization sampler was not started")
+        process.terminate()
+        try:
+            process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3.0)
+        thread.join(timeout=3.0)
+        stderr = process.stderr.read().strip() if process.stderr is not None else ""
+        self._process = None
+        self._thread = None
+        if thread.is_alive():
+            raise RuntimeError("GPU utilization sampler thread did not stop")
+        if self._read_error is not None:
+            raise RuntimeError("GPU utilization sampler reader failed") from self._read_error
+        if not self._samples:
+            raise RuntimeError(
+                "GPU utilization sampler produced no samples"
+                + (f": {stderr}" if stderr else "")
+            )
+        columns = tuple(zip(*self._samples, strict=True))
+        return {
+            "backend": "nvidia-smi",
+            "interval_ms": self.interval_ms,
+            "sample_count": len(self._samples),
+            "gpu_utilization_percent": _distribution(columns[0]),
+            "memory_utilization_percent": _distribution(columns[1]),
+            "memory_used_mib": _distribution(columns[2]),
+            "power_draw_watts": _distribution(columns[3]),
+        }
+
+    def abort(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+        self._process = None
+        self._thread = None
 
 
 def _synchronize(device: torch.device) -> None:
@@ -586,7 +745,8 @@ def _production_forward_loss(
     config: Stage2Config,
     global_step: int,
 ) -> ForwardLossResult:
-    if type(model) is not RegressionSystem:
+    unwrapped = getattr(model, "_orig_mod", model)
+    if type(unwrapped) is not RegressionSystem:
         raise TypeError("production forward requires exact RegressionSystem")
     if not isinstance(training, TrainingBatch):
         raise TypeError("production model benchmark requires TrainingBatch")
@@ -666,11 +826,14 @@ def run_model_candidate(
     expected_parameter_count: int = EXPECTED_REGRESSION_PARAMETER_COUNT,
     require_exact_model_class: bool = True,
     oof_codec_probe_path: Path | None = None,
+    torch_compile_mode: str = "eager",
 ) -> dict[str, object]:
     """Execute warmup and measured full optimizer steps for one candidate."""
 
     _positive_integer(warmup_steps, name="warmup_steps")
     _positive_integer(measured_steps, name="measured_steps")
+    if torch_compile_mode not in {"eager", "default", "reduce-overhead"}:
+        raise ValueError("unsupported torch compile mode")
     _validate_runtime_device(device, allow_cpu_test=allow_cpu_test)
     if not preflight.approved:
         raise ValueError("cannot execute a payload-preflight-rejected candidate")
@@ -689,6 +852,8 @@ def run_model_candidate(
     optimizer: torch.optim.Optimizer | None = None
     moved_training: object | None = None
     forward_result: ForwardLossResult | None = None
+    telemetry_sampler: _NvidiaSmiSampler | None = None
+    telemetry: dict[str, object] | None = None
     candidate_started = time.perf_counter()
     try:
         torch.manual_seed(config.seed)
@@ -703,6 +868,15 @@ def run_model_candidate(
             expected_parameter_count=expected_parameter_count,
             require_exact_class=require_exact_model_class,
         )
+        if torch_compile_mode != "eager":
+            if device.type != "cuda":
+                raise ValueError("torch.compile diagnostics require CUDA")
+            model = torch.compile(
+                model,
+                mode=torch_compile_mode,
+                fullgraph=False,
+                dynamic=False,
+            )
         _synchronize(device)
         model_construction_seconds = time.perf_counter() - model_started
 
@@ -748,6 +922,11 @@ def run_model_candidate(
         for step_index in range(total_steps):
             measured = step_index >= warmup_steps
             if measured and measurement_started is None:
+                if device.type == "cuda":
+                    telemetry_sampler = _NvidiaSmiSampler(
+                        device_index=device.index or 0
+                    )
+                    telemetry_sampler.start()
                 measurement_started = time.perf_counter()
             wait_started = time.perf_counter()
             timed = next(iterator)  # type: ignore[arg-type]
@@ -867,6 +1046,9 @@ def run_model_candidate(
             del moved_weights
 
         _synchronize(device)
+        if telemetry_sampler is not None:
+            telemetry = telemetry_sampler.stop()
+            telemetry_sampler = None
         if measurement_started is None:
             raise AssertionError("measurement window did not start")
         wall_seconds = time.perf_counter() - measurement_started
@@ -926,8 +1108,13 @@ def run_model_candidate(
             "device": str(device),
             "pin_memory": pin_memory,
             "non_blocking_h2d": device.type == "cuda",
+            "torch_compile_enabled": torch_compile_mode != "eager",
+            "torch_compile_mode": torch_compile_mode,
+            "gpu_telemetry": telemetry,
         }
     finally:
+        if telemetry_sampler is not None:
+            telemetry_sampler.abort()
         forward_result = None
         moved_training = None
         if optimizer is not None:
@@ -1206,6 +1393,19 @@ class _WandbLogger:
             if isinstance(distribution, Mapping):
                 for statistic, value in distribution.items():
                     payload[f"timing/{timing}/{statistic}"] = value
+        telemetry = result.get("gpu_telemetry")
+        if isinstance(telemetry, Mapping):
+            payload["gpu/sample_count"] = telemetry.get("sample_count", 0)
+            for name in (
+                "gpu_utilization_percent",
+                "memory_utilization_percent",
+                "memory_used_mib",
+                "power_draw_watts",
+            ):
+                distribution = telemetry.get(name)
+                if isinstance(distribution, Mapping):
+                    for statistic, value in distribution.items():
+                        payload[f"gpu/{name}/{statistic}"] = value
         losses = result.get("losses")
         if isinstance(losses, Mapping):
             for name, distribution in losses.items():
@@ -1303,6 +1503,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "role": contract.role,
         "fold_id": contract.fold_id,
         "plan_sha256": context.plan.semantic_sha256,
+        "diagnostic_non_power_of_two": (
+            contract.diagnostic_non_power_of_two
+        ),
+        "torch_compile_mode": contract.torch_compile_mode,
     }
     wandb_logger = _WandbLogger(
         mode=arguments.wandb_mode, safe_config=safe_wandb_config
@@ -1340,6 +1544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 system_config=model_contract.system,
                 pin_memory=True,
                 oof_codec_probe_path=arguments.oof_codec_probe_npy,
+                torch_compile_mode=contract.torch_compile_mode,
             )
 
         results = run_model_grid(
@@ -1375,6 +1580,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "fold_id": contract.fold_id,
                 "worker_count": contract.worker_count,
                 "prefetch_factor": contract.prefetch_factor,
+                "diagnostic_non_power_of_two": (
+                    contract.diagnostic_non_power_of_two
+                ),
+                "torch_compile_mode": contract.torch_compile_mode,
                 "grid": asdict(contract.grid),
                 "payload_limits": asdict(contract.payload_limits),
             },
