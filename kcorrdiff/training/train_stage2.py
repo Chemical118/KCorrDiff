@@ -1,4 +1,4 @@
-"""Strict two-rank Stage 2 regression, cross-fit OOF and deployment training.
+"""Strict multi-rank Stage 2 regression, cross-fit OOF and deployment training.
 
 The production entry point is launched with ``torchrun``.  It intentionally
 uses explicit SUM gradient reductions instead of wrapping the model in
@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -295,10 +295,10 @@ def _verify_launch_identity_distributed(
 
 
 def initialize_distributed_runtime(*, require_world_size: int) -> DistributedRuntime:
-    """Initialize the exact torchrun/NCCL production topology."""
+    """Initialize the explicitly requested torchrun/NCCL topology."""
 
-    if require_world_size != 2:
-        raise ValueError("v1.1.3b Stage 2 production requires exactly two ranks")
+    if isinstance(require_world_size, bool) or require_world_size <= 0:
+        raise ValueError("Stage 2 world size must be a positive integer")
     required = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
     missing = [name for name in required if name not in os.environ]
     if missing:
@@ -309,7 +309,7 @@ def initialize_distributed_runtime(*, require_world_size: int) -> DistributedRun
     if world_size != require_world_size or not 0 <= rank < world_size:
         raise RuntimeError("torchrun rank/world size disagrees with required topology")
     if not 0 <= local_rank < require_world_size:
-        raise RuntimeError("LOCAL_RANK is outside the visible two-GPU topology")
+        raise RuntimeError("LOCAL_RANK is outside the requested GPU topology")
     device = configure_strict_float32(
         require_cuda=True, required_visible_gpus=require_world_size
     )
@@ -330,6 +330,72 @@ def initialize_distributed_runtime(*, require_world_size: int) -> DistributedRun
     if torch.is_autocast_enabled() or torch.is_autocast_enabled("cuda"):
         raise RuntimeError("autocast must remain disabled for Stage 2")
     return DistributedRuntime(rank, local_rank, world_size, device, True)
+
+
+def execution_config_for_topology(
+    config: Stage2Config,
+    *,
+    world_size: int,
+    per_rank_microbatch_size: int,
+    gradient_accumulation_steps: int,
+) -> Stage2Config:
+    """Bind a CLI topology while preserving the preregistered global batch.
+
+    The immutable YAML remains the reference two-rank tuning contract.  A
+    different positive GPU count is allowed only when the selected per-rank
+    power-of-two batch is unchanged and gradient accumulation exactly
+    preserves ``global_effective_batch_size``.  Checkpoints and manifests
+    record the resulting execution topology, so incompatible resumes fail.
+    """
+
+    for name, value in (
+        ("world_size", world_size),
+        ("per_rank_microbatch_size", per_rank_microbatch_size),
+        ("gradient_accumulation_steps", gradient_accumulation_steps),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if per_rank_microbatch_size & (per_rank_microbatch_size - 1):
+        raise ValueError("per-rank microbatch size must be a power of two")
+    if per_rank_microbatch_size != config.optimization.per_rank_microbatch_size:
+        raise ValueError(
+            "execution microbatch must retain the benchmark-selected value"
+        )
+    observed_global = (
+        world_size
+        * per_rank_microbatch_size
+        * gradient_accumulation_steps
+    )
+    if observed_global != config.optimization.global_effective_batch_size:
+        raise ValueError(
+            "execution topology must preserve the configured global effective "
+            f"batch {config.optimization.global_effective_batch_size}; got "
+            f"{observed_global}"
+        )
+    result = replace(
+        config,
+        optimization=replace(
+            config.optimization,
+            per_rank_microbatch_size=per_rank_microbatch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        ),
+    )
+    result.validate_topology(world_size=world_size)
+    return result
+
+
+def _selection_reference_world_size(config: Stage2Config) -> int:
+    denominator = (
+        config.optimization.per_rank_microbatch_size
+        * config.optimization.gradient_accumulation_steps
+    )
+    global_batch = config.optimization.global_effective_batch_size
+    if global_batch % denominator:
+        raise ValueError("reference selection topology is not integral")
+    world_size = global_batch // denominator
+    if world_size <= 0:
+        raise ValueError("reference selection world size must be positive")
+    return world_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -2375,6 +2441,20 @@ def run_stage2(
     tracking_config = dict(config.raw)
     tracking_config["stage2_config_sha256"] = config.sha256
     tracking_config["launch_identity"] = launch_identity.provenance()
+    tracking_config["execution_topology"] = {
+        "world_size": runtime.world_size,
+        "per_rank_microbatch_size": (
+            config.optimization.per_rank_microbatch_size
+        ),
+        "gradient_accumulation_steps": (
+            config.optimization.gradient_accumulation_steps
+        ),
+        "global_effective_batch_size": (
+            runtime.world_size
+            * config.optimization.per_rank_microbatch_size
+            * config.optimization.gradient_accumulation_steps
+        ),
+    }
     tracking, tracking_step = _initialize_tracking_distributed(
         enabled=enabled,
         runtime=runtime,
@@ -2816,8 +2896,12 @@ def validate_launch_arguments(
         raise ValueError("Stage 2 config must be the source-tree production config")
     if arguments.data_contract.resolve() != source_root / "configs/data-contract-v1.1.3b.json":
         raise ValueError("Stage 2 data contract must be the source-tree contract")
-    if arguments.require_world_size != 2:
-        raise ValueError("Stage 2 requires exactly two torchrun ranks")
+    execution_config_for_topology(
+        config,
+        world_size=arguments.require_world_size,
+        per_rank_microbatch_size=arguments.per_rank_microbatch_size,
+        gradient_accumulation_steps=arguments.gradient_accumulation_steps,
+    )
     if arguments.precision != "float32" or arguments.precision != config.runtime.precision:
         raise ValueError("Stage 2 precision must remain config-bound float32")
     if not arguments.disable_tf32 or config.runtime.tf32:
@@ -2830,7 +2914,6 @@ def validate_launch_arguments(
         "era_latent_channels": config.runtime.era_latent_channels,
         "era_grid_size": config.runtime.era_grid_size,
         "per_rank_microbatch_size": config.optimization.per_rank_microbatch_size,
-        "gradient_accumulation_steps": config.optimization.gradient_accumulation_steps,
     }
     for name, value in expected.items():
         actual = getattr(arguments, name)
@@ -2879,7 +2962,7 @@ def validate_launch_arguments(
             selection_path,
             expected_sha256=selection_sha256,
             config=config,
-            world_size=arguments.require_world_size,
+            world_size=_selection_reference_world_size(config),
             num_workers=arguments.num_workers,
             prefetch_factor=arguments.prefetch_factor,
             # Production benchmark files live on the PVC; their immutable
@@ -2887,7 +2970,6 @@ def validate_launch_arguments(
             # after the factory exposes the mounted artifact lineage.
             verify_benchmark_artifacts=False,
         )
-    config.validate_topology(world_size=arguments.require_world_size)
     for name in _FALLBACK_ENVIRONMENT:
         raw = environment.get(name)
         if raw is not None and _environment_flag(raw):
@@ -2957,8 +3039,14 @@ def _factory_inputs_from_arguments(
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_args(argv)
-    config = load_stage2_config(arguments.config)
-    selection = validate_launch_arguments(arguments, config)
+    reference_config = load_stage2_config(arguments.config)
+    selection = validate_launch_arguments(arguments, reference_config)
+    config = execution_config_for_topology(
+        reference_config,
+        world_size=arguments.require_world_size,
+        per_rank_microbatch_size=arguments.per_rank_microbatch_size,
+        gradient_accumulation_steps=arguments.gradient_accumulation_steps,
+    )
     launch_identity = load_stage2_launch_identity(
         arguments.launch_identity,
         expected_sha256=arguments.launch_identity_sha256,
@@ -2992,8 +3080,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         loader_selection = load_stage2_selection_contract(
             selection_path,
             expected_sha256=str(loader_tuning["selection_artifact_sha256"]),
-            config=config,
-            world_size=runtime.world_size,
+            config=reference_config,
+            world_size=_selection_reference_world_size(reference_config),
             num_workers=arguments.num_workers,
             prefetch_factor=arguments.prefetch_factor,
             verify_benchmark_artifacts=False,
@@ -3097,6 +3185,7 @@ __all__ = [
     "Stage2RunResult",
     "StoragePreflight",
     "TARGET_BUILDER_VERSION",
+    "execution_config_for_topology",
     "initialize_distributed_runtime",
     "load_complete_stage2_manifest",
     "main",

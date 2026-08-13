@@ -27,6 +27,7 @@ from kcorrdiff.training.train_stage2 import (
     DistributedRuntime,
     RoleTrainingResult,
     RunSelection,
+    execution_config_for_topology,
     preflight_storage,
     reduce_gradients_sum,
     regression_system_config_from_stage2,
@@ -451,6 +452,63 @@ def test_launch_contract_accepts_bounded_fold_and_rejects_fallback() -> None:
             arguments,
             config,
             environ={"KCORRDIFF_ALLOW_CPU_FALLBACK": "1"},
+        )
+
+
+def test_launch_contract_accepts_one_gpu_with_equivalent_global_batch() -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    arguments = _launch_arguments()
+    arguments.require_world_size = 1
+    arguments.gradient_accumulation_steps = 2
+    selection = validate_launch_arguments(
+        arguments,
+        config,
+        environ={
+            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
+            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
+            "KCORRDIFF_REQUIRE_PRECISION": "float32",
+            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
+            "NVIDIA_TF32_OVERRIDE": "0",
+        },
+    )
+    execution = execution_config_for_topology(
+        config,
+        world_size=1,
+        per_rank_microbatch_size=8,
+        gradient_accumulation_steps=2,
+    )
+    assert selection.partial is True
+    assert execution.optimization.gradient_accumulation_steps == 2
+    assert (
+        execution.optimization.global_effective_batch_size
+        == 1
+        * execution.optimization.per_rank_microbatch_size
+        * execution.optimization.gradient_accumulation_steps
+        == 16
+    )
+    assert execution.sha256 == config.sha256
+
+    arguments.gradient_accumulation_steps = 1
+    with pytest.raises(ValueError, match="preserve the configured global"):
+        validate_launch_arguments(arguments, config, environ={
+            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
+            "KCORRDIFF_REQUIRE_PRECISION": "float32",
+            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
+            "NVIDIA_TF32_OVERRIDE": "0",
+        })
+
+
+def test_execution_topology_rejects_non_power_of_two_microbatch() -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    with pytest.raises(ValueError, match="power of two"):
+        execution_config_for_topology(
+            config,
+            world_size=1,
+            per_rank_microbatch_size=3,
+            gradient_accumulation_steps=2,
         )
 
 

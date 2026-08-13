@@ -178,6 +178,11 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   현재 node의 8 GPU가 모두 할당되어 정식 exact 2-GPU Job은 아직 스케줄할 수 없다.
   실측 기반 Stage 2 순수 학습 예상은 2 GPU 약 52시간, 1 GPU 환산 약 105시간이며
   OOF inference/compression/overflow 시간이 추가된다.
+- Stage 2 torchrun world size는 더 이상 2로 하드코딩하지 않는다. CLI의 양의
+  `--require-world-size`를 허용하되 benchmark-selected B=8과 global batch 16은
+  유지해야 한다. 따라서 2 GPU는 accumulation=1, 1 GPU는 accumulation=2이며,
+  다른 조합은 fail-closed다. 실제 topology는 checkpoint, partial/complete manifest,
+  W&B config에 별도로 기록되어 서로 다른 topology의 checkpoint를 잘못 resume할 수 없다.
 
 ## Stage 3 — residual EDM, 독립 평가 및 calibration 경계
 
@@ -220,6 +225,11 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
 - 전체 repository suite: `465 passed, 7 skipped`; host에서 skip된 CUDA 전용 7개
   경로를 porsche A100에서 재실행해 모두 통과했다. Triton/Torch cache는 read-only
   root가 아닌 `/tmp`로 고정한다.
+- A100-40GB에서 EDM-B 단독 full-width forward/backward/AdamW를 B=1,2,4,8,16의
+  2의 제곱 순서로 검사했다. Peak allocated는 각각 2.99, 5.73, 11.22, 22.22 GiB였고
+  B=16은 OOM으로 거부됐다. 실제 Stage 3에는 frozen Stage 2 frontend와 production
+  batch가 더해지므로 이 단독 결과만으로 B=8을 채택하지 않고, 현재 B=1/accumulation=4를
+  보수적 시작값으로 유지해 complete Stage 2 artifact에서 end-to-end 재검증한다.
 - Stage 2 Job은 immutable `/workspace/code/stage2-production-v1`에서만 import하도록
   `workingDir`와 `PYTHONPATH`를 수정해 suspended 상태로 클러스터에 등록했다.
   Stage 3 Job도 향후 immutable `/workspace/code/stage3-production-v1` snapshot만 본다.
