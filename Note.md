@@ -238,7 +238,7 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   B=16은 OOM으로 거부됐다. 실제 Stage 3에는 frozen Stage 2 frontend와 production
   batch가 더해지므로 이 단독 결과만으로 B=8을 채택하지 않고, 현재 B=1/accumulation=4를
   보수적 시작값으로 유지해 complete Stage 2 artifact에서 end-to-end 재검증한다.
-- Stage 2 fold Job은 immutable `/workspace/code/stage2-folds-porsche-v1`에서만
+- Stage 2 fold Job은 immutable `/workspace/code/stage2-folds-porsche-v2`에서만
   import하며 porsche-local PVC에 fold별 checkpoint를 직접 기록한다.
   Stage 3 Job도 향후 immutable `/workspace/code/stage3-production-v1` snapshot만 본다.
 - Stage 3 본학습은 complete Stage 2 OOF/checkpoint가 선행되어야 하므로 아직 시작하지

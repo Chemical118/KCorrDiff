@@ -91,8 +91,8 @@ completion marker와 checkpoint/manifest SHA-256을 검증하고 hard link로 �
 fold set을 게시한다. NFS, cross-node stage-in, 서버 간 복사는 사용하지 않는다.
 
 ```text
-/workspace/runs/stage2-folds-porsche-v1/assembled/fold-set-v1/fold-{0,1,2}/final.pt
-/workspace/runs/stage2-folds-porsche-v1/assembled/fold-set-v1/fold-set-manifest.json
+/workspace/runs/stage2-folds-porsche-v2/assembled/fold-set-v1/fold-{0,1,2}/final.pt
+/workspace/runs/stage2-folds-porsche-v2/assembled/fold-set-v1/fold-set-manifest.json
 ```
 
 이 fold set은 Stage 2 전체 release가 아니다. OOF inference, residual scale,

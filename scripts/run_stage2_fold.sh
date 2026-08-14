@@ -3,8 +3,8 @@ set -euo pipefail
 
 fold_id="${JOB_COMPLETION_INDEX:?missing indexed Job completion index}"
 node_name="${NODE_NAME:?missing scheduled node name}"
-source_root=/workspace/code/stage2-folds-porsche-v1
-run_root=/workspace/runs/stage2-folds-porsche-v1
+source_root=/workspace/code/stage2-folds-porsche-v2
+run_root=/workspace/runs/stage2-folds-porsche-v2
 output_dir="${run_root}/workers/fold-${fold_id}"
 launch_identity="${output_dir}/provenance/launch-identity.json"
 runtime_report=/workspace/envs/stage2-python-v1/pip-report.json

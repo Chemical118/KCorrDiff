@@ -3,12 +3,12 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: kcorrdiff-stage2-folds-porsche-v1
+  name: kcorrdiff-stage2-folds-porsche-v2
   namespace: ws-md93se6gk3270
   labels:
     app.kubernetes.io/name: kcorrdiff
     app.kubernetes.io/component: stage2-single-node-fold-training
-    app.kubernetes.io/instance: stage2-folds-porsche-v1
+    app.kubernetes.io/instance: stage2-folds-porsche-v2
 spec:
   suspend: true
   completions: 3
@@ -21,7 +21,7 @@ spec:
       labels:
         app.kubernetes.io/name: kcorrdiff
         app.kubernetes.io/component: stage2-single-node-fold-training
-        app.kubernetes.io/instance: stage2-folds-porsche-v1
+        app.kubernetes.io/instance: stage2-folds-porsche-v2
     spec:
       serviceAccountName: kcorrdiff-porsche-trainer
       automountServiceAccountToken: false
@@ -42,10 +42,10 @@ spec:
         - name: trainer
           image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
           imagePullPolicy: IfNotPresent
-          command: ["/bin/bash", "-ceu", "/workspace/code/stage2-folds-porsche-v1/scripts/run_stage2_fold.sh"]
+          command: ["/bin/bash", "-ceu", "/workspace/code/stage2-folds-porsche-v2/scripts/run_stage2_fold.sh"]
           env:
             - name: RUN_ID
-              value: stage2-folds-porsche-v1
+              value: stage2-folds-porsche-v2
             - name: SINGLE_NODE_FOLD_POLICY_SHA256
               value: fd6c9854fa389795cba7d8b903f4490fa8bce92d76a02ee3e55988ac6790bc9f
             - name: JOB_COMPLETION_INDEX
@@ -57,7 +57,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-folds-porsche-v1
+              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-folds-porsche-v2
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -166,12 +166,12 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: kcorrdiff-stage2-fold-collector-porsche-v1
+  name: kcorrdiff-stage2-fold-collector-porsche-v2
   namespace: ws-md93se6gk3270
   labels:
     app.kubernetes.io/name: kcorrdiff
     app.kubernetes.io/component: stage2-single-node-fold-collector
-    app.kubernetes.io/instance: stage2-folds-porsche-v1
+    app.kubernetes.io/instance: stage2-folds-porsche-v2
 spec:
   suspend: true
   completions: 1
@@ -183,7 +183,7 @@ spec:
       labels:
         app.kubernetes.io/name: kcorrdiff
         app.kubernetes.io/component: stage2-single-node-fold-collector
-        app.kubernetes.io/instance: stage2-folds-porsche-v1
+        app.kubernetes.io/instance: stage2-folds-porsche-v2
     spec:
       serviceAccountName: kcorrdiff-porsche-trainer
       automountServiceAccountToken: false
@@ -204,7 +204,7 @@ spec:
         - name: collector
           image: python:3.12-slim-bookworm@sha256:356b0d18f9385f4bdcc673af60e1e64c9d1504952e4ec36ee32044c722a6bc4e
           imagePullPolicy: Always
-          workingDir: /workspace/code/stage2-folds-porsche-v1
+          workingDir: /workspace/code/stage2-folds-porsche-v2
           command: ["/bin/bash", "-ceu"]
           args:
             - |
@@ -213,7 +213,7 @@ spec:
               }
               trap 'rc=$?; notify "[KCorrDiff] Stage 2 porsche fold collector failed (exit=${rc})."; exit ${rc}' EXIT
               python3 scripts/collect_stage2_folds.py collect \
-                --run-root /workspace/runs/stage2-folds-porsche-v1 \
+                --run-root /workspace/runs/stage2-folds-porsche-v2 \
                 --poll-seconds 30 \
                 --timeout-hours 168
               notify "[KCorrDiff] Stage 2 folds 0, 1 and 2 all completed and were verified on porsche."
