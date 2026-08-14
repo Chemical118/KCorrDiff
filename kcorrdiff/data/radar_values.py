@@ -22,6 +22,14 @@ CPRECNET_RAIN_DB_MIN = -15.0
 CPRECNET_RAIN_DB_SPAN = 45.0
 """Width of the CPrecNet normalized logarithmic rain-rate interval."""
 
+CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR = 10.0 ** (
+    (CPRECNET_RAIN_DB_MIN + CPRECNET_RAIN_DB_SPAN) / 10.0
+)
+"""Largest linear rain rate representable by the CPrecNet transform."""
+
+CPRECNET_RAIN_RATE_MAX_RTOL = 1.0e-6
+"""Relative tolerance for float32 rounding at the rain-rate upper bound."""
+
 A_WET_MM = 0.1
 """Official wet threshold in millimetres per 30 minutes."""
 
@@ -83,6 +91,37 @@ def cprecnet_normalized_to_rain_rate(values: ArrayLike) -> FloatArray:
     return rain_rate
 
 
+def rain_rate_to_cprecnet_normalized(
+    rain_rate_mm_per_hour: ArrayLike,
+) -> FloatArray:
+    """Convert linear rain rate in ``mm h-1`` to CPrecNet normalized values.
+
+    Inverse of :func:`cprecnet_normalized_to_rain_rate` on its image, used to
+    re-apply the model-input transform after linear-space context regridding.
+    Rates at or below the archive's minimum representable rate collapse to
+    exactly zero, mirroring the archive's below-threshold censoring.  Rates
+    above the representable maximum are contract violations; a relative
+    tolerance absorbs float32 regrid rounding before the final clip.
+    """
+
+    rate = _finite_float_array(rain_rate_mm_per_hour, name="rain rate")
+    if np.any(rate < 0.0):
+        raise ValueError("rain rate cannot be negative")
+    maximum_with_tolerance = CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR * (
+        1.0 + CPRECNET_RAIN_RATE_MAX_RTOL
+    )
+    if np.any(rate > maximum_with_tolerance):
+        raise ValueError("rain rate exceeds the CPrecNet representable maximum")
+
+    normalized = np.zeros(rate.shape, dtype=np.float64)
+    positive = rate > 0.0
+    rain_db = 10.0 * np.log10(rate[positive])
+    normalized[positive] = (
+        rain_db - CPRECNET_RAIN_DB_MIN
+    ) / CPRECNET_RAIN_DB_SPAN
+    return np.clip(normalized, 0.0, 1.0)
+
+
 def censor_accumulation(
     raw_accumulation_mm: ArrayLike,
     *,
@@ -121,8 +160,11 @@ __all__ = [
     "A_WET_MM",
     "CPRECNET_RAIN_DB_MIN",
     "CPRECNET_RAIN_DB_SPAN",
+    "CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR",
+    "CPRECNET_RAIN_RATE_MAX_RTOL",
     "Z_WET",
     "CensoredAccumulation",
     "censor_accumulation",
     "cprecnet_normalized_to_rain_rate",
+    "rain_rate_to_cprecnet_normalized",
 ]
