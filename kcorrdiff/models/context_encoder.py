@@ -8,6 +8,13 @@ from typing import Final, Sequence
 import torch
 from torch import Tensor, nn
 
+from kcorrdiff.data.radar_values import (
+    CPRECNET_RAIN_DB_MIN,
+    CPRECNET_RAIN_DB_SPAN,
+    CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR,
+    CPRECNET_RAIN_RATE_MAX_RTOL,
+)
+
 from .common import (
     CONTEXT_WIDTHS,
     HISTORY_STEPS,
@@ -86,8 +93,17 @@ class ContextEncoderInputs:
         tensors = self.dynamic_fields, self.detail_validity, self.static_fields
         if any(tensor.device != self.dynamic_fields.device for tensor in tensors):
             raise ValueError("all context encoder inputs must share one device")
-        if bool((self.dynamic_fields[:, :, :2] < 0.0).any().item()):
+        rain_rate = self.dynamic_fields[:, :, :2]
+        if bool((rain_rate < 0.0).any().item()):
             raise ValueError("context rain-rate channels cannot be negative")
+        maximum_with_tolerance = CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR * (
+            1.0 + CPRECNET_RAIN_RATE_MAX_RTOL
+        )
+        if bool((rain_rate > maximum_with_tolerance).any().item()):
+            raise ValueError(
+                "context rain-rate channels exceed the CPrecNet "
+                "representable maximum"
+            )
         bounded = self.dynamic_fields[:, :, 2:]
         if bool(((bounded < 0.0) | (bounded > 1.0)).any().item()):
             raise ValueError("wet/validity/confidence channels must lie in [0,1]")
@@ -137,6 +153,26 @@ class ContextEncoderOutput:
             temporal_level_zero=self.temporal_level_zero.detach(),
             static_level_zero=self.static_level_zero.detach(),
         )
+
+
+def cprecnet_rate_to_normalized(rate_mm_per_hour: Tensor) -> Tensor:
+    """Re-apply the CPrecNet model-input transform to linear rain rates.
+
+    Architecture section 4 regrids context radar in linear ``R(mm h-1)``
+    space and then re-applies the model-input transform, so the encoder
+    consumes the same normalized logarithmic space as the target radar
+    history.  Rates at or below the archive's minimum representable rate map
+    to exactly zero, mirroring the archive's below-threshold censoring.
+    """
+
+    positive = rate_mm_per_hour > 0.0
+    rain_db = 10.0 * torch.log10(
+        rate_mm_per_hour.clamp_min(torch.finfo(rate_mm_per_hour.dtype).tiny)
+    )
+    normalized = ((rain_db - CPRECNET_RAIN_DB_MIN) / CPRECNET_RAIN_DB_SPAN).clamp(
+        0.0, 1.0
+    )
+    return torch.where(positive, normalized, torch.zeros_like(normalized))
 
 
 class ContextEncoder(nn.Module):
@@ -192,6 +228,10 @@ class ContextEncoder(nn.Module):
         dynamic[:, :, 1:2] = torch.where(
             inputs.detail_validity, dynamic[:, :, 1:2], 0.0
         )
+        # Rain-rate channels arrive in linear mm/h so the advection path can
+        # alias the same batch tensor; only the encoder consumes them through
+        # the CPrecNet normalized space.
+        dynamic[:, :, :2] = cprecnet_rate_to_normalized(dynamic[:, :, :2])
         pooling_validity = dynamic[:, :, 3:4] > 0.0
         temporal = self.temporal_stem(
             dynamic, pooling_validity=pooling_validity
@@ -213,4 +253,5 @@ __all__ = [
     "ContextEncoder",
     "ContextEncoderInputs",
     "ContextEncoderOutput",
+    "cprecnet_rate_to_normalized",
 ]

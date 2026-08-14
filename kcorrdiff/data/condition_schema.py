@@ -256,7 +256,12 @@ class ContextRadarConditions:
         return CONTEXT_DYNAMIC_CHANNEL_NAMES
 
     def as_array(self, *, dtype: npt.DTypeLike = np.float32) -> np.ndarray:
-        """Return model-facing ``[T,5,H,W]`` values in named channel order."""
+        """Return batch-facing ``[T,5,H,W]`` values in named channel order.
+
+        Rate channels stay in linear ``mm h-1`` because the advection path
+        aliases this tensor; ``ContextEncoder`` re-applies the CPrecNet
+        model-input transform to them at its own boundary.
+        """
 
         return np.stack(
             (

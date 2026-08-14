@@ -6,10 +6,16 @@ import pytest
 import torch
 
 from kcorrdiff.models.condition_bank import ConditionBankInputs
+from kcorrdiff.data.radar_values import (
+    CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR,
+    CPRECNET_RAIN_RATE_MAX_RTOL,
+    rain_rate_to_cprecnet_normalized,
+)
 from kcorrdiff.models.context_encoder import (
     CONTEXT_DYNAMIC_CHANNEL_NAMES,
     ContextEncoder,
     ContextEncoderInputs,
+    cprecnet_rate_to_normalized,
 )
 from kcorrdiff.models.target_encoder import (
     TARGET_STATIC_CHANNEL_NAMES,
@@ -83,6 +89,57 @@ def test_temporal_stem_is_order_sensitive_and_static_is_evaluated_once() -> None
     )
 
 
+def test_rate_transform_matches_data_contract_and_censors_below_threshold() -> None:
+    generator = torch.Generator().manual_seed(1207)
+    rates = torch.rand(2, 12, 2, 8, 8, generator=generator) * 1000.0
+    rates[0, 0, 0, 0, :4] = torch.tensor([0.0, 1.0e-3, 10.0**-1.5, 1000.0])
+
+    normalized = cprecnet_rate_to_normalized(rates)
+
+    expected = rain_rate_to_cprecnet_normalized(rates.double().numpy())
+    torch.testing.assert_close(
+        normalized.double(),
+        torch.from_numpy(expected),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+    assert normalized.min().item() >= 0.0
+    assert normalized.max().item() <= 1.0
+    assert torch.equal(
+        normalized[0, 0, 0, 0, :3], torch.zeros(3)
+    )  # below-threshold rates censor to exact zero
+    assert normalized[0, 0, 0, 0, 3].item() == pytest.approx(1.0)
+
+
+def test_context_encoder_consumes_rates_through_the_normalized_space() -> None:
+    inputs = make_bank_inputs(batch=1, size=16)
+    encoder = ContextEncoder(
+        widths=TEST_CONTEXT_WIDTHS,
+        input_size=16,
+        allow_test_override=True,
+    ).eval()
+
+    censored_dynamic = inputs.context.dynamic_fields.clone()
+    censored_dynamic[:, :, :2] = torch.where(
+        censored_dynamic[:, :, :2] > 10.0**-1.5,
+        censored_dynamic[:, :, :2],
+        0.0,
+    )
+    with torch.no_grad():
+        from_rates = encoder(inputs.context)
+        from_censored = encoder(
+            ContextEncoderInputs(
+                dynamic_fields=censored_dynamic,
+                detail_validity=inputs.context.detail_validity,
+                static_fields=inputs.context.static_fields,
+            )
+        )
+
+    torch.testing.assert_close(
+        from_rates.temporal_level_zero, from_censored.temporal_level_zero
+    )
+
+
 def test_schema_and_issue_time_boundary_reject_wrong_or_future_names() -> None:
     inputs = make_bank_inputs(size=16)
     assert {field.name for field in fields(ConditionBankInputs)} == {
@@ -135,6 +192,30 @@ def test_input_contract_rejects_float64_bad_validity_and_invalid_coverage() -> N
     with pytest.raises(ValueError, match=r"\[0,1\]"):
         ContextEncoderInputs(
             dynamic_fields=invalid_context,
+            detail_validity=inputs.context.detail_validity,
+            static_fields=inputs.context.static_fields,
+        )
+
+
+def test_context_input_contract_enforces_cprecnet_rain_rate_maximum() -> None:
+    inputs = make_bank_inputs(size=16)
+    within_tolerance = inputs.context.dynamic_fields.clone()
+    within_tolerance[0, 0, 0, 0, 0] = CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR * (
+        1.0 + 0.5 * CPRECNET_RAIN_RATE_MAX_RTOL
+    )
+    ContextEncoderInputs(
+        dynamic_fields=within_tolerance,
+        detail_validity=inputs.context.detail_validity,
+        static_fields=inputs.context.static_fields,
+    )
+
+    above_tolerance = inputs.context.dynamic_fields.clone()
+    above_tolerance[0, 0, 0, 0, 0] = CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR * (
+        1.0 + 2.0 * CPRECNET_RAIN_RATE_MAX_RTOL
+    )
+    with pytest.raises(ValueError, match="representable maximum"):
+        ContextEncoderInputs(
+            dynamic_fields=above_tolerance,
             detail_validity=inputs.context.detail_validity,
             static_fields=inputs.context.static_fields,
         )

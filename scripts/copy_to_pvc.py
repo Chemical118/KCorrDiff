@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumably copy local/NFS files into a Kubernetes-mounted PVC.
+"""Resumably copy local files into a Kubernetes-mounted PVC.
 
 ``kubectl cp`` uses one long tar stream, which is fragile for multi-GiB data.
 This utility sends bounded chunks with byte-addressed writes, resumes a partial

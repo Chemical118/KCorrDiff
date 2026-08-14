@@ -1,0 +1,59 @@
+# Temporary CPU-only receiver used by scripts/publish_stage2_fold_source.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kcorrdiff-stage2-fold-source-publisher
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-fold-source-publisher
+spec:
+  serviceAccountName: kcorrdiff-porsche-trainer
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 10
+  nodeSelector:
+    kubernetes.io/hostname: porsche
+  securityContext:
+    runAsUser: 1035
+    runAsGroup: 1035
+    runAsNonRoot: true
+    fsGroup: 1035
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: publisher
+      image: alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-ceu", "--"]
+      args: ["trap 'exit 0' TERM INT; while :; do sleep 30; done"]
+      resources:
+        requests:
+          cpu: "0"
+          memory: "0"
+          ephemeral-storage: "0"
+        limits:
+          cpu: "1"
+          memory: 1Gi
+          ephemeral-storage: 128Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: saycorn-volume
+    - name: tmp
+      emptyDir:
+        sizeLimit: 128Mi

@@ -1,0 +1,265 @@
+# Three one-GPU Stage 2 fold workers restricted to the porsche node that owns
+# saycorn-volume. At most two run concurrently under the namespace GPU quota.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-stage2-folds-porsche-v1
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-single-node-fold-training
+    app.kubernetes.io/instance: stage2-folds-porsche-v1
+spec:
+  suspend: true
+  completions: 3
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  activeDeadlineSeconds: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: stage2-single-node-fold-training
+        app.kubernetes.io/instance: stage2-folds-porsche-v1
+    spec:
+      serviceAccountName: kcorrdiff-porsche-trainer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 300
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-ceu", "/workspace/code/stage2-folds-porsche-v1/scripts/run_stage2_fold.sh"]
+          env:
+            - name: RUN_ID
+              value: stage2-folds-porsche-v1
+            - name: SINGLE_NODE_FOLD_POLICY_SHA256
+              value: fd6c9854fa389795cba7d8b903f4490fa8bce92d76a02ee3e55988ac6790bc9f
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PYTHONPATH
+              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-folds-porsche-v1
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONPYCACHEPREFIX
+              value: /tmp/pycache
+            - name: TMPDIR
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/cache
+            - name: TORCH_EXTENSIONS_DIR
+              value: /tmp/torch-extensions
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/torchinductor
+            - name: TRITON_CACHE_DIR
+              value: /tmp/triton
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: NCCL_DEBUG
+              value: WARN
+            - name: NVIDIA_TF32_OVERRIDE
+              value: "0"
+            - name: CUBLAS_WORKSPACE_CONFIG
+              value: ":4096:8"
+            - name: PYTHONHASHSEED
+              value: "11103"
+            - name: KCORRDIFF_REQUIRE_FULL_WIDTH
+              value: "1"
+            - name: KCORRDIFF_REQUIRE_PRECISION
+              value: float32
+            - name: KCORRDIFF_REQUIRE_ERA_GRID_SIZE
+              value: "33"
+            - name: KCORRDIFF_ALLOW_CPU_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_PRECISION_FALLBACK
+              value: "0"
+            - name: KCORRDIFF_ALLOW_ERA_GRID_FALLBACK
+              value: "0"
+            - name: WANDB_PROJECT
+              value: kcorrdiff
+            - name: WANDB_JOB_TYPE
+              value: stage2-single-node-fold
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api
+                  key: WANDB_API_KEY
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kcorrdiff-telegram
+                  key: bot-token
+            - name: TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kcorrdiff-telegram
+                  key: chat-id
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "24"
+              memory: 60Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+            - name: oof-remote
+              mountPath: /run/secrets/kcorrdiff-oof
+              readOnly: true
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi
+        - name: oof-remote
+          secret:
+            secretName: kcorrdiff-oof-remote
+            defaultMode: 0440
+---
+# CPU-only verifier/notifier on the same porsche PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kcorrdiff-stage2-fold-collector-porsche-v1
+  namespace: ws-md93se6gk3270
+  labels:
+    app.kubernetes.io/name: kcorrdiff
+    app.kubernetes.io/component: stage2-single-node-fold-collector
+    app.kubernetes.io/instance: stage2-folds-porsche-v1
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcorrdiff
+        app.kubernetes.io/component: stage2-single-node-fold-collector
+        app.kubernetes.io/instance: stage2-folds-porsche-v1
+    spec:
+      serviceAccountName: kcorrdiff-porsche-trainer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/hostname: porsche
+      securityContext:
+        runAsUser: 1035
+        runAsGroup: 1035
+        runAsNonRoot: true
+        fsGroup: 1035
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: python:3.12-slim-bookworm@sha256:356b0d18f9385f4bdcc673af60e1e64c9d1504952e4ec36ee32044c722a6bc4e
+          imagePullPolicy: Always
+          workingDir: /workspace/code/stage2-folds-porsche-v1
+          command: ["/bin/bash", "-ceu"]
+          args:
+            - |
+              notify() {
+                python3 scripts/telegram_notify.py --optional "$1" || true
+              }
+              trap 'rc=$?; notify "[KCorrDiff] Stage 2 porsche fold collector failed (exit=${rc})."; exit ${rc}' EXIT
+              python3 scripts/collect_stage2_folds.py collect \
+                --run-root /workspace/runs/stage2-folds-porsche-v1 \
+                --poll-seconds 30 \
+                --timeout-hours 168
+              notify "[KCorrDiff] Stage 2 folds 0, 1 and 2 all completed and were verified on porsche."
+              trap - EXIT
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: TMPDIR
+              value: /tmp
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kcorrdiff-telegram
+                  key: bot-token
+            - name: TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kcorrdiff-telegram
+                  key: chat-id
+          resources:
+            requests:
+              cpu: "0"
+              memory: "0"
+              ephemeral-storage: "0"
+            limits:
+              cpu: "2"
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: saycorn-volume
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
