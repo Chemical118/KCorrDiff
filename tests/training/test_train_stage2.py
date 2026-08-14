@@ -575,6 +575,71 @@ def test_bounded_year_override_rejects_crossfit_or_accumulation() -> None:
         )
 
 
+def test_single_node_fold_worker_uses_porsche_b12_without_accumulation() -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    arguments = _launch_arguments()
+    arguments.require_world_size = 1
+    arguments.per_rank_microbatch_size = 12
+    arguments.gradient_accumulation_steps = 1
+    arguments.max_optimizer_steps = None
+    arguments.single_node_fold_worker = True
+    arguments.node_name = "porsche"
+    selection = validate_launch_arguments(
+        arguments,
+        config,
+        environ={
+            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
+            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
+            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
+            "KCORRDIFF_REQUIRE_PRECISION": "float32",
+            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
+            "NVIDIA_TF32_OVERRIDE": "0",
+        },
+    )
+    execution = execution_config_for_topology(
+        config,
+        world_size=1,
+        per_rank_microbatch_size=12,
+        gradient_accumulation_steps=1,
+        allow_single_node_fold_override=True,
+    )
+    assert selection.single_node_fold_worker is True
+    assert selection.node_name == "porsche"
+    assert execution.optimization.global_effective_batch_size == 12
+    assert execution.raw["optimization"]["global_effective_batch_size"] == 12
+    assert execution.raw["loader_tuning"]["selected_batch_size_per_rank"] == 12
+    assert execution.sha256 == config.sha256
+
+
+def test_single_node_fold_worker_rejects_node_batch_or_partial_run() -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    arguments = _launch_arguments()
+    arguments.require_world_size = 1
+    arguments.per_rank_microbatch_size = 12
+    arguments.gradient_accumulation_steps = 1
+    arguments.max_optimizer_steps = None
+    arguments.single_node_fold_worker = True
+    arguments.node_name = "bentley"
+    with pytest.raises(ValueError, match="PVC-local GPU node"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    arguments.node_name = "porsche"
+    arguments.max_optimizer_steps = 1
+    with pytest.raises(ValueError, match="no truncation"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    with pytest.raises(ValueError, match="B12/accum1"):
+        execution_config_for_topology(
+            config,
+            world_size=1,
+            per_rank_microbatch_size=24,
+            gradient_accumulation_steps=1,
+            allow_single_node_fold_override=True,
+        )
+
+
 def test_single_rank_skips_model_broadcast_and_multi_rank_is_no_grad(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

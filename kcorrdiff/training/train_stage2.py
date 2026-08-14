@@ -123,6 +123,39 @@ _FALLBACK_ENVIRONMENT = (
     "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK",
 )
 
+# User-directed one-GPU cross-fit policy for the porsche-local PVC. This is
+# separate from (and does not rewrite) the preregistered B8 loader/model
+# selection artifact.
+_SINGLE_NODE_FOLD_POLICY = {
+    "format_version": "kcorrdiff.stage2-single-node-fold-policy.v1",
+    "world_size": 1,
+    "global_effective_batch_size": 12,
+    "nodes": {
+        "porsche": {"gpu_memory_gib": 40, "microbatch": 12, "accumulation": 1},
+    },
+}
+SINGLE_NODE_FOLD_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(
+        _SINGLE_NODE_FOLD_POLICY, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+).hexdigest()
+
+
+def _single_node_fold_topology(node_name: str) -> tuple[int, int, int]:
+    raw = _SINGLE_NODE_FOLD_POLICY["nodes"]
+    assert isinstance(raw, Mapping)
+    node = raw.get(node_name)
+    if not isinstance(node, Mapping):
+        raise ValueError(
+            "single-node fold worker requires the PVC-local GPU node: "
+            f"{node_name!r}"
+        )
+    return (
+        int(node["microbatch"]),
+        int(node["accumulation"]),
+        int(node["gpu_memory_gib"]),
+    )
+
 
 def _mapping(value: object, *, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
@@ -337,6 +370,34 @@ def initialize_distributed_runtime(*, require_world_size: int) -> DistributedRun
     return DistributedRuntime(rank, local_rank, world_size, device, True)
 
 
+def validate_single_node_fold_device(
+    selection: "RunSelection", runtime: DistributedRuntime
+) -> None:
+    """Bind the PVC-local hostname policy to the visible physical A100."""
+
+    if not selection.single_node_fold_worker:
+        return
+    if runtime.world_size != 1 or runtime.device.type != "cuda":
+        raise RuntimeError("single-node fold worker requires one CUDA device")
+    assert selection.node_name is not None
+    _, _, expected_memory_gib = _single_node_fold_topology(selection.node_name)
+    properties = torch.cuda.get_device_properties(runtime.device)
+    device_name = str(properties.name)
+    if "A100" not in device_name.upper():
+        raise RuntimeError(
+            f"single-node fold worker requires an NVIDIA A100, got {device_name!r}"
+        )
+    observed_gib = int(properties.total_memory) / float(1024**3)
+    lower, upper = (
+        (35.0, 50.0) if expected_memory_gib == 40 else (70.0, 90.0)
+    )
+    if not lower <= observed_gib <= upper:
+        raise RuntimeError(
+            f"node {selection.node_name!r} declared {expected_memory_gib}GB but "
+            f"CUDA reports {observed_gib:.3f} GiB"
+        )
+
+
 def execution_config_for_topology(
     config: Stage2Config,
     *,
@@ -344,14 +405,15 @@ def execution_config_for_topology(
     per_rank_microbatch_size: int,
     gradient_accumulation_steps: int,
     allow_bounded_microbatch_override: bool = False,
+    allow_single_node_fold_override: bool = False,
 ) -> Stage2Config:
-    """Bind a CLI topology while preserving the preregistered global batch.
+    """Bind a CLI topology and explicitly record any permitted override.
 
     The immutable YAML remains the reference two-rank tuning contract.  A
-    different positive GPU count is allowed only when the selected per-rank
-    power-of-two batch is unchanged and gradient accumulation exactly
-    preserves ``global_effective_batch_size``.  Checkpoints and manifests
-    record the resulting execution topology, so incompatible resumes fail.
+    The normal path preserves the preregistered global batch. Bounded
+    diagnostics and the source-bound porsche fold policy may override it;
+    checkpoints and manifests record the actual execution topology so an
+    incompatible resume fails.
     """
 
     for name, value in (
@@ -366,6 +428,8 @@ def execution_config_for_topology(
         * per_rank_microbatch_size
         * gradient_accumulation_steps
     )
+    if allow_bounded_microbatch_override and allow_single_node_fold_override:
+        raise ValueError("Stage 2 execution overrides are mutually exclusive")
     if allow_bounded_microbatch_override:
         if world_size != 1 or gradient_accumulation_steps != 1:
             raise ValueError(
@@ -376,6 +440,45 @@ def execution_config_for_topology(
         # B (including B12), and records the resulting topology in its partial
         # manifest/checkpoint provenance.  Mirror the typed override in raw so
         # loader validation and W&B config report the actual execution.
+        execution_raw = json.loads(json.dumps(config.raw))
+        execution_optimization = _mapping(
+            execution_raw.get("optimization"), name="execution optimization"
+        )
+        execution_optimization["per_rank_microbatch_size"] = (
+            per_rank_microbatch_size
+        )
+        execution_optimization["gradient_accumulation_steps"] = (
+            gradient_accumulation_steps
+        )
+        execution_optimization["global_effective_batch_size"] = observed_global
+        execution_loader = _mapping(
+            execution_raw.get("loader_tuning"), name="execution loader tuning"
+        )
+        execution_loader["selected_batch_size_per_rank"] = (
+            per_rank_microbatch_size
+        )
+    elif allow_single_node_fold_override:
+        if world_size != 1:
+            raise ValueError("single-node fold override requires exactly one GPU")
+        if (
+            per_rank_microbatch_size,
+            gradient_accumulation_steps,
+        ) != (12, 1):
+            raise ValueError(
+                "single-node fold topology must be B12/accum1"
+            )
+        expected_global = int(
+            _SINGLE_NODE_FOLD_POLICY["global_effective_batch_size"]
+        )
+        if observed_global != expected_global:
+            raise ValueError(
+                "single-node folds require global effective batch "
+                f"{expected_global}; got {observed_global}"
+            )
+        # This mode is an explicit, source-bound execution policy rather than
+        # fabricated B12 benchmark evidence. Keep the immutable reference
+        # config SHA while reporting the actual topology through the typed and
+        # raw execution views, checkpoints, W&B and partial manifest.
         execution_raw = json.loads(json.dumps(config.raw))
         execution_optimization = _mapping(
             execution_raw.get("optimization"), name="execution optimization"
@@ -549,6 +652,8 @@ class RunSelection:
     max_optimizer_steps: int | None
     bounded_training_year: int | None = None
     expected_training_items: int | None = None
+    single_node_fold_worker: bool = False
+    node_name: str | None = None
 
     def __post_init__(self) -> None:
         unknown_phases = sorted(set(self.phases) - set(_ALL_PHASES))
@@ -602,6 +707,14 @@ class RunSelection:
                 or self.expected_training_items <= 0
             ):
                 raise ValueError("expected bounded training items must be positive")
+        if not isinstance(self.single_node_fold_worker, bool):
+            raise TypeError("single_node_fold_worker must be boolean")
+        if self.single_node_fold_worker:
+            if not isinstance(self.node_name, str) or not self.node_name:
+                raise ValueError("single-node fold worker requires a node name")
+            _single_node_fold_topology(self.node_name)
+        elif self.node_name is not None:
+            raise ValueError("node name is reserved for single-node fold workers")
 
     @property
     def partial(self) -> bool:
@@ -610,6 +723,7 @@ class RunSelection:
             or self.phases != _ALL_PHASES
             or bool(self.roles)
             or self.bounded_training_year is not None
+            or self.single_node_fold_worker
         )
 
     def includes_role(self, role: str, fold_id: int | None = None) -> bool:
@@ -2580,6 +2694,11 @@ def run_stage2(
             * config.optimization.gradient_accumulation_steps
         ),
     }
+    if selection.single_node_fold_worker:
+        tracking_config["single_node_fold_execution"] = {
+            "policy_sha256": SINGLE_NODE_FOLD_POLICY_SHA256,
+            "node_name": selection.node_name,
+        }
     tracking, tracking_step = _initialize_tracking_distributed(
         enabled=enabled,
         runtime=runtime,
@@ -2845,6 +2964,8 @@ def run_stage2(
                 "max_optimizer_steps": selection.max_optimizer_steps,
                 "bounded_training_year": selection.bounded_training_year,
                 "expected_training_items": selection.expected_training_items,
+                "single_node_fold_worker": selection.single_node_fold_worker,
+                "node_name": selection.node_name,
             },
             "config_sha256": config.sha256,
             "launch_identity": launch_identity.provenance(),
@@ -2854,8 +2975,18 @@ def run_stage2(
                 "world_size": runtime.world_size,
                 "per_rank_microbatch_size": config.optimization.per_rank_microbatch_size,
                 "gradient_accumulation_steps": config.optimization.gradient_accumulation_steps,
+                "global_effective_batch_size": (
+                    runtime.world_size
+                    * config.optimization.per_rank_microbatch_size
+                    * config.optimization.gradient_accumulation_steps
+                ),
                 "precision": config.runtime.precision,
                 "tf32": config.runtime.tf32,
+                "single_node_fold_policy_sha256": (
+                    SINGLE_NODE_FOLD_POLICY_SHA256
+                    if selection.single_node_fold_worker
+                    else None
+                ),
                 "cursor_global_example_index_semantics": (
                     "rank_local_plan_slots_consumed_including_padding"
                 ),
@@ -2962,6 +3093,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-optimizer-steps", type=int)
     parser.add_argument("--bounded-training-year", type=int)
     parser.add_argument("--expected-training-items", type=int)
+    parser.add_argument("--single-node-fold-worker", action="store_true")
+    parser.add_argument("--node-name")
     parser.add_argument("--phases", type=_csv, default=_ALL_PHASES)
     parser.add_argument("--roles", type=_csv, default=())
     parser.add_argument(
@@ -3031,6 +3164,10 @@ def validate_launch_arguments(
         max_optimizer_steps=arguments.max_optimizer_steps,
         bounded_training_year=arguments.bounded_training_year,
         expected_training_items=arguments.expected_training_items,
+        single_node_fold_worker=bool(
+            getattr(arguments, "single_node_fold_worker", False)
+        ),
+        node_name=getattr(arguments, "node_name", None),
     )
     bounded_year_run = selection.bounded_training_year is not None
     if bounded_year_run and (
@@ -3044,12 +3181,42 @@ def validate_launch_arguments(
             "bounded year run requires deployment-only, one GPU, no accumulation, "
             "and no optimizer-step truncation"
         )
+    single_node_fold_run = selection.single_node_fold_worker
+    if single_node_fold_run:
+        fold_roles = tuple(
+            role for role in selection.roles if role.startswith("fold:")
+        )
+        if (
+            selection.phases != ("crossfit",)
+            or len(fold_roles) != 1
+            or selection.roles != fold_roles
+            or selection.max_optimizer_steps is not None
+            or bounded_year_run
+            or arguments.require_world_size != 1
+        ):
+            raise ValueError(
+                "single-node fold worker requires exactly one complete fold role, "
+                "crossfit-only, one GPU, and no truncation/bounded-year selection"
+            )
+        assert selection.node_name is not None
+        expected_microbatch, expected_accumulation, _ = (
+            _single_node_fold_topology(selection.node_name)
+        )
+        if (
+            arguments.per_rank_microbatch_size != expected_microbatch
+            or arguments.gradient_accumulation_steps != expected_accumulation
+        ):
+            raise ValueError(
+                f"node {selection.node_name!r} requires B{expected_microbatch}/"
+                f"accum{expected_accumulation} in single-node fold mode"
+            )
     execution_config_for_topology(
         config,
         world_size=arguments.require_world_size,
         per_rank_microbatch_size=arguments.per_rank_microbatch_size,
         gradient_accumulation_steps=arguments.gradient_accumulation_steps,
         allow_bounded_microbatch_override=bounded_year_run,
+        allow_single_node_fold_override=single_node_fold_run,
     )
     if arguments.precision != "float32" or arguments.precision != config.runtime.precision:
         raise ValueError("Stage 2 precision must remain config-bound float32")
@@ -3065,7 +3232,9 @@ def validate_launch_arguments(
         "per_rank_microbatch_size": config.optimization.per_rank_microbatch_size,
     }
     for name, value in expected.items():
-        if name == "per_rank_microbatch_size" and bounded_year_run:
+        if name == "per_rank_microbatch_size" and (
+            bounded_year_run or single_node_fold_run
+        ):
             continue
         actual = getattr(arguments, name)
         if isinstance(value, tuple):
@@ -3196,6 +3365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_bounded_microbatch_override=(
             selection.bounded_training_year is not None
         ),
+        allow_single_node_fold_override=selection.single_node_fold_worker,
     )
     launch_identity = load_stage2_launch_identity(
         arguments.launch_identity,
@@ -3208,6 +3378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime = initialize_distributed_runtime(
         require_world_size=arguments.require_world_size
     )
+    validate_single_node_fold_device(selection, runtime)
     try:
         remote_store = AuthenticatedHTTPSShardStore(
             endpoint=config.crossfit.remote_spill.endpoint,
@@ -3336,6 +3507,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "DistributedRuntime",
+    "SINGLE_NODE_FOLD_POLICY_SHA256",
     "ModelContract",
     "OptimizerLoopResult",
     "RunSelection",
@@ -3354,4 +3526,5 @@ __all__ = [
     "run_stage2",
     "train_role",
     "validate_launch_arguments",
+    "validate_single_node_fold_device",
 ]

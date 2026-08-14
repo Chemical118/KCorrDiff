@@ -171,18 +171,26 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
 
 ### 현재 검증과 실행 상태
 
-- 전체 repository suite: `464 passed, 7 skipped`(CUDA/pin allocator host-only skip)
+- 전체 repository suite: `474 passed, 7 skipped`(CUDA/pin allocator host-only skip)
 - OOF/remote/Stage 3 lazy reader 집중 회귀, compile, `git diff --check`, 모든
-  Stage 2/3 YAML parse와 embedded bash `bash -n`, Kubernetes client/server dry-run 통과
-- porsche A100 1개는 `porsche-gpu-0`이 계속 확보하고 있고 두 번째 shell은 Pending이다.
-  현재 node의 8 GPU가 모두 할당되어 정식 exact 2-GPU Job은 아직 스케줄할 수 없다.
-  실측 기반 Stage 2 순수 학습 예상은 2 GPU 약 52시간, 1 GPU 환산 약 105시간이며
-  OOF inference/compression/overflow 시간이 추가된다.
-- Stage 2 torchrun world size는 더 이상 2로 하드코딩하지 않는다. CLI의 양의
-  `--require-world-size`를 허용하되 benchmark-selected B=8과 global batch 16은
-  유지해야 한다. 따라서 2 GPU는 accumulation=1, 1 GPU는 accumulation=2이며,
-  다른 조합은 fail-closed다. 실제 topology는 checkpoint, partial/complete manifest,
-  W&B config에 별도로 기록되어 서로 다른 topology의 checkpoint를 잘못 resume할 수 없다.
+  Stage 2/3 YAML parse와 embedded bash `bash -n`, Kubernetes server dry-run을 통과했다.
+- porsche에서 A100 두 장을 동시에 바로 확보할 수 없어 Stage 2의 3-fold cross-fit을
+  하나의 2-GPU 작업으로 기다리지 않고, fold 0/1/2를 각각 독립적인 1-GPU 학습으로
+  나눴다. `Indexed Job(completions=3, parallelism=2)`이 각 fold 번호를 관리하며,
+  GPU가 비는 순서대로 같은 porsche에서 실행한다. 당시 실제 상태는 fold 0 Running,
+  fold 1 GPU Pending이고, fold 2는 앞 index가 끝난 뒤 Job controller가 생성하는
+  대기 상태였다.
+- 각 fold는 porsche A100-40GB 한 장에서 microbatch 12, accumulation 1로 학습한다.
+  이는 기존 2-GPU B8/global batch 16과 동일한 effective batch를 강제한 구성이 아니라,
+  사용자가 선택한 single-node fold 실행 정책(global effective batch 12)이다. 정책 hash와
+  실제 topology를 checkpoint, partial manifest와 W&B config에 기록해 다른 topology의
+  checkpoint를 잘못 resume하지 못하게 한다.
+- `saycorn-volume`이 porsche-local RWO PVC이므로 세 worker와 CPU collector가 같은
+  porsche에서 PVC를 직접 mount한다. NFS나 서버 간 입력 복사는 사용하지 않는다.
+  fold별 출력 디렉터리를 분리하고, collector가 세 checkpoint와 partial manifest의
+  SHA-256을 검증한 뒤 hard link 기반 immutable fold set을 조립하고 Telegram으로
+  완료를 알린다. 3-fold 이후 OOF inference/residual scale 및 deployment/direct arm은
+  별도 후속 실행으로 남는다.
 
 ## Stage 3 — residual EDM, 독립 평가 및 calibration 경계
 
@@ -222,7 +230,7 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
 
 ### Stage 3 검증 및 현재 상태
 
-- 전체 repository suite: `465 passed, 7 skipped`; host에서 skip된 CUDA 전용 7개
+- 전체 repository suite: `474 passed, 7 skipped`; host에서 skip된 CUDA 전용 7개
   경로를 porsche A100에서 재실행해 모두 통과했다. Triton/Torch cache는 read-only
   root가 아닌 `/tmp`로 고정한다.
 - A100-40GB에서 EDM-B 단독 full-width forward/backward/AdamW를 B=1,2,4,8,16의
@@ -230,10 +238,9 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   B=16은 OOM으로 거부됐다. 실제 Stage 3에는 frozen Stage 2 frontend와 production
   batch가 더해지므로 이 단독 결과만으로 B=8을 채택하지 않고, 현재 B=1/accumulation=4를
   보수적 시작값으로 유지해 complete Stage 2 artifact에서 end-to-end 재검증한다.
-- Stage 2 Job은 immutable `/workspace/code/stage2-production-v1`에서만 import하도록
-  `workingDir`와 `PYTHONPATH`를 수정해 suspended 상태로 클러스터에 등록했다.
+- Stage 2 fold Job은 immutable `/workspace/code/stage2-folds-porsche-v1`에서만
+  import하며 porsche-local PVC에 fold별 checkpoint를 직접 기록한다.
   Stage 3 Job도 향후 immutable `/workspace/code/stage3-production-v1` snapshot만 본다.
-- Stage 3 본학습은 complete Stage 2 OOF/checkpoint가 선행되어야 하므로 아직 W&B에
-  시작하지 않았다. 현재 online W&B run은 Stage 2 B=8 endurance 검증이며, production
-  Stage 2 Job은 porsche의 두 번째 GPU가 확보되는 즉시 shell Pod 두 개와 원자적으로
-  전환해 시작한다.
+- Stage 3 본학습은 complete Stage 2 OOF/checkpoint가 선행되어야 하므로 아직 시작하지
+  않았다. 먼저 현재의 1-GPU-per-fold Indexed Job으로 세 cross-fit checkpoint를 모두
+  확보한 뒤 OOF와 나머지 Stage 2 arm을 이어서 실행한다.

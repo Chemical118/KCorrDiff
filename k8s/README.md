@@ -19,6 +19,9 @@ kubectl auth whoami
 ```
 
 비밀값은 YAML에 넣지 않는다. `WANDB_API_KEY`는 Kubernetes Secret으로 주입한다.
+Telegram의 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`도 `.env`에만 두고
+`scripts/apply_telegram_secret.py`가 두 값만 `kcorrdiff-telegram` Secret의
+`bot-token`/`chat-id` key로 전달한다. 값은 명령 인자나 출력에 노출하지 않는다.
 OOF overflow용 1047 HTTPS 계정과 self-signed CA는 `kcorrdiff-oof-remote` Secret의
 `credentials.env`/`server.crt`로 주입하며, Pod에는 fsGroup-read-only(0440)로 mount한다.
 모든 Job은 기존 `saycorn-volume`만 참조하며 PVC를 생성·삭제하지
@@ -28,7 +31,7 @@ OOF overflow용 1047 HTTPS 계정과 self-signed CA는 `kcorrdiff-oof-remote` Se
 
 - `rbac.yaml`: 토큰 자동 mount가 꺼진 전용 ServiceAccount
 - `pvc-porsche.yaml`: porsche-local 250 GiB RWO claim
-- `stager.yaml`: CPU-only PVC 통신/점검 Pod
+- `stager.yaml`: porsche-local PVC를 직접 점검하는 CPU-only Pod
 - `porsche-gpu-shell.yaml`: goal lifetime 동안 유지하는 독립 1-GPU Pod 두 개
   (`gpu-0`은 Running, `gpu-1`은 현재 Pending)
 - `train-stage2.yaml`: full-width deterministic/full-data·cross-fit OOF regression Job 초안
@@ -41,6 +44,10 @@ OOF overflow용 1047 HTTPS 계정과 self-signed CA는 `kcorrdiff-oof-remote` Se
   짧은 단일-GPU CUDA correctness/memory probe
 - `build-stage2-env.yaml`: 고정 image에 없는 SciPy/W&B를 버전 고정 PVC layer로
   원자적으로 게시하는 CPU-only 종료형 Job
+- `publish-stage2-fold-source.yaml`: 로컬 source snapshot을 새 immutable PVC
+  디렉터리로 받는 임시 CPU Pod
+- `train-stage2-folds-porsche.yaml`: porsche에 고정한 3-completion/parallelism-2
+  Indexed GPU Job과 같은 PVC를 검증하는 CPU collector
 
 ## training CLI 계약
 
@@ -71,6 +78,37 @@ screening/final artifact가 없으면 다음 단계로 넘어가지 않는다. �
 선택 결과와 deployment checkpoint를 결합할 뿐 calibration을 실행하지 않는다. 독립
 calibration은 생성된 `stage3-training-manifest.json`을 입력으로 받는 별도 명령에서
 수행해야 한다.
+
+## Stage 2 3-fold porsche 선행 학습
+
+`saycorn-volume`의 local PV가 porsche에 묶여 있으므로 세 fold 모두 porsche에서만
+실행한다. 각 Pod는 PVC를 직접 mount하고 A100 40 GB 한 장, microbatch 12,
+accumulation 1을 사용한다. Indexed Job의 `parallelism: 2`와 namespace GPU quota로
+두 fold까지 동시에 실행되고 세 번째는 같은 porsche GPU가 날 때까지 Pending이다.
+
+각 fold는 서로 다른 worker 디렉터리에 기록한다. CPU collector는 같은 PVC에서 세
+completion marker와 checkpoint/manifest SHA-256을 검증하고 hard link로 다음 immutable
+fold set을 게시한다. NFS, cross-node stage-in, 서버 간 복사는 사용하지 않는다.
+
+```text
+/workspace/runs/stage2-folds-porsche-v1/assembled/fold-set-v1/fold-{0,1,2}/final.pt
+/workspace/runs/stage2-folds-porsche-v1/assembled/fold-set-v1/fold-set-manifest.json
+```
+
+이 fold set은 Stage 2 전체 release가 아니다. OOF inference, residual scale,
+deployment/direct mean/direct q50 arm은 이후 단계로 남는다.
+
+다음 launcher가 `.env`의 Telegram 값만 Secret으로 적용하고, immutable source snapshot을
+PVC에 게시하고, server-side dry-run 후 training/collector Job을 시작한다.
+
+```bash
+cd KCorrDiff
+scripts/launch_stage2_folds.sh
+python3 scripts/monitor_stage2_folds.py --watch
+```
+
+fold 시작/성공/실패와 세 fold 최종 검증 시 Telegram을 보낸다. 토큰은 로그나
+manifest에 기록하지 않는다.
 
 ## Stage 3 실행 경계
 
