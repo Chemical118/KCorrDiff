@@ -1448,6 +1448,13 @@ class RankSlotCollator:
         )
 
 
+def _limit_worker_threads(_worker_id: int) -> None:
+    # DataLoader parallelism, not intra-worker OpenMP, is the throughput axis;
+    # this matches the single-thread condition under which worker counts were
+    # benchmarked and keeps 12 workers within the container CPU quota.
+    torch.set_num_threads(1)
+
+
 def dataloader_options(
     *,
     num_workers: int,
@@ -1470,6 +1477,7 @@ def dataloader_options(
     if num_workers:
         result["persistent_workers"] = persistent_workers
         result["prefetch_factor"] = prefetch_factor
+        result["worker_init_fn"] = _limit_worker_threads
     return result
 
 

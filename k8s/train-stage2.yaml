@@ -204,7 +204,7 @@ spec:
               nvidia.com/gpu: 2
             limits:
               cpu: "32"
-              memory: 104Gi
+              memory: 124Gi
               ephemeral-storage: 8Gi
               nvidia.com/gpu: 2
           securityContext:
