@@ -193,6 +193,50 @@ def test_tp_dropout_uses_null_and_does_not_reencode_or_read_tp_values() -> None:
     )
 
 
+def test_partial_missingness_attends_union_of_instantaneous_and_tp_tokens() -> None:
+    model = _model()
+    values = _inputs(batch=1)
+    values["data_valid_inst"] = torch.tensor(
+        [[True, True, False, True, False, True, True, True]]
+    )
+    values["tp_valid"] = torch.tensor(
+        [[True, True, True, False, False, True, True, True]]
+    )
+    changed = dict(values)
+    changed["instantaneous"] = values["instantaneous"].clone()
+    changed["instantaneous"][:, 2] = 99_999.0
+    changed["precipitation"] = values["precipitation"].clone()
+    changed["precipitation"][:, 3] = -99_999.0
+
+    cache = _encode(model, values)
+    changed_cache = _encode(model, changed)
+    result = model.query(
+        cache,
+        temporal_access_mask=values["temporal_access_mask"],
+        e_cond=values["e_cond"],
+    )
+    changed_result = model.query(
+        changed_cache,
+        temporal_access_mask=values["temporal_access_mask"],
+        e_cond=values["e_cond"],
+    )
+
+    assert result.valid_token_mask[0, 2].item()  # tp-only hour
+    assert result.valid_token_mask[0, 3].item()  # instantaneous-only hour
+    assert not result.valid_token_mask[0, 4].item()
+    assert torch.all(result.temporal_weights[0, :, 2] > 0.0)
+    assert torch.all(result.temporal_weights[0, :, 3] > 0.0)
+    assert torch.count_nonzero(result.temporal_weights[0, :, 4]) == 0
+    # Invalid branch payloads are unreadable even when the other branch keeps
+    # the temporal token attendable.
+    torch.testing.assert_close(
+        cache.encoded, changed_cache.encoded, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        result.features, changed_result.features, rtol=0.0, atol=0.0
+    )
+
+
 def test_frame_cache_is_lead_independent_and_query_is_conditioned() -> None:
     model = _model()
     values = _inputs(batch=1)

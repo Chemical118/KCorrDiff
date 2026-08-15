@@ -41,7 +41,11 @@ from kcorrdiff.data.split_manifest import (
     write_manifest,
 )
 from kcorrdiff.models.context_encoder import CONTEXT_STATIC_CHANNEL_NAMES
-from kcorrdiff.training.config import Stage2Config, load_stage2_config
+from kcorrdiff.training.config import (
+    Stage2Config,
+    load_stage2_config,
+    thaw_config_mapping,
+)
 from kcorrdiff.training.data_factory import (
     DatasetDependencies,
     EraArtifactNormalization,
@@ -598,7 +602,7 @@ def test_augmented_bundle_factory_consumes_row_level_signatures(
     normalization_path = tmp_path / "normalization.json"
     write_normalization_artifact(normalization_path, normalization)
 
-    raw_config = deepcopy(dict(artifact_fixture.config.raw))
+    raw_config = thaw_config_mapping(artifact_fixture.config.raw)
     raw_config["data"]["normalization"] = str(normalization_path)
     raw_config["data"]["condition_augmentation"] = policy.to_json()
     config_path = tmp_path / "stage2-augmented.yaml"

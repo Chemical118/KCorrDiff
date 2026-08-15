@@ -59,6 +59,11 @@ class ConditionEmbeddingInputs:
         if bool((self.verification_cyclic.abs() > 1.000001).any().item()):
             raise ValueError("verification cyclic features must lie in [-1,1]")
 
+    def validate(self) -> None:
+        """Revalidate tensor invariants after possible in-place mutation."""
+
+        self.__post_init__()
+
 
 class _LeadEmbedding(nn.Module):
     def __init__(self, *, bands: int = 16) -> None:
@@ -125,6 +130,7 @@ class ConditionEmbedding(nn.Module):
         require_module_float32("ConditionEmbedding", self)
         if not isinstance(inputs, ConditionEmbeddingInputs):
             raise TypeError("ConditionEmbedding expects ConditionEmbeddingInputs")
+        inputs.validate()
         e_tau = self._lead_embedding(inputs.lead_hours)
         e_time = self._verification_embedding(inputs.verification_cyclic)
         e_cond = self._condition_time_fusion(torch.cat((e_tau, e_time), dim=1))

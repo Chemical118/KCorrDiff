@@ -34,7 +34,8 @@ OOF overflow용 1047 HTTPS 계정과 self-signed CA는 `kcorrdiff-oof-remote` Se
 - `stager.yaml`: porsche-local PVC를 직접 점검하는 CPU-only Pod
 - `porsche-gpu-shell.yaml`: goal lifetime 동안 유지하는 독립 1-GPU Pod 두 개
   (`gpu-0`은 Running, `gpu-1`은 현재 Pending)
-- `train-stage2.yaml`: full-width deterministic/full-data·cross-fit OOF regression Job 초안
+- `train-stage2.yaml`: 검증된 B12 fold-set을 model-only로 가져와 world2/B8 OOF와
+  deployment/direct arm을 이어가는 full-width Stage 2 Job 초안
 - `train-stage3.yaml`: full-width residual EDM의 `screen` / `finalists` /
   `bind-decision` 경계를 분리한 suspended Job 3개와 immutable runner ConfigMap
 - `benchmark-loader.yaml`: batch/worker 수 탐색용 1-GPU W&B benchmark Job 초안
@@ -58,7 +59,7 @@ artifact가 없거나 config/CLI/runtime 계약이 다르면 GPU 학습 전에 f
 |---|---|---|---|
 | `benchmark-loader.yaml` | `kcorrdiff.training.benchmark_loader` | cache, outer-train draw manifest, static | `/workspace/benchmarks/loader/<pod>/` |
 | `benchmark-production-loader.yaml` | `kcorrdiff.training.production_benchmark` | cache, candidate/draw/bundle manifest, normalization, coordinates, static | `/workspace/benchmarks/production-loader/<pod>/` |
-| `train-stage2.yaml` | `kcorrdiff.training.train_stage2` | production cache/bundle/normalization, static, ERA5, OOF HTTPS Secret | `/workspace/runs/stage2/stage2-fullwidth-production-v1/` (full-data/cross-fit checkpoint와 OOF) |
+| `train-stage2.yaml` | `kcorrdiff.training.train_stage2` | production cache/bundle/normalization, static, ERA5, verified B12 fold-set, OOF HTTPS Secret | `/workspace/runs/stage2/stage2-fullwidth-production-v3/` (OOF와 deployment/direct checkpoint) |
 | `train-stage3.yaml` | `kcorrdiff.training.train_stage3` | cache, promoted Stage 2 release, 외부 평가 artifact | `/workspace/runs/stage3/stage3-fullwidth-v1-1-3b/` (EDM checkpoint와 선택 결정 결합 manifest) |
 
 production config는 각각 `configs/stage2-full-width.yaml`과
@@ -86,17 +87,38 @@ calibration은 생성된 `stage3-training-manifest.json`을 입력으로 받는 
 accumulation 1을 사용한다. Indexed Job의 `parallelism: 2`와 namespace GPU quota로
 두 fold까지 동시에 실행되고 세 번째는 같은 porsche GPU가 날 때까지 Pending이다.
 
-각 fold는 서로 다른 worker 디렉터리에 기록한다. CPU collector는 같은 PVC에서 세
-completion marker와 checkpoint/manifest SHA-256을 검증하고 hard link로 다음 immutable
-fold set을 게시한다. NFS, cross-node stage-in, 서버 간 복사는 사용하지 않는다.
+각 fold는 서로 다른 worker 디렉터리에 기록한다. 학습 image에서 실행되는
+`mark-complete`는 실제 draw manifest로 B12 plan을 재구성하고 checkpoint 내부
+provenance/cursor/plan/training-block/model tensor와 partial manifest를 교차검증한다.
+stdlib-only CPU collector는 그 strict receipt, 파일 크기/SHA-256과 세 fold 공통 lineage를
+다시 확인한 뒤 hard link로 다음 immutable fold set을 게시한다. NFS, cross-node
+stage-in, 서버 간 복사는 사용하지 않는다.
 
 ```text
-/workspace/runs/stage2-folds-porsche-v2/assembled/fold-set-v1/fold-{0,1,2}/final.pt
-/workspace/runs/stage2-folds-porsche-v2/assembled/fold-set-v1/fold-set-manifest.json
+/workspace/runs/stage2-folds-porsche-v3/assembled/fold-set-v1/fold-{0,1,2}/final.pt
+/workspace/runs/stage2-folds-porsche-v3/assembled/fold-set-v1/fold-set-manifest.json
 ```
 
-이 fold set은 Stage 2 전체 release가 아니다. OOF inference, residual scale,
-deployment/direct mean/direct q50 arm은 이후 단계로 남는다.
+이 fold set은 Stage 2 전체 release가 아니다. 세 fold가 끝난 뒤
+`train-stage2.yaml`은 `fold-set-manifest.json`과 sidecar hash를 명시적으로 전달한다.
+importer는 collector receipt를 신뢰하지 않고 세 checkpoint를 다시 deserialize하여
+world1/B12 provenance와 draw plan, 현재 model state-dict 호환성을 모두 검증한다. 또한
+producer와 consumer의 config 및 source-tree identity가 정확히 같아야 한다. 이후
+OOF model-only load에만 producer provenance를 사용하고, training resume의 exact
+topology 검증은 그대로 유지한다. OOF inference/residual scale 및
+deployment/direct mean/direct q50 arm이 성공해야 complete Stage 2가 된다.
+
+중요: 과거 `stage2-folds-porsche-v2` checkpoint는 수정 전 spatial
+geometry/advection/ERA 의미로 학습됐으므로 v3 importer가 거부하며 release 입력으로 쓰지
+않는다. fixed run은 launcher가 먼저 `/workspace/code/stage2-folds-porsche-v3`를 새 immutable
+snapshot으로 게시하고, fold 학습과 `train-stage2.yaml` continuation 모두 그 동일 snapshot을
+사용한다. 어느 실행 중에도 snapshot이나 기존 run directory를 덮어쓰지 않는다.
+
+v3 fold-set publication 후 `fold-set-manifest.json`의 실제 hash와 sidecar를 비교하고 내용을
+검토한 뒤,
+`train-stage2.yaml`의 `FOLD_SET_MANIFEST_SHA256` placeholder를 검토한 lowercase SHA-256로
+교체한다. Job은 이 외부 pin, sidecar, 실제 manifest 세 값이 모두 같지 않으면 GPU model
+load 전에 중단한다. 같은 writable PVC의 sidecar 값을 기대 hash로 자동 채우지 않는다.
 
 다음 launcher가 `.env`의 Telegram 값만 Secret으로 적용하고, immutable source snapshot을
 PVC에 게시하고, server-side dry-run 후 training/collector Job을 시작한다.
@@ -128,17 +150,23 @@ run root를 사용한다. 그래야 screening의 seed 11103 checkpoint와 rank-0
 finalists 단계가 동일 provenance로 재사용할 수 있다. phase별 Job 이름만 다르며 run ID나
 output root를 한 단계에서만 바꾸면 continuation은 fail-closed로 거부된다.
 
-promoted Stage 2 release에는 다음 파일이 있어야 한다.
+promoted Stage 2 release는 self-contained `kcorrdiff.stage2-release-index.v2` 트리여야
+한다. 인덱스는 Stage 3 입력 전체, 정확한 regression checkpoint 6개(fold 3개와
+deployment/direct-mean/direct-q50), B12 fold import를 사용했다면 원본 fold-set
+manifest와 partial manifest 3개를 모두 release root 상대 경로와 SHA-256으로 고정한다.
+Stage 3는 Stage 2 manifest 안의 원래 run 절대 경로를 다시 열지 않는다.
 
 ```text
-/workspace/releases/stage2/selected/stage2-manifest.json
-/workspace/releases/stage2/selected/stage2-manifest.sha256
-/workspace/releases/stage2/selected/oof/artifact/manifest.json
-/workspace/releases/stage2/selected/oof/residual-scales.json
+/workspace/releases/stage2/selected/release-index.json
+/workspace/releases/stage2/selected/release-index.sha256
+# release-index.json이 참조하는 모든 파일/디렉터리도 selected/ 아래에 존재
 ```
 
-`stage2-manifest.sha256`는 `stage2-manifest.json`의 lowercase SHA-256 64자리와 newline만
-담는다. runner는 sidecar와 실제 파일 hash를 먼저 비교한다. 또한 첫 phase에서 Stage 3
+`release-index.sha256`는 `release-index.json`의 lowercase SHA-256 64자리와 newline만
+담는다. runner는 sidecar와 실제 파일 hash를 먼저 비교한 뒤 인덱스의 containment,
+symlink 금지, 파일 크기/hash, artifact lineage와 checkpoint role을 전부 재검증한다.
+release tree를 다른 mount root로 복사해도 인덱스 hash와 checkpoint-set hash는 변하지
+않는다. 또한 첫 phase에서 Stage 3
 source-tree identity와 CUDA/PyTorch runtime report를 원자적으로 기록하고, 후속 phase는
 두 identity가 조금이라도 달라지면 실행을 중단한다. 컨테이너 image는 immutable digest와
 그 digest를 전달하는 `KCORRDIFF_CONTAINER_IMAGE_SHA256`가 일치해야 한다.

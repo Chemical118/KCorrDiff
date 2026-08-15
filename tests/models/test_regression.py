@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import pytest
@@ -140,6 +141,44 @@ def test_source_gates_receive_gradient_while_attention_projection_is_not_zeroed(
     assert gate.weight.grad is not None
     assert torch.count_nonzero(gate.weight.grad) > 0
     assert torch.count_nonzero(model.context_attention_l3.output_projection.weight) > 0
+
+
+def test_advection_sampling_uses_exact_repeated_stride2_lattice() -> None:
+    model = RegressionUNet(
+        target_widths=TARGET,
+        context_widths=CONTEXT,
+        query_chunk_size=2,
+        allow_test_override=True,
+    ).eval()
+    values = inputs()
+    horizontal = torch.arange(16, dtype=torch.float32)[None, None, None, :]
+    advection = horizontal.expand(1, 8, 16, 16).clone()
+    values = replace(values, advection_features=advection)
+    captured: list[torch.Tensor] = []
+
+    def capture(
+        _module: torch.nn.Module, arguments: tuple[torch.Tensor, ...]
+    ) -> None:
+        captured.append(arguments[1].detach().clone())
+
+    handle = model.advection_adapters[3].register_forward_pre_hook(capture)
+    with torch.no_grad():
+        model(values)
+    handle.remove()
+
+    expected = advection[..., ::8, ::8]
+    half_pixel = torch.nn.functional.interpolate(
+        advection, size=(2, 2), mode="bilinear", align_corners=False
+    )
+    endpoint_aligned = torch.nn.functional.interpolate(
+        advection, size=(2, 2), mode="bilinear", align_corners=True
+    )
+    torch.testing.assert_close(captured[0], expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        captured[0][0, 0, 0], torch.tensor([0.0, 8.0]), rtol=0.0, atol=0.0
+    )
+    assert not torch.equal(captured[0], half_pixel)
+    assert not torch.equal(captured[0], endpoint_aligned)
 
 
 def test_checkpointed_attention_and_decoder_match_plain_forward_backward() -> None:

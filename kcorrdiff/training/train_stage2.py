@@ -56,7 +56,12 @@ from kcorrdiff.training.checkpoints import (
     restore_rng_state,
     save_training_checkpoint,
 )
-from kcorrdiff.training.config import Stage2Config, load_stage2_config
+from kcorrdiff.training.config import (
+    Stage2Config,
+    freeze_config_mapping,
+    load_stage2_config,
+    thaw_config_mapping,
+)
 from kcorrdiff.training.crossfit import (
     CheckpointRecord,
     checkpoint_record,
@@ -99,6 +104,12 @@ from kcorrdiff.training.residual_scales import (
 )
 from kcorrdiff.training.runtime import assert_float32_tree, configure_strict_float32
 from kcorrdiff.training.selection_contract import load_stage2_selection_contract
+from kcorrdiff.training.stage2_fold_set import (
+    VerifiedStage2FoldSet,
+    load_verified_fold_model,
+    verify_fold_set_model_compatibility,
+    verify_stage2_fold_set,
+)
 from kcorrdiff.training.tracking import TrackingRun, initialize_tracking
 
 
@@ -409,8 +420,8 @@ def execution_config_for_topology(
 ) -> Stage2Config:
     """Bind a CLI topology and explicitly record any permitted override.
 
-    The immutable YAML remains the reference two-rank tuning contract.  A
-    The normal path preserves the preregistered global batch. Bounded
+    The immutable YAML remains the reference two-rank tuning contract. The
+    normal path preserves the preregistered global batch. Bounded
     diagnostics and the source-bound porsche fold policy may override it;
     checkpoints and manifests record the actual execution topology so an
     incompatible resume fails.
@@ -438,25 +449,7 @@ def execution_config_for_topology(
         # The immutable production selection remains B8/global16.  A bounded,
         # non-publishable year run may use an explicitly requested diagnostic
         # B (including B12), and records the resulting topology in its partial
-        # manifest/checkpoint provenance.  Mirror the typed override in raw so
-        # loader validation and W&B config report the actual execution.
-        execution_raw = json.loads(json.dumps(config.raw))
-        execution_optimization = _mapping(
-            execution_raw.get("optimization"), name="execution optimization"
-        )
-        execution_optimization["per_rank_microbatch_size"] = (
-            per_rank_microbatch_size
-        )
-        execution_optimization["gradient_accumulation_steps"] = (
-            gradient_accumulation_steps
-        )
-        execution_optimization["global_effective_batch_size"] = observed_global
-        execution_loader = _mapping(
-            execution_raw.get("loader_tuning"), name="execution loader tuning"
-        )
-        execution_loader["selected_batch_size_per_rank"] = (
-            per_rank_microbatch_size
-        )
+        # manifest/checkpoint provenance.
     elif allow_single_node_fold_override:
         if world_size != 1:
             raise ValueError("single-node fold override requires exactly one GPU")
@@ -479,23 +472,6 @@ def execution_config_for_topology(
         # fabricated B12 benchmark evidence. Keep the immutable reference
         # config SHA while reporting the actual topology through the typed and
         # raw execution views, checkpoints, W&B and partial manifest.
-        execution_raw = json.loads(json.dumps(config.raw))
-        execution_optimization = _mapping(
-            execution_raw.get("optimization"), name="execution optimization"
-        )
-        execution_optimization["per_rank_microbatch_size"] = (
-            per_rank_microbatch_size
-        )
-        execution_optimization["gradient_accumulation_steps"] = (
-            gradient_accumulation_steps
-        )
-        execution_optimization["global_effective_batch_size"] = observed_global
-        execution_loader = _mapping(
-            execution_raw.get("loader_tuning"), name="execution loader tuning"
-        )
-        execution_loader["selected_batch_size_per_rank"] = (
-            per_rank_microbatch_size
-        )
     else:
         if per_rank_microbatch_size & (per_rank_microbatch_size - 1):
             raise ValueError("per-rank microbatch size must be a power of two")
@@ -509,7 +485,23 @@ def execution_config_for_topology(
                 f"batch {config.optimization.global_effective_batch_size}; got "
                 f"{observed_global}"
             )
-        execution_raw = config.raw
+    # The execution view is a detached copy. Mirror even the normal
+    # world-size/accumulation substitution so downstream loader validation and
+    # tracking never report the reference topology as the topology in use.
+    mutable_execution_raw = thaw_config_mapping(config.raw)
+    execution_optimization = _mapping(
+        mutable_execution_raw.get("optimization"), name="execution optimization"
+    )
+    execution_optimization["per_rank_microbatch_size"] = per_rank_microbatch_size
+    execution_optimization["gradient_accumulation_steps"] = (
+        gradient_accumulation_steps
+    )
+    execution_optimization["global_effective_batch_size"] = observed_global
+    execution_loader = _mapping(
+        mutable_execution_raw.get("loader_tuning"), name="execution loader tuning"
+    )
+    execution_loader["selected_batch_size_per_rank"] = per_rank_microbatch_size
+    execution_raw = freeze_config_mapping(mutable_execution_raw)
     result = replace(
         config,
         raw=execution_raw,
@@ -550,6 +542,7 @@ def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
 
     raw = _mapping(config.raw.get("model"), name="stage2 model")
     required = {
+        "implementation_contract",
         "condition_dimension",
         "activation_checkpoint",
         "physical_attention_query_chunk_size",
@@ -561,6 +554,11 @@ def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
             f"stage2 model schema mismatch: missing={sorted(required-set(raw))}, "
             f"extra={sorted(set(raw)-required)}"
         )
+    if (
+        raw["implementation_contract"]
+        != "kcorrdiff.regression-geometry-advection-era.v2"
+    ):
+        raise ValueError("Stage 2 model implementation contract is incompatible")
     if raw["condition_dimension"] != 512:
         raise ValueError("condition dimension fallback is forbidden")
     activation = raw["activation_checkpoint"]
@@ -734,14 +732,18 @@ class RunSelection:
 
 
 def _selected_training_role_count(
-    selection: RunSelection, *, folds: int
+    selection: RunSelection,
+    *,
+    folds: int,
+    imported_folds: frozenset[int] = frozenset(),
 ) -> int:
     if folds <= 0:
         raise ValueError("fold count must be positive")
     count = 0
     if "crossfit" in selection.phases:
         count += sum(
-            selection.includes_role("fold", fold) for fold in range(folds)
+            selection.includes_role("fold", fold) and fold not in imported_folds
+            for fold in range(folds)
         )
     for phase, role in (
         ("deployment", "deployment"),
@@ -1905,6 +1907,7 @@ def _read_residual_state(
     actual_items = sum(
         int(record["items"])
         for record in accumulator.merge_state()["records"]  # type: ignore[index]
+        if record["pooling_level"] == "full_cell"
     )
     if actual_items != draw_rows:
         raise ValueError("OOF residual partial lost training draw multiplicity")
@@ -1934,6 +1937,7 @@ def infer_oof_rank_partials(
     num_workers: int,
     prefetch_factor: int,
     remote_store: RemoteShardStore | None = None,
+    imported_fold_set: VerifiedStage2FoldSet | None = None,
 ) -> tuple[Path, ...]:
     """Stream rank-disjoint OOF rows into lossless compressed final shards."""
 
@@ -2010,6 +2014,9 @@ def infer_oof_rank_partials(
         initialize=False,
     )
     partial_paths: list[Path] = []
+    imported_by_fold = (
+        imported_fold_set.by_fold() if imported_fold_set is not None else {}
+    )
     for fold_id in range(config.crossfit.folds):
         result = fold_results.get(fold_id)
         if result is None or not result.complete or result.record is None:
@@ -2067,23 +2074,40 @@ def infer_oof_rank_partials(
             num_workers=num_workers,
             prefetch_factor=prefetch_factor,
         )
-        provenance = _checkpoint_provenance(
-            config=config,
-            factory=factory,
-            runtime=runtime,
-            launch_identity=launch_identity,
-            role="fold",
-            fold_id=fold_id,
-        )
         model = _new_model(role="fold", contract=contract, device=runtime.device)
-        cursor, extra = load_training_checkpoint(
-            result.checkpoint_path,
-            model=model,
-            optimizer=None,
-            scheduler=None,
-            expected_provenance=provenance,
-            restore_rng=False,
-        )
+        imported = imported_by_fold.get(fold_id)
+        if imported is not None:
+            if (
+                result.checkpoint_path.resolve()
+                != imported.checkpoint_path.resolve()
+                or result.checkpoint_sha256 != imported.checkpoint_sha256
+            ):
+                raise ValueError("OOF imported fold descriptor/result mismatch")
+            load_verified_fold_model(imported, model)
+            cursor = imported.cursor
+            extra: Mapping[str, object] = {
+                "complete": True,
+                "plan_semantic_sha256": imported.plan_semantic_sha256,
+                "plan_optimizer_steps": imported.plan_optimizer_steps,
+                "training_blocks": list(imported.training_blocks),
+            }
+        else:
+            provenance = _checkpoint_provenance(
+                config=config,
+                factory=factory,
+                runtime=runtime,
+                launch_identity=launch_identity,
+                role="fold",
+                fold_id=fold_id,
+            )
+            cursor, extra = load_training_checkpoint(
+                result.checkpoint_path,
+                model=model,
+                optimizer=None,
+                scheduler=None,
+                expected_provenance=provenance,
+                restore_rng=False,
+            )
         if extra.get("complete") is not True or cursor.optimizer_step <= 0:
             raise ValueError("OOF checkpoint is not a completed fold fit")
         model.eval()
@@ -2148,6 +2172,7 @@ def infer_oof_rank_partials(
                         accumulator.update(
                             lead_hours=row.lead_hours,
                             condition_signature=row.condition_signature,
+                            block_id=row.block_id,
                             target_z=batch.labels.target_z[batch_index, 0]
                             .detach()
                             .cpu()
@@ -2653,6 +2678,7 @@ def run_stage2(
     wandb_mode: str,
     run_id: str,
     remote_store: RemoteShardStore | None = None,
+    imported_fold_set: VerifiedStage2FoldSet | None = None,
 ) -> Stage2RunResult:
     """Execute the selected DAG; publish ``complete`` only for the full DAG."""
 
@@ -2677,7 +2703,7 @@ def run_stage2(
         factory=factory,
         launch_identity=launch_identity,
     )
-    tracking_config = dict(config.raw)
+    tracking_config = thaw_config_mapping(config.raw)
     tracking_config["stage2_config_sha256"] = config.sha256
     tracking_config["launch_identity"] = launch_identity.provenance()
     tracking_config["execution_topology"] = {
@@ -2694,6 +2720,9 @@ def run_stage2(
             * config.optimization.gradient_accumulation_steps
         ),
     }
+    tracking_config["imported_fold_set"] = (
+        imported_fold_set.audit_json() if imported_fold_set is not None else None
+    )
     if selection.single_node_fold_worker:
         tracking_config["single_node_fold_execution"] = {
             "policy_sha256": SINGLE_NODE_FOLD_POLICY_SHA256,
@@ -2713,11 +2742,50 @@ def run_stage2(
     )
     role_results: list[RoleTrainingResult] = []
     fold_results: dict[int, RoleTrainingResult] = {}
+    if imported_fold_set is not None:
+        imported_by_fold = imported_fold_set.by_fold()
+        if (
+            imported_fold_set.lineage.config_sha256 != config.sha256
+            or imported_fold_set.lineage.launch_identity["source_tree_sha256"]
+            != launch_identity.source_tree_sha256
+            or imported_fold_set.lineage.draw_manifest_sha256
+            != factory.artifacts.artifact_hashes["draw_manifest"]
+            or dict(imported_fold_set.lineage.artifact_hashes)
+            != dict(factory.artifacts.artifact_hashes)
+            or len(imported_fold_set.folds) != config.crossfit.folds
+            or len(imported_by_fold) != len(imported_fold_set.folds)
+            or set(imported_by_fold) != set(range(config.crossfit.folds))
+            or imported_fold_set.lineage.node_name != "porsche"
+            or imported_fold_set.lineage.world_size != 1
+            or imported_fold_set.lineage.per_rank_microbatch_size != 12
+            or imported_fold_set.lineage.gradient_accumulation_steps != 1
+            or imported_fold_set.lineage.global_effective_batch_size != 12
+            or imported_fold_set.lineage.policy_sha256
+            != SINGLE_NODE_FOLD_POLICY_SHA256
+        ):
+            raise ValueError("imported fold set disagrees with current Stage 2 inputs")
+        for fold_id in range(config.crossfit.folds):
+            imported = imported_by_fold[fold_id]
+            result = RoleTrainingResult(
+                role="fold",
+                fold_id=imported.fold_id,
+                complete=True,
+                checkpoint_path=imported.checkpoint_path,
+                checkpoint_sha256=imported.checkpoint_sha256,
+                cursor=imported.cursor,
+                optimizer_steps_run=0,
+                metrics_step=tracking_step,
+                record=imported.record,
+            )
+            role_results.append(result)
+            fold_results[imported.fold_id] = result
     remaining = selection.max_optimizer_steps
     stopped = False
     try:
         if "crossfit" in selection.phases:
             for fold in range(config.crossfit.folds):
+                if fold in fold_results:
+                    continue
                 if not selection.includes_role("fold", fold):
                     continue
                 result = train_role(
@@ -2786,6 +2854,7 @@ def run_stage2(
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor,
                 remote_store=remote_store,
+                imported_fold_set=imported_fold_set,
             )
             oof_result = merge_oof_partials(
                 config=config,
@@ -2998,6 +3067,11 @@ def run_stage2(
             ),
             "residual_scales_sha256": scale_hash,
             "fold_checkpoint_set_sha256": fold_set_hash,
+            "imported_fold_set": (
+                imported_fold_set.audit_json()
+                if imported_fold_set is not None
+                else None
+            ),
             "wandb_mode": effective_mode,
             "wandb_run_id": run_id,
             "tracking_audit_path": (
@@ -3075,6 +3149,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--static-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--oof-output-dir", type=Path, required=True)
+    parser.add_argument("--fold-set-manifest", type=Path)
+    parser.add_argument("--fold-set-manifest-sha256")
     parser.add_argument("--oof-remote-credentials", type=Path, required=True)
     parser.add_argument("--oof-remote-ca-certificate", type=Path, required=True)
     parser.add_argument("--require-world-size", type=int, required=True)
@@ -3169,6 +3245,28 @@ def validate_launch_arguments(
         ),
         node_name=getattr(arguments, "node_name", None),
     )
+    fold_set_manifest = getattr(arguments, "fold_set_manifest", None)
+    fold_set_sha256 = getattr(arguments, "fold_set_manifest_sha256", None)
+    if (fold_set_manifest is None) != (fold_set_sha256 is None):
+        raise ValueError(
+            "--fold-set-manifest and --fold-set-manifest-sha256 are required together"
+        )
+    if fold_set_manifest is not None:
+        if (
+            not isinstance(fold_set_manifest, Path)
+            or selection.single_node_fold_worker
+            or any(role.startswith("fold:") for role in selection.roles)
+            or not set(selection.phases) & {"crossfit", "oof", "residual_scales"}
+        ):
+            raise ValueError(
+                "fold-set import is inference/full-DAG only and cannot select fold workers"
+            )
+        requested_fold_set_sha256 = str(fold_set_sha256)
+        if len(requested_fold_set_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in requested_fold_set_sha256
+        ):
+            raise ValueError("--fold-set-manifest-sha256 must be a lowercase SHA-256")
     bounded_year_run = selection.bounded_training_year is not None
     if bounded_year_run and (
         selection.phases != ("deployment",)
@@ -3417,6 +3515,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         loader_selection.validate_factory_lineage(factory.artifacts.artifact_hashes)
         loader_selection.verify_benchmark_artifacts()
         contract = regression_system_config_from_stage2(config)
+        imported_fold_set: VerifiedStage2FoldSet | None = None
+        if arguments.fold_set_manifest is not None:
+            assert arguments.fold_set_manifest_sha256 is not None
+            imported_fold_set = verify_stage2_fold_set(
+                arguments.fold_set_manifest,
+                expected_manifest_sha256=arguments.fold_set_manifest_sha256,
+                expected_policy_sha256=SINGLE_NODE_FOLD_POLICY_SHA256,
+                rows=factory.artifacts.rows,
+                expected_config_sha256=config.sha256,
+                expected_artifact_hashes=factory.artifacts.artifact_hashes,
+                expected_source_tree_sha256=launch_identity.source_tree_sha256,
+            )
+            verify_fold_set_model_compatibility(
+                imported_fold_set,
+                model_factory=lambda _fold_id: _new_model(
+                    role="fold", contract=contract, device=torch.device("cpu")
+                ),
+            )
+            import_receipts = runtime.all_gather_objects(
+                imported_fold_set.audit_json()
+            )
+            if len(
+                {
+                    json.dumps(value, sort_keys=True, separators=(",", ":"))
+                    for value in import_receipts
+                }
+            ) != 1:
+                raise RuntimeError("ranks imported different Stage 2 fold sets")
         # Parameter count is architecture-derived, not a stale disk constant.
         counting_model = RegressionSystem(contract.system)
         # A direct arm owns the identical full hurdle backbone plus a separate
@@ -3449,7 +3575,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             oof_output_dir=arguments.oof_output_dir,
             model_parameter_count=parameter_count,
             selected_checkpoint_count=_selected_training_role_count(
-                selection, folds=config.crossfit.folds
+                selection,
+                folds=config.crossfit.folds,
+                imported_folds=(
+                    frozenset(imported_fold_set.by_fold())
+                    if imported_fold_set is not None
+                    else frozenset()
+                ),
             ),
             oof_dense_bytes=oof_bytes,
             include_oof="oof" in selection.phases,
@@ -3483,6 +3615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             wandb_mode=arguments.wandb_mode,
             run_id=arguments.run_id,
             remote_store=remote_store,
+            imported_fold_set=imported_fold_set,
         )
         if runtime.is_rank_zero:
             print(

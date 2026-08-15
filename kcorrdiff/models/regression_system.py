@@ -202,6 +202,7 @@ class RegressionSystem(nn.Module):
     def _validate_batch(self, batch: RegressionModelBatch) -> None:
         if not isinstance(batch, RegressionModelBatch):
             raise TypeError("RegressionSystem expects RegressionModelBatch, never labels")
+        batch.validate()
         parameter = next(self.parameters())
         if parameter.dtype is not torch.float32:
             raise TypeError("RegressionSystem parameters must remain float32")
@@ -379,6 +380,7 @@ class DirectPhysicalRegressionSystem(nn.Module):
             raise TypeError(
                 "DirectPhysicalRegressionSystem expects RegressionModelBatch, never labels"
             )
+        batch.validate()
         parameter = next(self.parameters())
         if parameter.dtype is not torch.float32:
             raise TypeError("DirectPhysicalRegressionSystem parameters must remain float32")

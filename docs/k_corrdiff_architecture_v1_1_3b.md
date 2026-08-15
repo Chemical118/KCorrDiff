@@ -342,6 +342,12 @@ valid fraction
 | L3 | 32 x 32 | 4 km | 32 x 32 | 약 9.6 km |
 | L4 | 16 x 16 | 8 km | 16 x 16 | 약 19.2 km |
 
+현재 encoder의 `3 x 3, stride 2, padding 1` downsampling을 반복하면 level `L`의
+feature index `j` 중심은 원본 index `j * 2^L`이다. 따라서 L3/L4 geometry 중심도 각각
+원본 index `0, 8, ...`와 `0, 16, ...`에 둔다. 표의 token spacing/footprint와
+`2^(L+1)-1` 셀인 nominal downsampler receptive support는 서로 다른 값이며,
+`valid_fraction`은 구조적 zero padding까지 포함한 후자의 유효 면적 비율로 계산한다.
+
 같은 tensor index와 같은 feature-map shape가 같은 물리위치를 의미하지 않으므로 target/context feature를 인덱스 기준으로 직접 concat하지 않는다.
 
 ## 6. Target radar 및 static branch
@@ -485,6 +491,9 @@ F_adv_tau = AdvAdapter(z_adv_tau, w_adv_tau, flow, validity, confidence)
 g_adv_tau = Gate(e_cond, confidence)
 h_target  = h_target + g_adv_tau * F_adv_tau
 ```
+
+각 level의 advection 조건도 임의 resize 격자가 아니라 같은 repeated-stride-2 중심
+(`0, 2^L, ...`)에서 샘플링하여 target feature와 물리 위치를 맞춘다.
 
 `AdvAdapter`의 마지막 residual projection은 0으로 초기화하고 gate와 동시에 이중 zero-init하지 않는다. Gate는 lead·verification-time condition과 confidence의 함수지만 `0.5 h=1`, `6 h=0` 같은 고정 단조곡선을 강제하지 않는다. 약 307 km context와 128 km target의 편측 buffer는 약 89.5 km이므로 50 km/h 이동에서 target 경계 기준 약 1.8시간, 중심 기준 약 3.1시간 뒤 역궤적이 context를 이탈할 수 있다. 하나의 lead cutoff 대신 픽셀별 origin과 domain-residence 정보를 사용한다.
 

@@ -240,7 +240,40 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   보수적 시작값으로 유지해 complete Stage 2 artifact에서 end-to-end 재검증한다.
 - Stage 2 fold Job은 immutable `/workspace/code/stage2-folds-porsche-v2`에서만
   import하며 porsche-local PVC에 fold별 checkpoint를 직접 기록한다.
-  Stage 3 Job도 향후 immutable `/workspace/code/stage3-production-v1` snapshot만 본다.
+  Stage 3 Job도 수정된 inference/release 계약을 담은 immutable
+  `/workspace/code/stage3-production-v2` snapshot만 본다.
 - Stage 3 본학습은 complete Stage 2 OOF/checkpoint가 선행되어야 하므로 아직 시작하지
   않았다. 먼저 현재의 1-GPU-per-fold Indexed Job으로 세 cross-fit checkpoint를 모두
   확보한 뒤 OOF와 나머지 Stage 2 arm을 이어서 실행한다.
+
+## 2026-08-16 적대 검토 수정 및 A100 smoke
+
+- spatial geometry/advection, ERA condition/time identity, EDM source cache,
+  calibration·residual-scale, B12 fold importer, inference identity 및 portable
+  release 경계에서 재현된 correctness 결함을 수정했다. 최신 CPU suite는
+  `599 passed, 7 skipped`이고 skip은 CUDA/pin-memory 전용 7개뿐이다.
+- 수정 전 `/workspace/code/stage2-folds-porsche-v2`는 config/source identity와 모델
+  입력 의미가 모두 달라 새 importer가 거부한다. training과 collector Job은
+  `spec.suspend=true`로 중단했고 PVC의 fold0 final 및 fold1 latest artifact는 보존했다.
+- 수정본은 별도 read-only `/workspace/code/stage2-folds-porsche-v3` snapshot으로
+  게시했다. 기존 v2 source/run 경로는 덮어쓰거나 삭제하지 않았다.
+- porsche A100-SXM4-40GB에서 CUDA 전용 7개를 재실행해 `7 passed`를 확인했다.
+  production manifest/cache를 사용한 Stage 2 full-width B=1 학습 step도 warmup 1회와
+  measured 1회 모두 통과했다. peak allocated/reserved는 약 2.81/3.01 GiB였고 결과
+  SHA-256은 `105b2024eb9f45651bbceabf7810998fcf6a574a19d5fe1a2285929849c47005`다.
+- 같은 Job에서 production-width EDM-A/B 각각 source-cache 준비, denoise forward와
+  backward를 실행했다. EDM-A peak allocated/reserved는 약 2.15/2.30 GiB,
+  EDM-B는 약 3.00/3.16 GiB였고 두 출력·loss·gradient가 모두 finite였다.
+- smoke audit는 `/workspace/runs/smoke/a100-v3-20260815-r2/`에 보존했다. 완료 Job/Pod는
+  GPU 자원 정리를 위해 삭제했으며 PVC 결과는 삭제하지 않았다. 다음 장기 실행은 v3
+  source/config로 3-fold를 처음부터 다시 시작해야 한다.
+
+### 2026-08-16 EDM variant 운영 결정
+
+- 다음 Stage 3 실행은 **EDM-A만 우선 진행**한다. EDM-B 학습과 A/B 동시 screening은
+  보류한다.
+- EDM-A는 frozen Stage 2 deployment feature pyramid에 의존하지 않는 경로를 사용한다.
+  현재 단계에서는 이 독립적인 조건 경계를 우선 검증하고 운영 복잡도와 GPU 사용량을
+  줄이는 것이 목적이다.
+- 이 결정은 독립 평가에서 EDM-A의 성능 우위가 확정됐다는 의미가 아니다. EDM-B의 코드,
+  checkpoint schema와 평가 계약은 유지하며, EDM-A 결과 검토 후 별도 승인으로 재개한다.

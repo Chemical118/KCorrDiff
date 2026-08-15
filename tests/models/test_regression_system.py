@@ -172,6 +172,16 @@ def test_system_never_accepts_training_batch_or_loss_fields() -> None:
         model(batch.model, labels=batch.labels)  # type: ignore[call-arg]
 
 
+def test_system_rejects_post_construction_time_embedding_mutation() -> None:
+    batch = make_batch(leads=(1.0,))
+    model = RegressionSystem(small_config())
+    flow = zero_flow(batch, model.config)
+    batch.model.embedding.verification_cyclic.zero_()
+
+    with pytest.raises(ValueError, match="canonical FP32 t0/lead"):
+        model(batch.model, flow_override=flow)
+
+
 def test_no_autocast_module_dtype_and_production_flow_override_fail_closed() -> None:
     batch = make_batch(leads=(0.5,))
     model = RegressionSystem(small_config())

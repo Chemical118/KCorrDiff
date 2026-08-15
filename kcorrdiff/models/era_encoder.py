@@ -298,13 +298,22 @@ class EraEncoder(nn.Module):
         )[..., None, None]
         inst = inst + inst_time
         tp = tp + tp_time
+        inst_on = (
+            masks["data_valid_inst"]
+            & masks["era_present"][:, None]
+        )[:, :, None, None, None]
+        # A valid tp hour may remain usable when its instantaneous fields are
+        # missing.  Zero the missing instantaneous branch before fusion so a
+        # tp-only token cannot read placeholder/archive payload values.
+        inst_selected = torch.where(inst_on, inst, torch.zeros_like(inst))
         tp_on = (
             masks["tp_valid"]
             & masks["tp_present"][:, None]
+            & masks["era_present"][:, None]
         )[:, :, None, None, None]
         tp_null = self.tp_null_state.expand_as(tp)
         tp_selected = torch.where(tp_on, tp, tp_null)
-        fused = torch.cat((inst, tp_selected), dim=2).flatten(0, 1)
+        fused = torch.cat((inst_selected, tp_selected), dim=2).flatten(0, 1)
         fused = self.fusion(fused)
         fused = self.spatial_blocks(fused).unflatten(
             0, (batch, ERA_NATIVE_HOURS)
@@ -351,7 +360,7 @@ class EraEncoder(nn.Module):
         if not torch.isfinite(e_cond).all():
             raise ValueError("e_cond must be finite")
 
-        valid = (
+        instantaneous_token_mask = (
             cache.data_valid_inst
             & cache.trajectory_window_mask
             & access
@@ -364,6 +373,11 @@ class EraEncoder(nn.Module):
             & cache.tp_present[:, None]
             & cache.era_present[:, None]
         )
+        # Keep the masks distinct for diagnostics, but let either physically
+        # available branch make an hour attendable.  Previously tp-only hours
+        # were reported in tp_token_mask and then unconditionally discarded by
+        # the instantaneous-only attention mask.
+        valid = instantaneous_token_mask | tp_token_mask
         pooled = cache.encoded.mean(dim=(-2, -1))
         pooled = self.temporal_norm(
             self.temporal_key(pooled)

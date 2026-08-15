@@ -404,6 +404,33 @@ def test_named_era_masks_signature_provenance_and_raw_values_are_preserved() -> 
     )
 
 
+def test_era_condition_signature_is_bound_to_presence_and_access_masks() -> None:
+    model = make_batch(leads=(0.5,)).model
+    with pytest.raises(ValueError, match="source-presence flags mismatch"):
+        replace(model.era, tp_present=torch.zeros_like(model.era.tp_present))
+
+    inaccessible = model.era.temporal_access_mask.clone()
+    inaccessible[0, 0] = False
+    with pytest.raises(ValueError, match="full-trajectory condition"):
+        replace(model.era, temporal_access_mask=inaccessible)
+
+    # Even coherently changing both masks is rejected at the complete model
+    # batch boundary because trajectory/access are recomputed from t0+lead.
+    shortened = model.era.trajectory_window_mask.clone()
+    shortened[0, -2] = False
+    forged_era = replace(
+        model.era,
+        trajectory_window_mask=shortened,
+        temporal_access_mask=shortened.clone(),
+    )
+    with pytest.raises(ValueError, match="trajectory mask disagrees"):
+        replace(model, era=forged_era)
+
+    model.era.tp_present.fill_(False)
+    with pytest.raises(ValueError, match="source-presence flags mismatch"):
+        model.validate()
+
+
 def test_actual_lcc_axes_define_target_context_and_era_token_footprints() -> None:
     batch = make_batch(leads=(0.5,))
     geometry = batch.model.geometry
@@ -424,6 +451,24 @@ def test_actual_lcc_axes_define_target_context_and_era_token_footprints() -> Non
         torch.full((2, 2), 9.6),
         rtol=2.0e-6,
         atol=2.0e-6,
+    )
+    torch.testing.assert_close(
+        geometry.context_l4.footprint_height,
+        torch.full((1, 1), 19.2),
+        rtol=2.0e-6,
+        atol=2.0e-6,
+    )
+    torch.testing.assert_close(
+        geometry.target_l3.x_shared,
+        torch.tensor([[-0.0375, 0.0025], [-0.0375, 0.0025]]),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+    torch.testing.assert_close(
+        geometry.context_l3.x_shared,
+        torch.tensor([[-0.09, 0.006], [-0.09, 0.006]]),
+        rtol=0.0,
+        atol=1.0e-7,
     )
     assert geometry.era_native.x_shared.shape == (33, 33)
     assert torch.all(geometry.era_native.footprint_width > 0.0)
@@ -523,6 +568,23 @@ def test_time_dtype_normalizer_and_test_override_contracts_fail_closed() -> None
 
     with pytest.raises(ValueError, match="allow_test_override"):
         TrainingBatchCollator(grid)
+
+
+def test_model_batch_binds_canonical_fp32_time_embedding_to_t0_and_lead() -> None:
+    original = make_batch(leads=(1.0,)).model
+    mismatched_embedding = replace(
+        original.embedding,
+        verification_cyclic=torch.zeros_like(
+            original.embedding.verification_cyclic
+        ),
+    )
+
+    with pytest.raises(ValueError, match="canonical FP32 t0/lead"):
+        replace(original, embedding=mismatched_embedding)
+
+    original.embedding.verification_cyclic.zero_()
+    with pytest.raises(ValueError, match="canonical FP32 t0/lead"):
+        original.validate()
 
 
 def test_production_geometry_golden_spacing_and_orientation() -> None:

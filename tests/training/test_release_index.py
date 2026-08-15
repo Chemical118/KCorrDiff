@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, fields, replace
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +12,12 @@ import yaml
 
 from kcorrdiff.data.condition_augmentation import ConditionAugmentationPolicy
 from kcorrdiff.training.config import load_stage2_config
+from kcorrdiff.training.crossfit import CheckpointRecord, checkpoint_set_hash
 from kcorrdiff.training.release_index import (
     PATH_CONTRACT,
     RELEASE_INDEX_FORMAT,
+    Stage2ReleaseCheckpointPaths,
+    Stage2ImportedFoldSetPaths,
     Stage2ReleasePaths,
     load_stage2_release_index,
     resolve_stage3_release_inputs,
@@ -169,13 +173,35 @@ def release(tmp_path: Path) -> SimpleNamespace:
         "target_coordinates": _hash(target_coordinates),
         "context_coordinates": _hash(context_coordinates),
     }
-    roles = [
-        {"role": "fold", "fold_id": fold} for fold in range(3)
-    ] + [
-        {"role": "deployment", "fold_id": None},
-        {"role": "direct_mean", "fold_id": None},
-        {"role": "direct_q50", "fold_id": None},
+    original_run = tmp_path / "original-stage2-run"
+    release_models = selected / "models"
+    checkpoint_records: list[CheckpointRecord] = []
+    released_checkpoints: dict[tuple[str, int | None], Path] = {}
+    identities = [
+        *(("fold", fold) for fold in range(3)),
+        ("deployment", None),
+        ("direct_mean", None),
+        ("direct_q50", None),
     ]
+    for role, fold_id in identities:
+        name = role if fold_id is None else f"fold-{fold_id}"
+        payload = f"checkpoint for {name}\n".encode()
+        original_checkpoint = _file(original_run / name / "final.pt", payload)
+        released_checkpoint = _file(release_models / name / "final.pt", payload)
+        digest = _hash(original_checkpoint)
+        checkpoint_records.append(
+            CheckpointRecord(
+                fold_id=fold_id,
+                role=role,
+                path=str(original_checkpoint.resolve()),
+                sha256=digest,
+                training_blocks_sha256=hashlib.sha256(name.encode()).hexdigest(),
+                config_sha256=config.sha256,
+                draw_manifest_sha256=_hash(draw),
+                global_step=7,
+            )
+        )
+        released_checkpoints[(role, fold_id)] = released_checkpoint
     stage2_manifest = selected / "stage2-manifest.json"
     stage2_payload = {
         "format_version": "kcorrdiff.stage2-training.v1",
@@ -193,10 +219,12 @@ def release(tmp_path: Path) -> SimpleNamespace:
             "runtime_report_sha256": _hash(runtime_report),
             "data_contract_sha256": _hash(contract),
         },
-        "role_checkpoints": roles,
+        "role_checkpoints": [asdict(record) for record in checkpoint_records],
         "oof_manifest_sha256": _hash(oof_manifest),
         "residual_scales_sha256": _hash(residual_scales),
-        "fold_checkpoint_set_sha256": "4" * 64,
+        "fold_checkpoint_set_sha256": checkpoint_set_hash(
+            [record for record in checkpoint_records if record.role == "fold"]
+        ),
         "manual_release_required": True,
     }
     _canonical(stage2_manifest, stage2_payload)
@@ -222,6 +250,14 @@ def release(tmp_path: Path) -> SimpleNamespace:
         radar_cache_root=radar_root,
         era5_cache_root=era_root,
         oof_artifact_root=oof_root,
+        model_checkpoints=Stage2ReleaseCheckpointPaths(
+            fold_0=released_checkpoints[("fold", 0)],
+            fold_1=released_checkpoints[("fold", 1)],
+            fold_2=released_checkpoints[("fold", 2)],
+            deployment=released_checkpoints[("deployment", None)],
+            direct_mean=released_checkpoints[("direct_mean", None)],
+            direct_q50=released_checkpoints[("direct_q50", None)],
+        ),
     )
     index = selected / "release-index.json"
     return SimpleNamespace(
@@ -230,6 +266,108 @@ def release(tmp_path: Path) -> SimpleNamespace:
         index=index,
         stage2_payload=stage2_payload,
         policy_sha256=policy.semantic_sha256,
+        original_run=original_run,
+        checkpoint_records=tuple(checkpoint_records),
+    )
+
+
+def _attach_imported_fold_audit(
+    release: SimpleNamespace, tmp_path: Path
+) -> None:
+    original = tmp_path / "original-b12-audit"
+    promoted = release.index.parent / "imported-fold-audit"
+    original_manifest = original / "fold-set-manifest.json"
+    promoted_manifest = promoted / "fold-set-manifest.json"
+    manifest_payload = {"format_version": "kcorrdiff.stage2-single-node-fold-set.v1"}
+    manifest_hash = _canonical(original_manifest, manifest_payload)
+    _canonical(promoted_manifest, manifest_payload)
+    states = {
+        (record.role, record.fold_id): {
+            "epoch": 0,
+            "global_example_index": 84,
+            "optimizer_step": record.global_step,
+            "microbatches_since_step": 0,
+        }
+        for record in release.checkpoint_records
+    }
+    folds: list[dict[str, object]] = []
+    promoted_partials: dict[int, Path] = {}
+    for record in release.checkpoint_records:
+        if record.role != "fold":
+            continue
+        assert record.fold_id is not None
+        original_partial = original / f"fold-{record.fold_id}-partial.json"
+        promoted_partial = promoted / f"fold-{record.fold_id}-partial.json"
+        partial_payload = {"fold_id": record.fold_id}
+        partial_hash = _canonical(original_partial, partial_payload)
+        _canonical(promoted_partial, partial_payload)
+        promoted_partials[record.fold_id] = promoted_partial
+        folds.append(
+            {
+                "fold_id": record.fold_id,
+                "checkpoint_path": record.path,
+                "checkpoint_bytes": Path(record.path).stat().st_size,
+                "checkpoint_sha256": record.sha256,
+                "partial_manifest_path": str(original_partial.resolve()),
+                "partial_manifest_sha256": partial_hash,
+                "cursor": states[("fold", record.fold_id)],
+                "plan_semantic_sha256": str(record.fold_id + 1) * 64,
+                "plan_optimizer_steps": record.global_step,
+                "training_blocks_sha256": record.training_blocks_sha256,
+            }
+        )
+    release.stage2_payload["imported_fold_set"] = {
+        "format_version": "kcorrdiff.stage2-verified-fold-set-import.v1",
+        "manifest_path": str(original_manifest.resolve()),
+        "manifest_sha256": manifest_hash,
+        "producer": {},
+        "folds": folds,
+    }
+    _canonical(release.paths.stage2_manifest, release.stage2_payload)
+    release.paths = replace(
+        release.paths,
+        imported_fold_set=Stage2ImportedFoldSetPaths(
+            manifest=promoted_manifest,
+            fold_0_partial=promoted_partials[0],
+            fold_1_partial=promoted_partials[1],
+            fold_2_partial=promoted_partials[2],
+        ),
+    )
+    release.original_import_audit = original
+
+
+def _relocated_release_paths(
+    paths: Stage2ReleasePaths, *, source: Path, destination: Path
+) -> Stage2ReleasePaths:
+    def moved(path: Path) -> Path:
+        return destination / Path(path).relative_to(source)
+
+    scalar_paths = {
+        field.name: moved(getattr(paths, field.name))
+        for field in fields(Stage2ReleasePaths)
+        if field.name not in {"model_checkpoints", "imported_fold_set"}
+    }
+    checkpoints = Stage2ReleaseCheckpointPaths(
+        **{
+            field.name: moved(getattr(paths.model_checkpoints, field.name))
+            for field in fields(Stage2ReleaseCheckpointPaths)
+        }
+    )
+    imported = paths.imported_fold_set
+    relocated_imported = (
+        None
+        if imported is None
+        else Stage2ImportedFoldSetPaths(
+            **{
+                field.name: moved(getattr(imported, field.name))
+                for field in fields(Stage2ImportedFoldSetPaths)
+            }
+        )
+    )
+    return Stage2ReleasePaths(
+        **scalar_paths,
+        model_checkpoints=checkpoints,
+        imported_fold_set=relocated_imported,
     )
 
 
@@ -262,20 +400,108 @@ def test_roundtrip_is_canonical_portable_and_resolves_exact_stage3_cli(
     assert resolve_stage3_release_inputs(
         release.index, expected_sha256=digest, containment_root=release.root
     ) == cli
-    assert set(cli.as_cli_mapping()) == {
-        "--stage2-config",
-        "--stage2-manifest",
-        "--stage2-manifest-sha256",
-        "--oof-artifact",
-        "--residual-scales",
-        "--radar-cache-root",
-        "--era5-cache-root",
-        "--draw-manifest",
-        "--candidate-manifest",
-        "--bundle-metadata",
-        "--data-contract",
-        "--static-path",
+    assert {(item.role, item.fold_id) for item in cli.checkpoints} == {
+        ("fold", 0),
+        ("fold", 1),
+        ("fold", 2),
+        ("deployment", None),
+        ("direct_mean", None),
+        ("direct_q50", None),
     }
+    assert set(cli.as_cli_mapping()) == {
+        "--stage2-release-index",
+        "--stage2-release-index-sha256",
+        "--stage2-release-root",
+    }
+
+
+def test_release_tree_relocates_after_original_paths_are_unavailable(
+    release: SimpleNamespace, tmp_path: Path
+) -> None:
+    _attach_imported_fold_audit(release, tmp_path)
+    self_contained = tmp_path / "self-contained-release"
+    shutil.copytree(release.root, self_contained)
+    self_contained_paths = _relocated_release_paths(
+        release.paths, source=release.root, destination=self_contained
+    )
+    relative_index = release.index.relative_to(release.root)
+    self_contained_index = self_contained / relative_index
+    digest = write_stage2_release_index(
+        self_contained_index,
+        containment_root=self_contained,
+        release_paths=self_contained_paths,
+    )
+    relocated = tmp_path / "relocated-release"
+    shutil.copytree(self_contained, relocated)
+
+    shutil.rmtree(self_contained)
+    shutil.rmtree(release.root)
+    shutil.rmtree(release.original_run)
+    shutil.rmtree(release.original_import_audit)
+
+    loaded = load_stage2_release_index(
+        relocated / relative_index,
+        expected_sha256=digest,
+        containment_root=relocated,
+    )
+    cli = loaded.stage3_cli_inputs()
+    assert all(item.path.is_file() for item in cli.checkpoints)
+    assert all(str(item.path).startswith(str(relocated)) for item in cli.checkpoints)
+    assert cli.imported_fold_set is not None
+    assert cli.imported_fold_set.manifest.is_file()
+    assert all(path.is_file() for _, path in cli.imported_fold_set.partials)
+
+
+def test_release_checkpoint_missing_tampered_and_wrong_role_fail_closed(
+    release: SimpleNamespace,
+) -> None:
+    digest = write_stage2_release_index(
+        release.index,
+        containment_root=release.root,
+        release_paths=release.paths,
+    )
+    release.paths.model_checkpoints.fold_0.unlink()
+    with pytest.raises(FileNotFoundError, match="checkpoint"):
+        load_stage2_release_index(
+            release.index, expected_sha256=digest, containment_root=release.root
+        )
+
+    # Restore exact bytes, then forge a self-consistent index that assigns the
+    # direct-mean bytes to the deployment role.  Content hashing alone is not
+    # enough; the Stage 2 role lineage must reject this substitution.
+    fold_record = next(
+        record
+        for record in release.checkpoint_records
+        if record.role == "fold" and record.fold_id == 0
+    )
+    release.paths.model_checkpoints.fold_0.write_bytes(
+        Path(fold_record.path).read_bytes()
+    )
+    raw = json.loads(release.index.read_text(encoding="utf-8"))
+    deployment = next(
+        record for record in raw["model_checkpoints"] if record["role"] == "deployment"
+    )
+    direct_mean = next(
+        record for record in raw["model_checkpoints"] if record["role"] == "direct_mean"
+    )
+    for key in ("path", "sha256", "bytes"):
+        deployment[key], direct_mean[key] = direct_mean[key], deployment[key]
+    semantic_payload = {
+        key: value for key, value in raw.items() if key != "semantic_sha256"
+    }
+    raw["semantic_sha256"] = hashlib.sha256(
+        (
+            json.dumps(semantic_payload, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    _canonical(release.index, raw)
+    with pytest.raises(ValueError, match="role/content mismatch"):
+        load_stage2_release_index(
+            release.index,
+            expected_sha256=_hash(release.index),
+            containment_root=release.root,
+        )
 
 
 def test_atomic_publication_is_no_clobber_and_leaves_no_temporary(

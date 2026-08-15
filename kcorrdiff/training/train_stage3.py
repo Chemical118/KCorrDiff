@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import importlib.metadata
 import json
@@ -31,6 +31,7 @@ import shutil
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 from typing import Literal, Protocol
 
 import numpy as np
@@ -41,10 +42,12 @@ import yaml
 
 from kcorrdiff.data.normalization import sha256_file
 from kcorrdiff.models.common import (
+    CONDITION_DIM,
     CONTEXT_WIDTHS,
     PRODUCTION_INPUT_SIZE,
     TARGET_WIDTHS,
 )
+from kcorrdiff.models.physical_attention import ATTENTION_DIM, ATTENTION_HEADS
 from kcorrdiff.models.regression_system import RegressionSystem
 from kcorrdiff.models.residual_edm import (
     EDM_A_PRODUCTION_PARAMETER_COUNT,
@@ -78,6 +81,7 @@ from kcorrdiff.training.edm_loss import (
 )
 from kcorrdiff.training.stage3_data import (
     PROTOCOL_VERSION,
+    STAGE2_TARGET_BUILDER_VERSION,
     Stage2FactoryTargetLoaderFactory,
     Stage3ArtifactBundle,
     Stage3ArtifactInputs,
@@ -90,6 +94,10 @@ from kcorrdiff.training.stage3_data import (
 )
 from kcorrdiff.training.oof_remote import AuthenticatedHTTPSShardStore
 from kcorrdiff.training.runtime import assert_float32_tree
+from kcorrdiff.training.release_index import (
+    Stage2ReleaseIndex,
+    load_stage2_release_index,
+)
 from kcorrdiff.training.tracking import TrackingRun, initialize_tracking
 from kcorrdiff.training.train_stage2 import (
     DistributedRuntime,
@@ -135,9 +143,62 @@ _FALLBACK_ENVIRONMENT = (
 )
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as error:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from error
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 def _mapping(value: object, *, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be a mapping")
+    return value
+
+
+def _deep_freeze_config(value: object) -> object:
+    """Return an immutable, detached copy of a validated config tree."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _deep_freeze_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_config(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze_config(item) for item in value)
     return value
 
 
@@ -182,12 +243,49 @@ def _nonnegative_int(value: object, *, name: str) -> int:
 
 
 def _positive_float(value: object, *, name: str, allow_zero: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a JSON number")
     result = float(value)
     accepted = result >= 0.0 if allow_zero else result > 0.0
     if not math.isfinite(result) or not accepted:
         qualifier = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{name} must be finite and {qualifier}")
     return result
+
+
+def _finite_float(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a JSON number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _fixed_number(value: object, expected: float) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) == float(expected)
+    )
+
+
+def _integer_sequence(value: object, *, name: str) -> tuple[int, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be an integer sequence")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise TypeError(f"{name} must contain only integers")
+    return tuple(value)
+
+
+def _number_sequence(value: object, *, name: str) -> tuple[float, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be a numeric sequence")
+    return tuple(
+        _finite_float(item, name=f"{name}[{index}]")
+        for index, item in enumerate(value)
+    )
 
 
 def _strict_bool(value: object, *, name: str) -> bool:
@@ -445,7 +543,9 @@ class Stage3Config:
 def load_stage3_config(path: Path) -> Stage3Config:
     """Load and fail-closed validate the frozen full-width Stage 3 config."""
 
-    loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    loaded = yaml.load(
+        Path(path).read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader
+    )
     raw = _mapping(loaded, name="Stage 3 config")
     _exact_keys(
         raw,
@@ -498,19 +598,22 @@ def load_stage3_config(path: Path) -> Stage3Config:
         },
         name="runtime",
     )
-    target_widths = tuple(
-        int(value) for value in runtime["target_widths"]  # type: ignore[union-attr]
+    target_widths = _integer_sequence(
+        runtime["target_widths"], name="runtime target_widths"
     )
-    context_widths = tuple(
-        int(value) for value in runtime["context_widths"]  # type: ignore[union-attr]
+    context_widths = _integer_sequence(
+        runtime["context_widths"], name="runtime context_widths"
     )
     if target_widths != TARGET_WIDTHS or context_widths != CONTEXT_WIDTHS:
         raise ValueError("original full model widths are mandatory")
     if (
-        runtime["era_latent_channels"] != 128
+        type(runtime["era_latent_channels"]) is not int
+        or runtime["era_latent_channels"] != 128
+        or type(runtime["era_grid_size"]) is not int
         or runtime["era_grid_size"] != 33
+        or type(runtime["target_grid_size"]) is not int
         or runtime["target_grid_size"] != 256
-        or float(runtime["target_spacing_km"]) != 0.5
+        or not _fixed_number(runtime["target_spacing_km"], 0.5)
         or runtime["precision"] != "float32"
         or runtime["tf32"] is not False
     ):
@@ -548,13 +651,31 @@ def load_stage3_config(path: Path) -> Stage3Config:
         name="data",
     )
     if (
-        data.get("oof_dtype") != "float32"
+        data.get("radar_timezone") != "Asia/Seoul"
+        or data.get("target_builder_version") != STAGE2_TARGET_BUILDER_VERSION
+        or data.get("oof_dtype") != "float32"
         or tuple(data.get("oof_fields", ())) != ("occurrence_probability", "mu_z")
         or data.get("mmap_lazy_per_worker") is not True
         or data.get("pin_memory") is not True
         or data.get("persistent_workers") is not True
     ):
         raise ValueError("Stage 3 OOF/loader data contract fallback is forbidden")
+    for key in (
+        "target_coordinates",
+        "context_coordinates",
+        "target_static",
+        "normalization",
+        "draw_manifest",
+        "candidate_manifest",
+        "bundle_metadata",
+    ):
+        configured_path = data.get(key)
+        if (
+            not isinstance(configured_path, str)
+            or not configured_path.strip()
+            or not Path(configured_path).is_absolute()
+        ):
+            raise ValueError(f"Stage 3 data.{key} must be a non-empty absolute path")
     signatures_raw = data.get("condition_signatures")
     if not isinstance(signatures_raw, Sequence) or isinstance(
         signatures_raw, (str, bytes)
@@ -574,14 +695,57 @@ def load_stage3_config(path: Path) -> Stage3Config:
         raise ValueError("Stage 3 production condition policy changed")
 
     stage2_contract = _mapping(raw["stage2_contract"], name="stage2_contract")
-    if not stage2_contract or any(value is not True for value in stage2_contract.values()):
+    _exact_keys(
+        stage2_contract,
+        {
+            "require_complete_stage_manifest",
+            "require_three_fold_checkpoints",
+            "require_deployment_checkpoint",
+            "require_complete_oof",
+            "require_residual_scales",
+            "require_float32_oof",
+            "freeze_deployment_condition_encoder",
+        },
+        name="stage2_contract",
+    )
+    if any(value is not True for value in stage2_contract.values()):
         raise ValueError("every Stage 2 lineage/freeze requirement must remain enabled")
 
     model = _mapping(raw["model"], name="model")
+    _exact_keys(
+        model,
+        {
+            "condition_dimension",
+            "target_widths",
+            "activation_checkpoint",
+            "sigma_data",
+            "state_channels",
+            "regression_condition_channels",
+            "raw_positive_amount_condition",
+            "target_grid_residual_state",
+            "diffusion_specific_condition_adapters",
+            "diffusion_specific_qkv",
+            "physical_attention_levels",
+            "physical_attention_heads",
+            "physical_attention_dimension",
+            "physical_attention_query_chunk_size",
+            "cache_source_kv_per_lead_signature",
+            "source_kv_depends_on_sigma",
+            "source_gate_depends_on_sigma",
+            "candidates",
+            "selection_decision_file",
+        },
+        name="model",
+    )
+    model_target_widths = _integer_sequence(
+        model.get("target_widths"), name="model target_widths"
+    )
     if (
-        tuple(model.get("target_widths", ())) != TARGET_WIDTHS
-        or model.get("condition_dimension") != 512
-        or model.get("sigma_data") != 1.0
+        model_target_widths != TARGET_WIDTHS
+        or type(model.get("condition_dimension")) is not int
+        or model.get("condition_dimension") != CONDITION_DIM
+        or not _fixed_number(model.get("sigma_data"), 1.0)
+        or type(model.get("state_channels")) is not int
         or model.get("state_channels") != 1
         or tuple(model.get("regression_condition_channels", ()))
         != ("mu_z", "probability_wet")
@@ -590,31 +754,88 @@ def load_stage3_config(path: Path) -> Stage3Config:
         or model.get("activation_checkpoint") is not True
         or model.get("diffusion_specific_condition_adapters") is not True
         or model.get("diffusion_specific_qkv") is not True
+        or _integer_sequence(
+            model.get("physical_attention_levels"),
+            name="physical_attention_levels",
+        )
+        != (3, 4)
+        or type(model.get("physical_attention_heads")) is not int
+        or model.get("physical_attention_heads") != ATTENTION_HEADS
+        or type(model.get("physical_attention_dimension")) is not int
+        or model.get("physical_attention_dimension") != ATTENTION_DIM
         or model.get("cache_source_kv_per_lead_signature") is not True
         or model.get("source_kv_depends_on_sigma") is not False
         or model.get("source_gate_depends_on_sigma") is not True
     ):
         raise ValueError("Stage 3 model contract differs from the frozen architecture")
     candidates = model.get("candidates")
-    if not isinstance(candidates, list) or [
-        item.get("name") for item in candidates
-    ] != list(EDM_VARIANTS):  # type: ignore[union-attr]
+    expected_candidates = (
+        {
+            "name": "edm_a",
+            "deployment_encoder_pyramid": False,
+            "static_and_advection_conditions": True,
+        },
+        {
+            "name": "edm_b",
+            "deployment_encoder_pyramid": True,
+            "static_and_advection_conditions": True,
+        },
+    )
+    if (
+        not isinstance(candidates, list)
+        or len(candidates) != len(expected_candidates)
+        or any(not isinstance(item, Mapping) for item in candidates)
+    ):
         raise ValueError("Stage 3 must retain exactly the preregistered EDM-A/B arms")
+    for index, (candidate, expected_candidate) in enumerate(
+        zip(candidates, expected_candidates, strict=True)
+    ):
+        candidate_mapping = _mapping(candidate, name=f"model candidate {index}")
+        _exact_keys(
+            candidate_mapping,
+            set(expected_candidate),
+            name=f"model candidate {index}",
+        )
+        if dict(candidate_mapping) != expected_candidate:
+            raise ValueError(
+                "Stage 3 candidate architecture differs from the preregistered arms"
+            )
     query_chunk_size = _positive_int(
         model.get("physical_attention_query_chunk_size"),
         name="physical_attention_query_chunk_size",
     )
+    selection_decision_file_raw = model.get("selection_decision_file")
+    if (
+        not isinstance(selection_decision_file_raw, str)
+        or not selection_decision_file_raw.strip()
+        or not Path(selection_decision_file_raw).is_absolute()
+    ):
+        raise ValueError("selection_decision_file must be a non-empty absolute path")
 
     noise = _mapping(raw["noise"], name="noise")
+    _exact_keys(
+        noise,
+        {
+            "distribution",
+            "log_sigma_mean",
+            "log_sigma_standard_deviation",
+            "minimum_sigma",
+            "maximum_sigma",
+            "purpose_id",
+            "invalid_clean_residual_fill",
+            "gaussian_noise_full_grid",
+        },
+        name="noise",
+    )
     if (
         noise.get("distribution") != "lognormal"
         or noise.get("purpose_id") != TRAINING_NOISE_PURPOSE
-        or noise.get("invalid_clean_residual_fill") != 0.0
+        or not _fixed_number(noise.get("invalid_clean_residual_fill"), 0.0)
         or noise.get("gaussian_noise_full_grid") is not True
     ):
         raise ValueError("EDM training-noise contract mismatch")
     noise_config = Stage3NoiseConfig(
-        log_sigma_mean=float(noise["log_sigma_mean"]),
+        log_sigma_mean=_finite_float(noise["log_sigma_mean"], name="log sigma mean"),
         log_sigma_standard_deviation=_positive_float(
             noise["log_sigma_standard_deviation"], name="log sigma standard deviation"
         ),
@@ -637,16 +858,41 @@ def load_stage3_config(path: Path) -> Stage3Config:
         "full_item_importance_weight",
         "target_validity_loss_only",
         "distributed_global_numerator_denominator",
-    } or loss.get("sigma_data") != 1.0 or any(
+    } or not _fixed_number(loss.get("sigma_data"), 1.0) or any(
         loss[key] is not True for key in loss if key != "sigma_data"
     ):
         raise ValueError("masked global EDM objective must remain fully enabled")
 
     optimization = _mapping(raw["optimization"], name="optimization")
+    _exact_keys(
+        optimization,
+        {
+            "optimizer",
+            "learning_rate",
+            "weight_decay",
+            "betas",
+            "gradient_clip_norm",
+            "epochs",
+            "scheduler",
+            "scheduler_minimum_ratio",
+            "per_rank_microbatch_size",
+            "gradient_accumulation_steps",
+            "global_effective_batch_size",
+            "checkpoint_every_optimizer_steps",
+            "log_every_optimizer_steps",
+        },
+        name="optimization",
+    )
     if optimization.get("optimizer") != "AdamW" or optimization.get("scheduler") != "cosine":
         raise ValueError("only the declared AdamW/cosine path is supported")
-    betas = tuple(float(value) for value in optimization["betas"])  # type: ignore[union-attr]
-    if len(betas) != 2 or not all(0.0 < value < 1.0 for value in betas):
+    betas_raw = optimization["betas"]
+    if not isinstance(betas_raw, Sequence) or isinstance(betas_raw, (str, bytes)):
+        raise TypeError("AdamW betas must be a two-element numeric sequence")
+    betas = tuple(
+        _positive_float(value, name=f"AdamW beta {index}")
+        for index, value in enumerate(betas_raw)
+    )
+    if len(betas) != 2 or not all(value < 1.0 for value in betas):
         raise ValueError("AdamW betas must lie in (0,1)")
     optimization_config = Stage3OptimizationConfig(
         learning_rate=_positive_float(optimization["learning_rate"], name="learning rate"),
@@ -683,6 +929,16 @@ def load_stage3_config(path: Path) -> Stage3Config:
         raise ValueError("Stage 3 uses one immutable draw epoch and a cosine floor in (0,1]")
 
     loader = _mapping(raw["loader_tuning"], name="loader_tuning")
+    _exact_keys(
+        loader,
+        {
+            "selected_batch_size_per_rank",
+            "selected_num_workers",
+            "selected_prefetch_factor",
+            "require_production_pipeline_benchmark",
+        },
+        name="loader_tuning",
+    )
     selected_loader_batch = _positive_power_of_two(
         loader.get("selected_batch_size_per_rank"), name="selected loader batch"
     )
@@ -695,54 +951,217 @@ def load_stage3_config(path: Path) -> Stage3Config:
     prefetch = _positive_int(loader.get("selected_prefetch_factor"), name="selected prefetch")
 
     profiles = _mapping(raw["sampling_profiles"], name="sampling_profiles")
-    selection = _mapping(profiles.get("selection_signature"), name="selection signature")
+    _exact_keys(
+        profiles,
+        {
+            "development_smoke",
+            "selection_signature",
+            "final_primary_signature",
+            "operational_transition_signature",
+            "solver",
+            "sigma_schedule",
+            "minimum_sigma",
+            "maximum_sigma",
+            "rho",
+        },
+        name="sampling_profiles",
+    )
+    expected_profile_mappings: Mapping[str, Mapping[str, object]] = {
+        "development_smoke": {"members": 4, "edm_steps": 6},
+        "selection_signature": {
+            "members": SELECTION_MEMBERS,
+            "edm_steps": SELECTION_STEPS,
+        },
+        "final_primary_signature": {"members": 32, "edm_steps": 12},
+        "operational_transition_signature": {
+            "members": 8,
+            "edm_steps": 4,
+            "distilled_only": True,
+        },
+    }
+    for profile_name, expected_profile in expected_profile_mappings.items():
+        profile = _mapping(profiles.get(profile_name), name=profile_name)
+        _exact_keys(profile, set(expected_profile), name=profile_name)
+        if (
+            _positive_int(profile.get("members"), name=f"{profile_name} members")
+            != expected_profile["members"]
+            or _positive_int(
+                profile.get("edm_steps"), name=f"{profile_name} edm_steps"
+            )
+            != expected_profile["edm_steps"]
+            or (
+                "distilled_only" in expected_profile
+                and profile.get("distilled_only") is not True
+            )
+        ):
+            raise ValueError(f"frozen sampling profile changed: {profile_name}")
     if (
-        selection != {"members": SELECTION_MEMBERS, "edm_steps": SELECTION_STEPS}
-        or profiles.get("solver") != "heun"
+        profiles.get("solver") != "heun"
         or profiles.get("sigma_schedule") != "karras_rho7"
+        or not _fixed_number(profiles.get("minimum_sigma"), 0.002)
+        or not _fixed_number(profiles.get("maximum_sigma"), 80.0)
+        or not _fixed_number(profiles.get("rho"), 7.0)
     ):
-        raise ValueError("fixed 16x8 selection sampler contract mismatch")
+        raise ValueError("frozen Stage 3 sampler contract mismatch")
     model_selection = _mapping(raw["model_selection"], name="model_selection")
+    _exact_keys(
+        model_selection,
+        {
+            "split",
+            "labels_never_fit_calibration_parameters",
+            "candidates",
+            "sampler_bias_d_candidates",
+            "profile",
+            "decision_file_required_before_calibration",
+        },
+        name="model_selection",
+    )
     if (
         model_selection.get("split") != "model_selection"
         or model_selection.get("labels_never_fit_calibration_parameters") is not True
         or tuple(model_selection.get("candidates", ())) != EDM_VARIANTS
+        or tuple(model_selection.get("sampler_bias_d_candidates", ()))
+        != ("disabled", "enabled")
         or model_selection.get("profile") != "selection_signature"
         or model_selection.get("decision_file_required_before_calibration") is not True
     ):
         raise ValueError("model-selection governance contract mismatch")
     calibration = _mapping(raw["calibration"], name="calibration")
+    _exact_keys(
+        calibration,
+        {
+            "split",
+            "require_frozen_model_selection_decision",
+            "order",
+            "fold_mixture_weights",
+            "variance",
+            "d_default_when_disabled",
+            "gamma_preserve_member_mean",
+            "probability_family",
+            "probability_clip",
+            "p_thresholds_mm",
+            "q_thresholds_mm",
+            "pooling_order",
+            "minimum_independent_blocks",
+            "minimum_block_ess",
+            "minimum_positive_support_blocks",
+            "minimum_negative_support_blocks",
+        },
+        name="calibration",
+    )
     if (
         calibration.get("split") != "calibration"
         or calibration.get("require_frozen_model_selection_decision") is not True
+        or tuple(calibration.get("order", ()))
+        != (
+            "oof_scale_restore",
+            "location_b",
+            "total_scale_c",
+            "optional_sampler_d",
+            "spread_gamma",
+            "probability_maps",
+        )
+        or calibration.get("fold_mixture_weights") != "oof_weighted_valid_mass"
+        or calibration.get("variance") != "weighted_population"
+        or not _fixed_number(calibration.get("d_default_when_disabled"), 0.0)
+        or calibration.get("gamma_preserve_member_mean") is not True
         or calibration.get("probability_family") != MONOTONE_LOGIT_LINEAR_FAMILY
+        or not _fixed_number(calibration.get("probability_clip"), 0.000001)
+        or _number_sequence(
+            calibration.get("p_thresholds_mm"), name="calibration p_thresholds_mm"
+        )
+        != (0.1,)
+        or _number_sequence(
+            calibration.get("q_thresholds_mm"), name="calibration q_thresholds_mm"
+        )
+        != (0.1, 1.0, 5.0)
         or tuple(calibration.get("pooling_order", ())) != POOLING_ORDER
+        or type(calibration.get("minimum_independent_blocks")) is not int
+        or calibration.get("minimum_independent_blocks") != 30
+        or not _fixed_number(calibration.get("minimum_block_ess"), 20.0)
+        or type(calibration.get("minimum_positive_support_blocks")) is not int
+        or calibration.get("minimum_positive_support_blocks") != 20
+        or type(calibration.get("minimum_negative_support_blocks")) is not int
+        or calibration.get("minimum_negative_support_blocks") != 20
     ):
         raise ValueError("independent calibration family/pooling governance changed")
 
+    inference = _mapping(raw["inference"], name="inference")
+    _exact_keys(
+        inference,
+        {
+            "output_grid",
+            "inverse_transform_a0_mm",
+            "censor_threshold_mm",
+            "ensemble_mean_after_member_inverse",
+            "ensemble_median",
+            "output_each_lead_independently",
+            "cross_lead_member_trajectory_claim",
+        },
+        name="inference",
+    )
+    if (
+        _integer_sequence(inference.get("output_grid"), name="inference output_grid")
+        != (PRODUCTION_INPUT_SIZE, PRODUCTION_INPUT_SIZE)
+        or not _fixed_number(inference.get("inverse_transform_a0_mm"), 1.0)
+        or not _fixed_number(inference.get("censor_threshold_mm"), 0.1)
+        or inference.get("ensemble_mean_after_member_inverse") is not True
+        or inference.get("ensemble_median") != "empirical_lower"
+        or inference.get("output_each_lead_independently") is not True
+        or inference.get("cross_lead_member_trajectory_claim") is not False
+    ):
+        raise ValueError("Stage 3 inference contract differs from the fixed implementation")
+
     tracking = _mapping(raw["tracking"], name="tracking")
+    _exact_keys(
+        tracking,
+        {"backend", "project", "job_type", "mode", "log_gpu_system_metrics"},
+        name="tracking",
+    )
     if tracking.get("backend") != "wandb" or tracking.get("log_gpu_system_metrics") is not True:
         raise ValueError("rank-zero W&B system tracking must remain enabled")
     mode = str(tracking.get("mode"))
     if mode not in {"online", "offline", "disabled"}:
         raise ValueError("unsupported W&B mode")
+    project = tracking.get("project")
+    job_type = tracking.get("job_type")
+    if (
+        not isinstance(project, str)
+        or not project.strip()
+        or not isinstance(job_type, str)
+        or not job_type.strip()
+    ):
+        raise ValueError("W&B project/job type must be non-empty strings")
     tracking_config = Stage3TrackingConfig(
-        project=str(tracking.get("project")),
-        job_type=str(tracking.get("job_type")),
+        project=project,
+        job_type=job_type,
         mode=mode,
     )
-    if not tracking_config.project or not tracking_config.job_type:
-        raise ValueError("W&B project/job type cannot be empty")
 
     publication = _mapping(raw["publication"], name="publication")
-    if publication.get("atomic_stage_manifest") is not True or publication.get(
-        "immutable_release_requires_manual_promotion"
-    ) is not True:
-        raise ValueError("atomic/manual Stage 3 publication must remain enabled")
+    _exact_keys(
+        publication,
+        {
+            "require_stage2_hash_lineage",
+            "require_model_selection_decision_hash",
+            "require_edm_checkpoint",
+            "require_independent_calibration",
+            "require_sampling_profile_smoke",
+            "atomic_stage_manifest",
+            "immutable_release_requires_manual_promotion",
+        },
+        name="publication",
+    )
+    if any(value is not True for value in publication.values()):
+        raise ValueError("every Stage 3 publication requirement must remain enabled")
 
+    config_sha256 = _semantic_sha256(raw)
+    frozen_raw = _mapping(
+        _deep_freeze_config(raw), name="frozen Stage 3 config"
+    )
     result = Stage3Config(
-        raw=raw,
-        sha256=_semantic_sha256(raw),
+        raw=frozen_raw,
+        sha256=config_sha256,
         protocol_version=PROTOCOL_VERSION,
         research_track=str(raw["research_track"]),
         seed=seed,
@@ -761,7 +1180,7 @@ def load_stage3_config(path: Path) -> Stage3Config:
         condition_augmentation_sha256=condition_augmentation_sha256,
         condition_signatures=condition_signatures,
         tracking=tracking_config,
-        selection_decision_file=Path(str(model["selection_decision_file"])).resolve(),
+        selection_decision_file=Path(selection_decision_file_raw).resolve(),
         probability_mapping_family=MONOTONE_LOGIT_LINEAR_FAMILY,
         pooling_order=POOLING_ORDER,
     )
@@ -3068,21 +3487,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--phase", choices=("screen", "finalists", "bind-decision"), required=True
     )
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--stage2-config", type=Path, required=True)
-    parser.add_argument("--stage2-manifest", type=Path, required=True)
-    parser.add_argument("--stage2-manifest-sha256", required=True)
-    parser.add_argument("--oof-artifact", type=Path, required=True)
+    parser.add_argument("--stage2-release-index", type=Path, required=True)
+    parser.add_argument("--stage2-release-index-sha256", required=True)
+    parser.add_argument("--stage2-release-root", type=Path, required=True)
     parser.add_argument("--oof-remote-credentials", type=Path, required=True)
     parser.add_argument("--oof-remote-ca-certificate", type=Path, required=True)
     parser.add_argument("--oof-remote-cache-root", type=Path, required=True)
-    parser.add_argument("--residual-scales", type=Path, required=True)
-    parser.add_argument("--radar-cache-root", type=Path, required=True)
-    parser.add_argument("--era5-cache-root", type=Path, required=True)
-    parser.add_argument("--draw-manifest", type=Path, required=True)
-    parser.add_argument("--candidate-manifest", type=Path, required=True)
-    parser.add_argument("--bundle-metadata", type=Path, required=True)
-    parser.add_argument("--data-contract", type=Path, required=True)
-    parser.add_argument("--static-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--screening-evaluation", type=Path)
     parser.add_argument("--final-decision", type=Path)
@@ -3225,8 +3635,38 @@ def _factory_inputs_from_arguments(
     )
 
 
+def _bind_stage2_release_arguments(
+    arguments: argparse.Namespace,
+) -> Stage2ReleaseIndex:
+    """Resolve every Stage 2 input from one externally pinned portable index."""
+
+    release = load_stage2_release_index(
+        arguments.stage2_release_index,
+        expected_sha256=arguments.stage2_release_index_sha256,
+        containment_root=arguments.stage2_release_root,
+    )
+    resolved = release.stage3_cli_inputs()
+    for name, value in (
+        ("stage2_config", resolved.stage2_config),
+        ("stage2_manifest", resolved.stage2_manifest),
+        ("stage2_manifest_sha256", resolved.stage2_manifest_sha256),
+        ("oof_artifact", resolved.oof_artifact),
+        ("residual_scales", resolved.residual_scales),
+        ("radar_cache_root", resolved.radar_cache_root),
+        ("era5_cache_root", resolved.era5_cache_root),
+        ("draw_manifest", resolved.draw_manifest),
+        ("candidate_manifest", resolved.candidate_manifest),
+        ("bundle_metadata", resolved.bundle_metadata),
+        ("data_contract", resolved.data_contract),
+        ("static_path", resolved.static_path),
+    ):
+        setattr(arguments, name, value)
+    return release
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_args(argv)
+    stage2_release = _bind_stage2_release_arguments(arguments)
     config = load_stage3_config(arguments.config)
     validate_launch_arguments(arguments, config)
     runtime = initialize_distributed_runtime(require_world_size=arguments.require_world_size)
@@ -3253,6 +3693,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "Stage 2/3 condition augmentation lineage mismatch"
             )
+        stage3_data_raw = _mapping(config.raw["data"], name="Stage 3 data")
+        for name, producer_path in (
+            ("target_coordinates", stage2_config.data.target_coordinates),
+            ("context_coordinates", stage2_config.data.context_coordinates),
+            ("normalization", stage2_config.data.normalization),
+        ):
+            if Path(str(stage3_data_raw[name])).resolve() != producer_path.resolve():
+                raise ValueError(
+                    f"Stage 2/3 producer {name} paths disagree before relocation"
+                )
+        release_inputs = stage2_release.stage3_cli_inputs()
+        stage2_config = replace(
+            stage2_config,
+            data=replace(
+                stage2_config.data,
+                target_coordinates=release_inputs.target_coordinates,
+                context_coordinates=release_inputs.context_coordinates,
+                normalization=release_inputs.normalization,
+            ),
+        )
         factory = build_data_factory(
             stage2_config, _factory_inputs_from_arguments(arguments, stage2_config)
         )
@@ -3270,25 +3730,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 draw_manifest=arguments.draw_manifest,
                 oof_artifact=arguments.oof_artifact,
                 residual_scales=arguments.residual_scales,
+                checkpoint_path_overrides=tuple(
+                    (record.role, record.fold_id, record.path)
+                    for record in release_inputs.checkpoints
+                ),
+                imported_fold_set_manifest_override=(
+                    None
+                    if release_inputs.imported_fold_set is None
+                    else release_inputs.imported_fold_set.manifest
+                ),
+                imported_fold_partial_manifest_overrides=(
+                    ()
+                    if release_inputs.imported_fold_set is None
+                    else release_inputs.imported_fold_set.partials
+                ),
                 remote_store=remote_store,
                 remote_cache_root=arguments.oof_remote_cache_root,
             )
         )
         if stage2_config.sha256 != bundle.provenance.stage2_config_sha256:
             raise ValueError("loaded Stage 2 config hash disagrees with complete Stage 2 manifest")
-        stage3_data_raw = _mapping(config.raw["data"], name="Stage 3 data")
-        stage3_path_contract = {
-            "draw_manifest": arguments.draw_manifest,
-            "candidate_manifest": arguments.candidate_manifest,
-            "bundle_metadata": arguments.bundle_metadata,
-            "target_static": arguments.static_path,
-            "target_coordinates": stage2_config.data.target_coordinates,
-            "context_coordinates": stage2_config.data.context_coordinates,
-            "normalization": stage2_config.data.normalization,
-        }
-        for name, actual_path in stage3_path_contract.items():
-            if Path(str(stage3_data_raw[name])).resolve() != Path(actual_path).resolve():
-                raise ValueError(f"Stage 3 {name} path disagrees with immutable config lineage")
+        # Stage 2/3 YAML paths remain semantic producer metadata (the shared
+        # coordinate/normalization producer identities were checked above).
+        # Runtime
+        # deployment paths are deliberately relocated by the externally
+        # pinned release index, whose role/content bindings were revalidated
+        # above.  Requiring the producer's absolute paths here would defeat
+        # the portable release boundary.
         contract = regression_system_config_from_stage2(stage2_config)
         deployment = RegressionSystem(contract.system).to(
             device=runtime.device, dtype=torch.float32

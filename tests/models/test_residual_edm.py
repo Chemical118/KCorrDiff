@@ -174,6 +174,7 @@ def _conditions(
             context_l4=_geometry(1, 1),
             era_native=_geometry(33, 33),
         ),
+        sample_ids=("sample-0",),
         condition_signatures=(SIGNATURE,),
         lead_indices=torch.tensor([2], dtype=torch.int64),
     )
@@ -214,6 +215,7 @@ def test_condition_schema_and_target_grid_state_are_fail_closed() -> None:
         "probability_wet",
         "e_cond",
         "geometry",
+        "sample_ids",
         "condition_signatures",
         "lead_indices",
     }
@@ -349,6 +351,41 @@ def test_edm_b_uses_detached_deployment_pyramid_and_separate_source_qkv() -> Non
     assert model.context_attention_l3.key_projection is not model.context_attention_l4.key_projection
 
 
+def test_diffusion_advection_uses_same_exact_stride2_lattice() -> None:
+    model = ResidualEDM(_config()).eval()
+    conditions = _conditions()
+    horizontal = torch.arange(SIZE, dtype=torch.float32)[None, None, None, :]
+    advection = horizontal.expand(1, 8, SIZE, SIZE).clone()
+    conditions = replace(conditions, advection_features=advection)
+    hidden = torch.zeros(1, TARGET[3], 2, 2)
+    e_diff = torch.zeros(1, 512)
+    captured: list[torch.Tensor] = []
+
+    def capture(
+        _module: torch.nn.Module, arguments: tuple[torch.Tensor, ...]
+    ) -> None:
+        captured.append(arguments[1].detach().clone())
+
+    handle = model.advection_adapters[3].register_forward_pre_hook(capture)
+    with torch.no_grad():
+        model._conditioned_level(3, hidden, conditions, e_diff)
+    handle.remove()
+
+    expected = advection[..., ::8, ::8]
+    half_pixel = torch.nn.functional.interpolate(
+        advection, size=(2, 2), mode="bilinear", align_corners=False
+    )
+    endpoint_aligned = torch.nn.functional.interpolate(
+        advection, size=(2, 2), mode="bilinear", align_corners=True
+    )
+    torch.testing.assert_close(captured[0], expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        captured[0][0, 0, 0], torch.tensor([0.0, 8.0]), rtol=0.0, atol=0.0
+    )
+    assert not torch.equal(captured[0], half_pixel)
+    assert not torch.equal(captured[0], endpoint_aligned)
+
+
 def test_source_kv_cache_is_sigma_free_and_reused_across_noise_levels() -> None:
     torch.manual_seed(604)
     model = ResidualEDM(_config()).eval()
@@ -402,6 +439,163 @@ def test_source_kv_cache_is_sigma_free_and_reused_across_noise_levels() -> None:
             torch.zeros(1, 1, SIZE, SIZE),
             torch.ones(1),
             wrong_lead,
+            source_cache=source_cache,
+        )
+
+
+def test_source_kv_cache_rejects_stale_source_geometry_and_sample_identity() -> None:
+    torch.manual_seed(614)
+    model = ResidualEDM(_config()).eval()
+    conditions = _conditions()
+    source_cache = model.prepare_source_cache(conditions)
+    noisy = torch.zeros(1, 1, SIZE, SIZE)
+    sigma = torch.ones(1)
+
+    cloned_source = replace(
+        conditions,
+        era=replace(
+            conditions.era,
+            features=conditions.era.features.clone(),
+        ),
+    )
+    with pytest.raises(ValueError, match="era_features tensor identity mismatch"):
+        model.denoise(noisy, sigma, cloned_source, source_cache=source_cache)
+
+    cloned_context = replace(
+        conditions,
+        condition_bank=replace(
+            conditions.condition_bank,
+            context=replace(
+                conditions.condition_bank.context,
+                features=replace(
+                    conditions.condition_bank.context.features,
+                    l3=conditions.condition_bank.context.l3.clone(),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="context_l3 tensor identity mismatch"):
+        model.denoise(noisy, sigma, cloned_context, source_cache=source_cache)
+
+    changed_geometry = replace(
+        conditions,
+        geometry=replace(
+            conditions.geometry,
+            target_l3=replace(
+                conditions.geometry.target_l3,
+                x_shared=conditions.geometry.target_l3.x_shared.clone(),
+            ),
+        ),
+    )
+    with pytest.raises(
+        ValueError, match="geometry_target_l3_x tensor identity mismatch"
+    ):
+        model.denoise(noisy, sigma, changed_geometry, source_cache=source_cache)
+
+    changed_sample = replace(conditions, sample_ids=("another-sample",))
+    with pytest.raises(ValueError, match="sample identity mismatch"):
+        model.denoise(noisy, sigma, changed_sample, source_cache=source_cache)
+
+    mutated_conditions = _conditions()
+    mutated_cache = model.prepare_source_cache(mutated_conditions)
+    with torch.no_grad():
+        mutated_conditions.era.features.add_(1.0)
+    with pytest.raises(ValueError, match="era_features tensor was mutated"):
+        model.denoise(noisy, sigma, mutated_conditions, source_cache=mutated_cache)
+
+
+def test_source_kv_cache_rejects_same_object_inference_tensor_mutation() -> None:
+    torch.manual_seed(615)
+    model = ResidualEDM(_config()).eval()
+    with torch.inference_mode():
+        conditions = _conditions()
+        source_cache = model.prepare_source_cache(conditions)
+        # Inference tensors have no PyTorch version counter.  The cache must
+        # still reject an in-place mutation of the exact same tensor object.
+        conditions.era.features.add_(1.0)
+        with pytest.raises(ValueError, match="era_features tensor was mutated"):
+            model.denoise(
+                torch.zeros(1, 1, SIZE, SIZE),
+                torch.ones(1),
+                conditions,
+                source_cache=source_cache,
+            )
+
+
+def test_source_kv_cache_binds_source_projection_and_geometry_model_state() -> None:
+    torch.manual_seed(616)
+    model = ResidualEDM(_config()).eval()
+    conditions = _conditions()
+    source_cache = model.prepare_source_cache(conditions)
+    binding_names = {binding.name for binding in source_cache.model_bindings}
+    for attention_name in (
+        "context_attention_l3",
+        "era_attention_l3",
+        "context_attention_l4",
+        "era_attention_l4",
+    ):
+        prefix = f"model_{attention_name}."
+        assert prefix + "source_norm.modulation.weight" in binding_names
+        assert prefix + "source_norm.modulation.bias" in binding_names
+        assert prefix + "key_projection.weight" in binding_names
+        assert prefix + "value_projection.weight" in binding_names
+        assert prefix + "geometry_bias.0.weight" in binding_names
+        assert prefix + "geometry_bias.0.bias" in binding_names
+        assert prefix + "geometry_bias.2.weight" in binding_names
+        assert prefix + "geometry_bias.2.bias" in binding_names
+        assert prefix + "geometry_frequencies" in binding_names
+
+    with torch.no_grad():
+        model.context_attention_l3.key_projection.weight.add_(1.0)
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"model_context_attention_l3\.key_projection\.weight "
+            r"tensor was mutated"
+        ),
+    ):
+        model.denoise(
+            torch.zeros(1, 1, SIZE, SIZE),
+            torch.ones(1),
+            conditions,
+            source_cache=source_cache,
+        )
+
+
+def test_source_kv_cache_rejects_version_bypassing_data_mutations() -> None:
+    torch.manual_seed(617)
+    model = ResidualEDM(_config()).eval()
+    conditions = _conditions()
+    source_cache = model.prepare_source_cache(conditions)
+
+    source_version = conditions.era.features._version
+    conditions.era.features.data.add_(1.0)
+    assert conditions.era.features._version == source_version
+    with pytest.raises(ValueError, match="era_features tensor was mutated"):
+        model.denoise(
+            torch.zeros(1, 1, SIZE, SIZE),
+            torch.ones(1),
+            conditions,
+            source_cache=source_cache,
+        )
+
+    conditions = _conditions()
+    source_cache = model.prepare_source_cache(conditions)
+    weight = model.context_attention_l3.key_projection.weight
+    parameter_version = weight._version
+    weight.data.add_(1.0)
+    assert weight._version == parameter_version
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"model_context_attention_l3\.key_projection\.weight "
+            r"tensor was mutated"
+        ),
+    ):
+        model.denoise(
+            torch.zeros(1, 1, SIZE, SIZE),
+            torch.ones(1),
+            conditions,
             source_cache=source_cache,
         )
 

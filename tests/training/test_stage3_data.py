@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,10 +33,13 @@ from kcorrdiff.training.oof import (
     OOFShardWriter,
 )
 from kcorrdiff.training.residual_scales import (
+    DEFAULT_MINIMUM_BLOCK_ESS,
+    DEFAULT_MINIMUM_INDEPENDENT_BLOCKS,
     ResidualScaleAccumulator,
     write_residual_scales,
 )
 from kcorrdiff.training.stage3_data import (
+    DiffusionScaleUnsupportedError,
     STAGE2_TARGET_BUILDER_VERSION,
     Stage3ArtifactInputs,
     Stage3BatchCollator,
@@ -173,6 +177,68 @@ def _replace_stage2_hash(inputs: Stage3ArtifactInputs) -> Stage3ArtifactInputs:
     )
 
 
+def _imported_fold_set(
+    published: SimpleNamespace, tmp_path: Path
+) -> dict[str, object]:
+    manifest_path = tmp_path / "verified-fold-set-manifest.json"
+    manifest_hash = _canonical_json(
+        manifest_path,
+        {"format_version": "kcorrdiff.stage2-verified-fold-set.v1"},
+    )
+    states = {
+        (state["role"], state["fold_id"]): state
+        for state in published.stage2_payload["role_states"]
+    }
+    folds: list[dict[str, object]] = []
+    for record in published.records:
+        if record.role != "fold":
+            continue
+        assert record.fold_id is not None
+        partial_path = tmp_path / f"fold-{record.fold_id}-partial-manifest.json"
+        partial_hash = _canonical_json(partial_path, {"fold_id": record.fold_id})
+        folds.append(
+            {
+                "fold_id": record.fold_id,
+                "checkpoint_path": record.path,
+                "checkpoint_bytes": Path(record.path).stat().st_size,
+                "checkpoint_sha256": record.sha256,
+                "partial_manifest_path": str(partial_path.resolve()),
+                "partial_manifest_sha256": partial_hash,
+                "cursor": dict(states[("fold", record.fold_id)]["cursor"]),
+                "plan_semantic_sha256": str(record.fold_id) * 64,
+                "plan_optimizer_steps": record.global_step,
+                "training_blocks_sha256": record.training_blocks_sha256,
+            }
+        )
+    return {
+        "format_version": "kcorrdiff.stage2-verified-fold-set-import.v1",
+        "manifest_path": str(manifest_path.resolve()),
+        "manifest_sha256": manifest_hash,
+        "producer": {
+            "protocol_version": "v1.1.3b",
+            "config_sha256": published.stage2_payload["config_sha256"],
+            "draw_manifest_sha256": published.stage2_payload[
+                "draw_manifest_sha256"
+            ],
+            "launch_identity": {
+                "artifact_sha256": "2" * 64,
+                "source_tree_sha256": "3" * 64,
+                "container_image_sha256": "4" * 64,
+                "runtime_report_sha256": "5" * 64,
+                "data_contract_sha256": "6" * 64,
+            },
+            "artifact_hashes": dict(published.stage2_payload["artifact_hashes"]),
+            "node_name": "porsche",
+            "world_size": 1,
+            "per_rank_microbatch_size": 12,
+            "gradient_accumulation_steps": 1,
+            "global_effective_batch_size": 12,
+            "policy_sha256": "7" * 64,
+        },
+        "folds": folds,
+    }
+
+
 @pytest.fixture()
 def published(tmp_path: Path) -> SimpleNamespace:
     rows = _draws()
@@ -202,7 +268,11 @@ def published(tmp_path: Path) -> SimpleNamespace:
         key = (row.t0_utc, row.lead_hours, row.condition_signature)
         multiplicities[key] = multiplicities.get(key, 0) + 1
     z, _, validity = _target()
-    scales = ResidualScaleAccumulator(epsilon_scale=1.0e-3)
+    scales = ResidualScaleAccumulator(
+        epsilon_scale=1.0e-3,
+        minimum_independent_blocks=1,
+        minimum_block_ess=1.0,
+    )
     for row in _unique(rows):
         mean = _mean(row.lead_hours)
         writer.append(
@@ -221,6 +291,7 @@ def published(tmp_path: Path) -> SimpleNamespace:
         scales.update(
             lead_hours=row.lead_hours,
             condition_signature=row.condition_signature,
+            block_id=row.block_id,
             target_z=z,
             mu_z_oof=mean,
             target_validity=validity,
@@ -256,6 +327,10 @@ def published(tmp_path: Path) -> SimpleNamespace:
             ],
             "roles": [],
             "max_optimizer_steps": None,
+            "bounded_training_year": None,
+            "expected_training_items": None,
+            "single_node_fold_worker": False,
+            "node_name": None,
         },
         "config_sha256": "c" * 64,
         "launch_identity": {
@@ -271,8 +346,10 @@ def published(tmp_path: Path) -> SimpleNamespace:
             "world_size": 2,
             "per_rank_microbatch_size": 1,
             "gradient_accumulation_steps": 2,
+            "global_effective_batch_size": 4,
             "precision": "float32",
             "tf32": False,
+            "single_node_fold_policy_sha256": None,
             "cursor_global_example_index_semantics": (
                 "rank_local_plan_slots_consumed_including_padding"
             ),
@@ -286,6 +363,7 @@ def published(tmp_path: Path) -> SimpleNamespace:
         "wandb_run_id": "stage2-complete-test",
         "tracking_audit_path": str(tmp_path / "tracking.jsonl"),
         "manual_release_required": True,
+        "imported_fold_set": None,
     }
     stage2_hash = _canonical_json(stage2, stage2_payload)
     inputs = Stage3ArtifactInputs(
@@ -295,6 +373,8 @@ def published(tmp_path: Path) -> SimpleNamespace:
         oof_artifact=oof,
         residual_scales=scale_path,
         expected_grid_shape=(GRID_SIZE, GRID_SIZE),
+        expected_residual_scale_minimum_independent_blocks=1,
+        expected_residual_scale_minimum_block_ess=1.0,
     )
     return SimpleNamespace(
         rows=rows,
@@ -427,6 +507,164 @@ def test_complete_publication_is_bound_and_dense_oof_stays_lazy(
     second = bundle.rows[1]
     bundle.oof.read_key((second.t0_utc, second.lead_hours, second.condition_signature))
     assert bundle.oof.open_shard_index == 1
+
+
+def _portable_checkpoint_overrides(
+    published: SimpleNamespace, root: Path
+) -> tuple[tuple[str, int | None, Path], ...]:
+    result: list[tuple[str, int | None, Path]] = []
+    for record in published.records:
+        identity = record.role if record.fold_id is None else f"fold-{record.fold_id}"
+        destination = root / "checkpoints" / identity / "final.pt"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(record.path, destination)
+        result.append((record.role, record.fold_id, destination))
+    return tuple(result)
+
+
+def test_stage3_uses_complete_relocated_checkpoint_set_and_rejects_wrong_role(
+    published: SimpleNamespace, tmp_path: Path
+) -> None:
+    overrides = _portable_checkpoint_overrides(
+        published, tmp_path / "portable-release"
+    )
+    shutil.rmtree(tmp_path / "checkpoints")
+    inputs = replace(published.inputs, checkpoint_path_overrides=overrides)
+
+    bundle = load_stage3_artifacts(inputs)
+    assert all(
+        str(record.path).startswith(str(tmp_path / "portable-release"))
+        for record in bundle.checkpoints
+    )
+
+    swapped = list(overrides)
+    deployment = next(
+        index for index, value in enumerate(swapped) if value[:2] == ("deployment", None)
+    )
+    direct_mean = next(
+        index for index, value in enumerate(swapped) if value[:2] == ("direct_mean", None)
+    )
+    deployment_path = swapped[deployment][2]
+    direct_mean_path = swapped[direct_mean][2]
+    swapped[deployment] = ("deployment", None, direct_mean_path)
+    swapped[direct_mean] = ("direct_mean", None, deployment_path)
+    with pytest.raises(ValueError, match="checkpoint SHA-256 mismatch"):
+        load_stage3_artifacts(
+            replace(published.inputs, checkpoint_path_overrides=tuple(swapped))
+        )
+
+
+def test_stage3_relocates_imported_b12_audit_after_original_tree_is_gone(
+    published: SimpleNamespace, tmp_path: Path
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    imported = _imported_fold_set(published, tmp_path)
+    payload["imported_fold_set"] = imported
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    portable = tmp_path / "portable-release"
+    overrides = _portable_checkpoint_overrides(published, portable)
+    promoted_manifest = portable / "imported" / "fold-set.json"
+    promoted_manifest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(imported["manifest_path"], promoted_manifest)
+    promoted_partials: list[tuple[int, Path]] = []
+    for fold in imported["folds"]:
+        fold_id = int(fold["fold_id"])
+        destination = portable / "imported" / f"fold-{fold_id}-partial.json"
+        shutil.copyfile(fold["partial_manifest_path"], destination)
+        promoted_partials.append((fold_id, destination))
+
+    shutil.rmtree(tmp_path / "checkpoints")
+    Path(imported["manifest_path"]).unlink()
+    for fold in imported["folds"]:
+        Path(fold["partial_manifest_path"]).unlink()
+    inputs = replace(
+        _replace_stage2_hash(published.inputs),
+        checkpoint_path_overrides=overrides,
+        imported_fold_set_manifest_override=promoted_manifest,
+        imported_fold_partial_manifest_overrides=tuple(promoted_partials),
+    )
+
+    bundle = load_stage3_artifacts(inputs)
+    assert len(bundle.checkpoints) == 6
+
+
+def test_terminal_scale_cell_is_auditable_and_excluded_from_diffusion_plan(
+    published: SimpleNamespace,
+) -> None:
+    unsupported = ResidualScaleAccumulator(epsilon_scale=1.0e-3)
+    z, _, validity = _target()
+    multiplicities: dict[tuple[str, float, str], int] = {}
+    for row in published.rows:
+        key = (row.t0_utc, row.lead_hours, row.condition_signature)
+        multiplicities[key] = multiplicities.get(key, 0) + 1
+    for row in _unique(published.rows):
+        unsupported.update(
+            lead_hours=row.lead_hours,
+            condition_signature=row.condition_signature,
+            block_id=row.block_id,
+            target_z=z,
+            mu_z_oof=_mean(row.lead_hours),
+            target_validity=validity,
+            omega=row.omega,
+            multiplicity=multiplicities[
+                (row.t0_utc, row.lead_hours, row.condition_signature)
+            ],
+        )
+    scale_hash = write_residual_scales(
+        published.inputs.residual_scales,
+        unsupported,
+        oof_manifest_sha256=str(published.stage2_payload["oof_manifest_sha256"]),
+        regression_checkpoint_set_sha256=published.fold_set_hash,
+    )
+    stage2 = dict(published.stage2_payload)
+    stage2["residual_scales_sha256"] = scale_hash
+    _canonical_json(published.inputs.stage2_manifest, stage2)
+    unsupported_inputs = replace(
+        _replace_stage2_hash(published.inputs),
+        expected_residual_scale_minimum_independent_blocks=(
+            DEFAULT_MINIMUM_INDEPENDENT_BLOCKS
+        ),
+        expected_residual_scale_minimum_block_ess=DEFAULT_MINIMUM_BLOCK_ESS,
+    )
+    bundle = load_stage3_artifacts(unsupported_inputs)
+
+    row = bundle.rows[0]
+    audit = bundle.residual_scale_record(
+        lead_hours=row.lead_hours,
+        condition_signature=row.condition_signature,
+    )
+    assert audit.diffusion_scale_unsupported and audit.scale is None
+    with pytest.raises(DiffusionScaleUnsupportedError, match="unsupported"):
+        bundle.scale_record(row)
+    assert bundle.diffusion_supported_row_indices == ()
+    with pytest.raises(ValueError, match="no diffusion-supported"):
+        build_stage3_distributed_plan(
+            bundle,
+            per_rank_microbatch_size=1,
+            gradient_accumulation_steps=2,
+        )
+
+    # Even a coherently re-hashed artifact may not replace the terminal state
+    # with a convenient identity/global scale.
+    tampered = json.loads(published.inputs.residual_scales.read_text())
+    tampered["records"][0]["scale"] = 1.0
+    tampered_scale_hash = _canonical_json(
+        published.inputs.residual_scales, tampered
+    )
+    stage2["residual_scales_sha256"] = tampered_scale_hash
+    _canonical_json(published.inputs.stage2_manifest, stage2)
+    with pytest.raises(ValueError, match="must not substitute"):
+        load_stage3_artifacts(
+            replace(
+                _replace_stage2_hash(published.inputs),
+                expected_residual_scale_minimum_independent_blocks=(
+                    DEFAULT_MINIMUM_INDEPENDENT_BLOCKS
+                ),
+                expected_residual_scale_minimum_block_ess=(
+                    DEFAULT_MINIMUM_BLOCK_ESS
+                ),
+            )
+        )
 
 
 def test_two_rank_plan_retains_draw_multiplicity_and_explicit_padding(
@@ -644,6 +882,143 @@ def test_requires_exact_complete_stage2_manifest_filename(
         load_stage3_artifacts(inputs)
 
 
+def test_stage2_manifest_accepts_legacy_selection_and_topology_schema(
+    published: SimpleNamespace,
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    payload.pop("imported_fold_set")
+    for name in (
+        "bounded_training_year",
+        "expected_training_items",
+        "single_node_fold_worker",
+        "node_name",
+    ):
+        payload["selection"].pop(name)
+    for name in (
+        "global_effective_batch_size",
+        "single_node_fold_policy_sha256",
+    ):
+        payload["topology"].pop(name)
+    _canonical_json(published.inputs.stage2_manifest, payload)
+
+    bundle = load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+    assert bundle.provenance.stage2_manifest_sha256 == hashlib.sha256(
+        published.inputs.stage2_manifest.read_bytes()
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    (
+        ("selection", "single_node_fold_worker", True, "partial-only selection"),
+        ("selection", "node_name", "porsche", "partial-only selection"),
+        ("topology", "global_effective_batch_size", 16, "execution metadata"),
+        (
+            "topology",
+            "single_node_fold_policy_sha256",
+            "a" * 64,
+            "execution metadata",
+        ),
+    ),
+)
+def test_stage2_manifest_rejects_invalid_current_execution_metadata(
+    published: SimpleNamespace,
+    section: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    payload[section][field] = value
+    _canonical_json(published.inputs.stage2_manifest, payload)
+
+    with pytest.raises(ValueError, match=message):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+
+def test_stage2_manifest_rejects_hybrid_selection_or_topology_schema(
+    published: SimpleNamespace,
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    payload["selection"].pop("node_name")
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    with pytest.raises(ValueError, match="selection schema mismatch"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+    payload = json.loads(json.dumps(published.stage2_payload))
+    payload["topology"].pop("global_effective_batch_size")
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    with pytest.raises(ValueError, match="topology schema mismatch"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+
+def test_stage2_manifest_accepts_and_cross_binds_imported_fold_set_audit(
+    published: SimpleNamespace, tmp_path: Path
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    payload["imported_fold_set"] = _imported_fold_set(published, tmp_path)
+    _canonical_json(published.inputs.stage2_manifest, payload)
+
+    bundle = load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+    assert len(bundle.checkpoints) == 6
+    assert payload["imported_fold_set"]["producer"]["launch_identity"] != payload[
+        "launch_identity"
+    ]
+
+
+def test_stage2_manifest_rejects_imported_fold_set_schema_and_lineage_mismatch(
+    published: SimpleNamespace, tmp_path: Path
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    imported = _imported_fold_set(published, tmp_path)
+    imported["unexpected"] = True
+    payload["imported_fold_set"] = imported
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    with pytest.raises(ValueError, match="imported_fold_set schema mismatch"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+    imported = _imported_fold_set(published, tmp_path)
+    imported["producer"]["config_sha256"] = "8" * 64
+    payload["imported_fold_set"] = imported
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    with pytest.raises(ValueError, match="producer lineage mismatch"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+
+def test_stage2_manifest_rejects_imported_fold_identity_and_record_mismatch(
+    published: SimpleNamespace, tmp_path: Path
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    imported = _imported_fold_set(published, tmp_path)
+    imported["folds"][1]["fold_id"] = 0
+    payload["imported_fold_set"] = imported
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    with pytest.raises(ValueError, match="fold IDs must be exactly"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+    imported = _imported_fold_set(published, tmp_path)
+    imported["folds"][0]["plan_optimizer_steps"] += 1
+    payload["imported_fold_set"] = imported
+    _canonical_json(published.inputs.stage2_manifest, payload)
+    with pytest.raises(ValueError, match="audit/checkpoint mismatch"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+
+def test_stage2_manifest_rejects_tampered_imported_fold_set_artifact(
+    published: SimpleNamespace, tmp_path: Path
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    imported = _imported_fold_set(published, tmp_path)
+    payload["imported_fold_set"] = imported
+    Path(imported["manifest_path"]).write_bytes(b"tampered fold-set manifest\n")
+    _canonical_json(published.inputs.stage2_manifest, payload)
+
+    with pytest.raises(ValueError, match="fold-set manifest SHA-256 mismatch"):
+        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+
+
 def test_fail_closed_on_oof_shard_and_residual_provenance_mismatch(
     published: SimpleNamespace,
 ) -> None:
@@ -669,6 +1044,26 @@ def test_fail_closed_on_residual_scale_cross_provenance(
     coherent_outer = _replace_stage2_hash(published.inputs)
     with pytest.raises(ValueError, match="exact provenance"):
         load_stage3_artifacts(coherent_outer)
+
+
+def test_residual_scale_support_gates_are_bound_to_consumer_contract(
+    published: SimpleNamespace,
+) -> None:
+    stricter_consumer = replace(
+        published.inputs,
+        expected_residual_scale_minimum_independent_blocks=2,
+        expected_residual_scale_minimum_block_ess=2.0,
+    )
+    with pytest.raises(ValueError, match="support gates differ"):
+        load_stage3_artifacts(stricter_consumer)
+
+    with pytest.raises(ValueError, match="frozen at 30 blocks/ESS 20"):
+        replace(
+            published.inputs,
+            expected_grid_shape=(256, 256),
+            expected_residual_scale_minimum_independent_blocks=1,
+            expected_residual_scale_minimum_block_ess=1.0,
+        )
 
 
 def test_fail_closed_when_target_loader_changes_exact_signature_join(

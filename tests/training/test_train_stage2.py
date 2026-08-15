@@ -14,14 +14,20 @@ import torch.multiprocessing as multiprocessing
 from torch import nn
 
 from kcorrdiff.data.sampling import DrawRow
-from kcorrdiff.training.checkpoints import TrainingCursor
+from kcorrdiff.training.checkpoints import CheckpointProvenance, TrainingCursor
 from kcorrdiff.training.config import load_stage2_config
+from kcorrdiff.training.crossfit import CheckpointRecord
 from kcorrdiff.training.data_factory import RankLocalBatch
 from kcorrdiff.training.losses import (
     accumulation_window_denominators,
     distributed_direct_loss_contribution,
 )
 from kcorrdiff.training.plan import DrawSlot
+from kcorrdiff.training.stage2_fold_set import (
+    FoldProducerLineage,
+    VerifiedFoldCheckpoint,
+    VerifiedStage2FoldSet,
+)
 import kcorrdiff.training.train_stage2 as stage2
 from kcorrdiff.training.train_stage2 import (
     DistributedRuntime,
@@ -492,6 +498,11 @@ def test_launch_contract_accepts_one_gpu_with_equivalent_global_batch() -> None:
         == 16
     )
     assert execution.sha256 == config.sha256
+    assert execution.raw["optimization"]["gradient_accumulation_steps"] == 2  # type: ignore[index]
+    assert execution.raw["optimization"]["global_effective_batch_size"] == 16  # type: ignore[index]
+    assert config.raw["optimization"]["gradient_accumulation_steps"] == 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        execution.raw["optimization"]["gradient_accumulation_steps"] = 4  # type: ignore[index]
 
     arguments.gradient_accumulation_steps = 1
     with pytest.raises(ValueError, match="preserve the configured global"):
@@ -740,8 +751,52 @@ def test_cli_help_and_tuning_switches(capsys: pytest.CaptureFixture[str]) -> Non
         "--wandb-mode",
         "--output-dir",
         "--oof-output-dir",
+        "--fold-set-manifest",
+        "--fold-set-manifest-sha256",
     ):
         assert option in help_text
+
+
+def test_fold_set_launch_arguments_require_pair_and_reject_fold_worker_ambiguity(
+) -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    arguments = _launch_arguments()
+    arguments.fold_set_manifest = Path("fold-set-manifest.json")
+    arguments.fold_set_manifest_sha256 = None
+    with pytest.raises(ValueError, match="required together"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    arguments.fold_set_manifest = None
+    arguments.fold_set_manifest_sha256 = "a" * 64
+    with pytest.raises(ValueError, match="required together"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    arguments.fold_set_manifest = Path("fold-set-manifest.json")
+    arguments.fold_set_manifest_sha256 = "a" * 64
+    with pytest.raises(ValueError, match="cannot select fold workers"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    arguments.roles = ()
+    arguments.single_node_fold_worker = True
+    arguments.node_name = "porsche"
+    with pytest.raises(ValueError, match="cannot select fold workers"):
+        validate_launch_arguments(arguments, config, environ={})
+
+    arguments.phases = ("oof",)
+    arguments.single_node_fold_worker = False
+    arguments.node_name = None
+    arguments.max_optimizer_steps = None
+    selection = validate_launch_arguments(
+        arguments,
+        config,
+        environ={
+            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
+            "KCORRDIFF_REQUIRE_PRECISION": "float32",
+            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
+            "NVIDIA_TF32_OVERRIDE": "0",
+        },
+    )
+    assert selection.phases == ("oof",)
 
 
 def test_storage_preflight_counts_atomic_peak_and_partial_distinction(
@@ -825,10 +880,15 @@ def test_residual_sidecar_binds_hash_provenance_and_draw_multiplicity(
     rows = (_draw_row(0), _draw_row(1, duplicate=True))
     selected = ((0, rows[0]),)
     multiplicities = stage2._draw_multiplicities(rows)
-    accumulator = stage2.ResidualScaleAccumulator(epsilon_scale=0.001)
+    accumulator = stage2.ResidualScaleAccumulator(
+        epsilon_scale=0.001,
+        minimum_independent_blocks=1,
+        minimum_block_ess=1.0,
+    )
     accumulator.update(
         lead_hours=0.5,
         condition_signature=rows[0].condition_signature,
+        block_id=rows[0].block_id,
         target_z=[1.0],
         mu_z_oof=[0.0],
         target_validity=[True],
@@ -917,10 +977,15 @@ def test_draw_multiplicity_rejects_changed_duplicate_weight_or_identity() -> Non
 def test_existing_residual_scales_must_exactly_reproduce_verified_moments(
     tmp_path: Path,
 ) -> None:
-    accumulator = stage2.ResidualScaleAccumulator(epsilon_scale=0.001)
+    accumulator = stage2.ResidualScaleAccumulator(
+        epsilon_scale=0.001,
+        minimum_independent_blocks=1,
+        minimum_block_ess=1.0,
+    )
     accumulator.update(
         lead_hours=0.5,
         condition_signature=_draw_row(0).condition_signature,
+        block_id=_draw_row(0).block_id,
         target_z=[2.0],
         mu_z_oof=[1.0],
         target_validity=[True],
@@ -953,6 +1018,158 @@ def test_existing_residual_scales_must_exactly_reproduce_verified_moments(
             oof_manifest_sha256="a" * 64,
             regression_checkpoint_set_sha256="b" * 64,
         )
+
+
+def _fabricated_verified_fold_set(
+    tmp_path: Path, *, config_sha256: str, artifact_hashes: dict[str, str]
+) -> VerifiedStage2FoldSet:
+    launch = FakeLaunchIdentity().provenance()
+    lineage = FoldProducerLineage(
+        protocol_version="v1.1.3b",
+        config_sha256=config_sha256,
+        draw_manifest_sha256=artifact_hashes["draw_manifest"],
+        launch_identity=launch,
+        artifact_hashes=artifact_hashes,
+        node_name="porsche",
+        world_size=1,
+        per_rank_microbatch_size=12,
+        gradient_accumulation_steps=1,
+        global_effective_batch_size=12,
+        policy_sha256=stage2.SINGLE_NODE_FOLD_POLICY_SHA256,
+    )
+    manifest = tmp_path / "fold-set-manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    folds: list[VerifiedFoldCheckpoint] = []
+    for fold_id in range(3):
+        checkpoint = tmp_path / f"fold-{fold_id}" / "final.pt"
+        checkpoint.parent.mkdir()
+        checkpoint.write_bytes(f"fold-{fold_id}".encode())
+        checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        partial_manifest = checkpoint.parent / "partial-manifest.json"
+        partial_manifest.write_text("{}\n", encoding="utf-8")
+        partial_sha256 = hashlib.sha256(partial_manifest.read_bytes()).hexdigest()
+        cursor = TrainingCursor(0, 12, 1, 0)
+        blocks_sha256 = hashlib.sha256(f"blocks-{fold_id}".encode()).hexdigest()
+        record = CheckpointRecord(
+            fold_id=fold_id,
+            role="fold",
+            path=str(checkpoint.resolve()),
+            sha256=checkpoint_sha256,
+            training_blocks_sha256=blocks_sha256,
+            config_sha256=config_sha256,
+            draw_manifest_sha256=artifact_hashes["draw_manifest"],
+            global_step=cursor.optimizer_step,
+        )
+        folds.append(
+            VerifiedFoldCheckpoint(
+                fold_id=fold_id,
+                checkpoint_path=checkpoint,
+                checkpoint_bytes=checkpoint.stat().st_size,
+                checkpoint_sha256=checkpoint_sha256,
+                partial_manifest_path=partial_manifest,
+                partial_manifest_sha256=partial_sha256,
+                provenance=CheckpointProvenance(
+                    protocol_version="v1.1.3b",
+                    config_sha256=config_sha256,
+                    draw_manifest_sha256=artifact_hashes["draw_manifest"],
+                    launch_identity_sha256=launch["artifact_sha256"],
+                    source_tree_sha256=launch["source_tree_sha256"],
+                    container_image_sha256=launch["container_image_sha256"],
+                    runtime_report_sha256=launch["runtime_report_sha256"],
+                    data_contract_sha256=launch["data_contract_sha256"],
+                    role="fold",
+                    fold_id=fold_id,
+                    world_size=1,
+                    per_rank_microbatch_size=12,
+                    gradient_accumulation_steps=1,
+                ),
+                cursor=cursor,
+                plan_semantic_sha256=str(fold_id) * 64,
+                plan_optimizer_steps=cursor.optimizer_step,
+                training_blocks=(f"block-{fold_id}",),
+                training_blocks_sha256=blocks_sha256,
+                lineage=lineage,
+                record=record,
+            )
+        )
+    return VerifiedStage2FoldSet(
+        manifest_path=manifest,
+        manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        lineage=lineage,
+        folds=tuple(folds),
+    )
+
+
+def test_imported_fold_set_seeds_crossfit_and_is_forwarded_to_oof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    artifact_hashes = {"draw_manifest": "a" * 64}
+    imported = _fabricated_verified_fold_set(
+        tmp_path,
+        config_sha256=config.sha256,
+        artifact_hashes=artifact_hashes,
+    )
+    factory = SimpleNamespace(
+        artifacts=SimpleNamespace(artifact_hashes=artifact_hashes, rows=())
+    )
+    monkeypatch.setattr(stage2, "initialize_tracking", lambda **_kwargs: AuditRun())
+
+    def unexpected_train_role(**_kwargs: object) -> RoleTrainingResult:
+        raise AssertionError(
+            "an imported fold must never enter training/resume loading"
+        )
+
+    monkeypatch.setattr(stage2, "train_role", unexpected_train_role)
+    captured: dict[str, object] = {}
+
+    def fake_infer_oof_rank_partials(**kwargs: object) -> tuple[Path, ...]:
+        captured["imported_fold_set"] = kwargs["imported_fold_set"]
+        captured["fold_results"] = kwargs["fold_results"]
+        return ()
+
+    def fake_merge_oof_partials(**kwargs: object) -> stage2.OOFMergeResult:
+        fold_results = kwargs["fold_results"]
+        assert isinstance(fold_results, dict)
+        assert set(fold_results) == {0, 1, 2}
+        return stage2.OOFMergeResult(
+            artifact_dir=tmp_path / "oof" / "artifact",
+            manifest_sha256="9" * 64,
+            residual_accumulator=stage2.ResidualScaleAccumulator(
+                epsilon_scale=config.crossfit.epsilon_residual_scale
+            ),
+            items=0,
+        )
+
+    monkeypatch.setattr(stage2, "infer_oof_rank_partials", fake_infer_oof_rank_partials)
+    monkeypatch.setattr(stage2, "merge_oof_partials", fake_merge_oof_partials)
+
+    result = run_stage2(
+        config=config,
+        factory=factory,  # type: ignore[arg-type]
+        runtime=DistributedRuntime(0, 0, 2, torch.device("cpu"), False),
+        launch_identity=FakeLaunchIdentity(),  # type: ignore[arg-type]
+        output_dir=tmp_path / "checkpoints",
+        oof_output_dir=tmp_path / "oof",
+        selection=RunSelection(("crossfit", "oof"), (), None),
+        num_workers=0,
+        prefetch_factor=2,
+        wandb_mode="disabled",
+        run_id="imported-oof",
+        imported_fold_set=imported,
+    )
+
+    assert captured["imported_fold_set"] is imported
+    seeded = captured["fold_results"]
+    assert isinstance(seeded, dict)
+    assert set(seeded) == {0, 1, 2}
+    assert all(value.optimizer_steps_run == 0 for value in seeded.values())
+    assert tuple(value.checkpoint_path for value in seeded.values()) == tuple(
+        fold.checkpoint_path for fold in imported.folds
+    )
+    assert tuple(role.fold_id for role in result.role_results) == (0, 1, 2)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["imported_fold_set"] == imported.audit_json()
 
 
 def test_bounded_orchestration_writes_only_partial_manifest_with_latest_state(

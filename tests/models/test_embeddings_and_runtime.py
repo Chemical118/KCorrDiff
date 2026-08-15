@@ -65,6 +65,15 @@ def test_condition_embedding_rejects_zero_lead_downcast_and_autocast() -> None:
             module(inputs)
 
 
+def test_condition_embedding_revalidates_inputs_after_tensor_mutation() -> None:
+    module = ConditionEmbedding()
+    inputs = embedding_inputs([1.0])
+    inputs.verification_cyclic[0, 0] = 2.0
+
+    with pytest.raises(ValueError, match=r"\[-1,1\]"):
+        module(inputs)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

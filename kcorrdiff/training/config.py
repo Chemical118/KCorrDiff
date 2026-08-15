@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 import yaml
@@ -19,6 +20,93 @@ from .runtime import RuntimeContract, contract_from_mapping
 
 
 STAGE2_NAME = "deterministic_regression_crossfit_oof"
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as error:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from error
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _deep_freeze_config(value: object) -> object:
+    """Return an immutable, detached copy of a validated config tree."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _deep_freeze_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_config(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze_config(item) for item in value)
+    return value
+
+
+def _deep_thaw_config(value: object) -> object:
+    """Return a detached mutable, YAML-serializable copy of a frozen tree."""
+
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw_config(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_deep_thaw_config(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_deep_thaw_config(item) for item in value]
+    return value
+
+
+def freeze_config_mapping(
+    value: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Deep-freeze a detached config mapping for storage on a config object."""
+
+    frozen = _deep_freeze_config(value)
+    if not isinstance(frozen, Mapping):  # pragma: no cover - defensive invariant
+        raise AssertionError("frozen config root is not a mapping")
+    return frozen
+
+
+def thaw_config_mapping(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    """Deep-copy a frozen config mapping for serialization or execution edits."""
+
+    thawed = _deep_thaw_config(value)
+    if not isinstance(thawed, dict):  # pragma: no cover - defensive invariant
+        raise AssertionError("thawed config root is not a dictionary")
+    return thawed
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -46,7 +134,38 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _nonnegative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _strict_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise TypeError(f"{name} must be a non-empty string")
+    return value
+
+
+def _absolute_path(value: object, name: str) -> Path:
+    selected = Path(_strict_string(value, name))
+    if not selected.is_absolute():
+        raise ValueError(f"{name} must be an absolute path")
+    return selected
+
+
+def _sha256(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256")
+    return value
+
+
 def _positive_float(value: object, name: str, *, allow_zero: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a JSON number")
     result = float(value)
     minimum_ok = result >= 0.0 if allow_zero else result > 0.0
     if not math.isfinite(result) or not minimum_ok:
@@ -64,7 +183,9 @@ def _strict_bool(value: object, name: str) -> bool:
 def _int_pair(value: object, name: str) -> tuple[int, int]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError(f"{name} must be a two-element sequence")
-    result = tuple(int(item) for item in value)
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise TypeError(f"{name} must contain only integers")
+    result = tuple(value)
     if len(result) != 2 or any(item <= 0 for item in result):
         raise ValueError(f"{name} must contain two positive integers")
     return result  # type: ignore[return-value]
@@ -170,7 +291,9 @@ def _canonical_hash(raw: Mapping[str, object]) -> str:
 def load_stage2_config(path: Path) -> Stage2Config:
     """Load the full-width Stage 2 config without accepting hidden defaults."""
 
-    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    loaded = yaml.load(
+        Path(path).read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader
+    )
     raw = _mapping(loaded, "stage2 config")
     required_top = {
         "protocol_version",
@@ -216,7 +339,10 @@ def load_stage2_config(path: Path) -> Stage2Config:
         optional={"condition_augmentation"},
         name="data",
     )
-    if data["history_frames"] != 12 or data["future_target_frames"] != 7:
+    if (
+        _positive_int(data["history_frames"], "history_frames") != 12
+        or _positive_int(data["future_target_frames"], "future_target_frames") != 7
+    ):
         raise ValueError("radar temporal fallback is forbidden")
     if _int_pair(data["target_shape"], "target_shape") != (256, 256):
         raise ValueError("target spatial fallback is forbidden")
@@ -227,11 +353,11 @@ def load_stage2_config(path: Path) -> Stage2Config:
     for key in ("mmap_lazy_per_worker", "pin_memory", "persistent_workers"):
         if not _strict_bool(data[key], key):
             raise ValueError(f"{key} must remain enabled in production")
-    detail_mode = str(data["context_detail_mode"])
+    detail_mode = _strict_string(data["context_detail_mode"], "context_detail_mode")
     if detail_mode not in {"local_max", "nearest"}:
         raise ValueError("unsupported context detail mode")
     condition_signature = parse_condition_signature(
-        str(data["condition_signature"])
+        _strict_string(data["condition_signature"], "condition_signature")
     ).key
     condition_augmentation = (
         ConditionAugmentationPolicy.from_mapping(
@@ -248,11 +374,13 @@ def load_stage2_config(path: Path) -> Stage2Config:
             "condition augmentation source signature disagrees with data config"
         )
     data_config = Stage2DataConfig(
-        target_coordinates=Path(str(data["target_coordinates"])),
-        context_coordinates=Path(str(data["context_coordinates"])),
-        normalization=Path(str(data["normalization"])),
+        target_coordinates=_absolute_path(data["target_coordinates"], "target_coordinates"),
+        context_coordinates=_absolute_path(
+            data["context_coordinates"], "context_coordinates"
+        ),
+        normalization=_absolute_path(data["normalization"], "normalization"),
         condition_signature=condition_signature,
-        radar_timezone=str(data["radar_timezone"]),
+        radar_timezone=_strict_string(data["radar_timezone"], "radar_timezone"),
         context_detail_mode=detail_mode,
         context_wet_threshold_mm_per_hour=_positive_float(
             data["context_wet_threshold_mm_per_hour"],
@@ -263,6 +391,8 @@ def load_stage2_config(path: Path) -> Stage2Config:
     )
     if not data_config.condition_signature:
         raise ValueError("condition_signature cannot be empty")
+    if data_config.radar_timezone != "Asia/Seoul":
+        raise ValueError("Stage 2 radar timezone contract changed")
 
     loss = _mapping(raw["loss"], "loss")
     _exact_keys(
@@ -289,7 +419,9 @@ def load_stage2_config(path: Path) -> Stage2Config:
         lambda_mean=_positive_float(
             loss["lambda_mean"], "lambda_mean", allow_zero=True
         ),
-        mean_warmup_steps=int(loss["mean_warmup_steps"]),
+        mean_warmup_steps=_nonnegative_int(
+            loss["mean_warmup_steps"], "mean_warmup_steps"
+        ),
         detach_probability_in_mean=_strict_bool(
             loss["detach_probability_in_mean"], "detach_probability_in_mean"
         ),
@@ -321,7 +453,10 @@ def load_stage2_config(path: Path) -> Stage2Config:
     betas_value = optimization["betas"]
     if not isinstance(betas_value, Sequence) or isinstance(betas_value, (str, bytes)):
         raise TypeError("betas must be a two-element sequence")
-    betas = tuple(float(value) for value in betas_value)
+    betas = tuple(
+        _positive_float(value, f"AdamW beta {index}")
+        for index, value in enumerate(betas_value)
+    )
     if len(betas) != 2 or not 0.0 < betas[0] < 1.0 or not 0.0 < betas[1] < 1.0:
         raise ValueError("AdamW betas must lie in (0,1)")
     optimization_config = Stage2OptimizationConfig(
@@ -417,8 +552,10 @@ def load_stage2_config(path: Path) -> Stage2Config:
         },
         name="crossfit oof_remote_spill",
     )
-    endpoint = str(remote_spill["endpoint"])
-    remote_prefix = str(remote_spill["remote_prefix"])
+    endpoint = _strict_string(remote_spill["endpoint"], "OOF remote endpoint")
+    remote_prefix = _strict_string(
+        remote_spill["remote_prefix"], "OOF remote prefix"
+    )
     if not endpoint.startswith("https://") or not remote_prefix.startswith("/"):
         raise ValueError("OOF remote spill requires HTTPS endpoint/absolute prefix")
     remote_spill_config = Stage2OOFRemoteSpillConfig(
@@ -464,9 +601,168 @@ def load_stage2_config(path: Path) -> Stage2Config:
     if crossfit_config.maximum_oof_compressed_bytes >= crossfit_config.maximum_oof_bytes:
         raise ValueError("compressed OOF cap must be smaller than logical FP32 bytes")
 
+    model = _mapping(raw["model"], "model")
+    _exact_keys(
+        model,
+        required={
+            "implementation_contract",
+            "condition_dimension",
+            "activation_checkpoint",
+            "physical_attention_query_chunk_size",
+            "advection",
+            "regression",
+        },
+        name="model",
+    )
+    if (
+        model["implementation_contract"]
+        != "kcorrdiff.regression-geometry-advection-era.v2"
+        or _positive_int(model["condition_dimension"], "condition_dimension") != 512
+        or _strict_bool(model["activation_checkpoint"], "activation_checkpoint")
+        is not True
+        or _positive_int(
+            model["physical_attention_query_chunk_size"],
+            "physical_attention_query_chunk_size",
+        )
+        != 128
+    ):
+        raise ValueError("Stage 2 model implementation contract changed")
+    advection = _mapping(model["advection"], "model.advection")
+    _exact_keys(
+        advection,
+        required={
+            "trajectory_mode",
+            "flow_pyramid_levels",
+            "flow_warps_per_level",
+            "flow_irls_iterations",
+            "flow_window_size",
+            "maximum_speed_km_per_hour",
+        },
+        name="model.advection",
+    )
+    if _strict_string(advection["trajectory_mode"], "trajectory_mode") != "streaming":
+        raise ValueError("Stage 2 advection trajectory mode changed")
+    for name in (
+        "flow_pyramid_levels",
+        "flow_warps_per_level",
+        "flow_irls_iterations",
+        "flow_window_size",
+    ):
+        _positive_int(advection[name], name)
+    _positive_float(
+        advection["maximum_speed_km_per_hour"], "maximum_speed_km_per_hour"
+    )
+    regression = _mapping(model["regression"], "model.regression")
+    _exact_keys(
+        regression,
+        required={
+            "occurrence_head",
+            "wet_amount_support",
+            "transformed_mean",
+            "direct_physical_mean_checkpoint",
+            "direct_physical_q50_checkpoint",
+        },
+        name="model.regression",
+    )
+    if (
+        _strict_bool(regression["occurrence_head"], "occurrence_head") is not True
+        or _strict_string(regression["wet_amount_support"], "wet_amount_support")
+        != "z_wet_plus_softplus"
+        or _strict_string(regression["transformed_mean"], "transformed_mean")
+        != "probability_times_wet_amount"
+        or _strict_bool(
+            regression["direct_physical_mean_checkpoint"],
+            "direct_physical_mean_checkpoint",
+        )
+        is not True
+        or _strict_bool(
+            regression["direct_physical_q50_checkpoint"],
+            "direct_physical_q50_checkpoint",
+        )
+        is not True
+    ):
+        raise ValueError("Stage 2 regression head contract changed")
+
+    loader = _mapping(raw["loader_tuning"], "loader_tuning")
+    _exact_keys(
+        loader,
+        required={
+            "selection_artifact",
+            "selection_artifact_sha256",
+            "selected_batch_size_per_rank",
+            "selected_num_workers",
+            "selected_prefetch_factor",
+            "candidates",
+        },
+        name="loader_tuning",
+    )
+    _strict_string(loader["selection_artifact"], "loader selection artifact")
+    _sha256(loader["selection_artifact_sha256"], "loader selection artifact")
+    if _positive_int(
+        loader["selected_batch_size_per_rank"], "selected loader batch size"
+    ) != optimization_config.per_rank_microbatch_size:
+        raise ValueError("loader batch size disagrees with optimization config")
+    workers = loader["selected_num_workers"]
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
+        raise ValueError("selected_num_workers must be a non-negative integer")
+    _positive_int(loader["selected_prefetch_factor"], "selected_prefetch_factor")
+    candidates = _mapping(loader["candidates"], "loader_tuning.candidates")
+    _exact_keys(
+        candidates,
+        required={"batch_sizes", "worker_counts", "prefetch_factors"},
+        name="loader_tuning.candidates",
+    )
+    expected_candidates = {
+        "batch_sizes": (1, 2, 4, 8, 16, 32),
+        "worker_counts": (0, 4, 8, 12, 16, 24),
+        "prefetch_factors": (2, 4),
+    }
+    for name, expected in expected_candidates.items():
+        values = candidates[name]
+        if (
+            not isinstance(values, Sequence)
+            or isinstance(values, (str, bytes))
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+            or tuple(values) != expected
+        ):
+            raise ValueError(f"loader candidate set changed: {name}")
+
+    tracking = _mapping(raw["tracking"], "tracking")
+    _exact_keys(
+        tracking,
+        required={"backend", "project", "job_type", "mode", "log_gpu_system_metrics"},
+        name="tracking",
+    )
+    if (
+        _strict_string(tracking["backend"], "tracking backend") != "wandb"
+        or _strict_string(tracking["mode"], "tracking mode")
+        not in {"online", "offline", "disabled"}
+        or _strict_bool(
+            tracking["log_gpu_system_metrics"], "log_gpu_system_metrics"
+        )
+        is not True
+    ):
+        raise ValueError("Stage 2 tracking contract changed")
+    _strict_string(tracking["project"], "tracking project")
+    _strict_string(tracking["job_type"], "tracking job_type")
+
+    publication = _mapping(raw["publication"], "publication")
+    expected_publication = {
+        "require_all_fold_checkpoints": True,
+        "require_complete_oof": True,
+        "require_residual_scales": True,
+        "atomic_stage_manifest": True,
+        "immutable_release_requires_manual_promotion": True,
+    }
+    _exact_keys(publication, required=set(expected_publication), name="publication")
+    if dict(publication) != expected_publication:
+        raise ValueError("Stage 2 publication contract changed")
+
+    config_sha256 = _canonical_hash(raw)
+    frozen_raw = freeze_config_mapping(raw)
     return Stage2Config(
-        raw=raw,
-        sha256=_canonical_hash(raw),
+        raw=frozen_raw,
+        sha256=config_sha256,
         protocol_version=str(raw["protocol_version"]),
         research_track=str(raw["research_track"]),
         seed=seed,
@@ -485,5 +781,7 @@ __all__ = [
     "Stage2DataConfig",
     "Stage2OptimizationConfig",
     "Stage2OOFRemoteSpillConfig",
+    "freeze_config_mapping",
     "load_stage2_config",
+    "thaw_config_mapping",
 ]

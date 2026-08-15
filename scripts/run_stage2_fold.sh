@@ -3,8 +3,8 @@ set -euo pipefail
 
 fold_id="${JOB_COMPLETION_INDEX:?missing indexed Job completion index}"
 node_name="${NODE_NAME:?missing scheduled node name}"
-source_root=/workspace/code/stage2-folds-porsche-v2
-run_root=/workspace/runs/stage2-folds-porsche-v2
+source_root=/workspace/code/stage2-folds-porsche-v3
+run_root=/workspace/runs/stage2-folds-porsche-v3
 output_dir="${run_root}/workers/fold-${fold_id}"
 launch_identity="${output_dir}/provenance/launch-identity.json"
 runtime_report=/workspace/envs/stage2-python-v1/pip-report.json
@@ -115,7 +115,9 @@ python3 "${source_root}/scripts/collect_stage2_folds.py" mark-complete \
   --run-root "${run_root}" \
   --worker-root "${output_dir}" \
   --fold-id "${fold_id}" \
-  --policy-sha256 "${SINGLE_NODE_FOLD_POLICY_SHA256}"
+  --policy-sha256 "${SINGLE_NODE_FOLD_POLICY_SHA256}" \
+  --config "${source_root}/configs/stage2-full-width.yaml" \
+  --draw-manifest /workspace/data/manifests/event-pretrain-production-v1/training-draw-manifest.jsonl
 
 notify "[KCorrDiff] Stage 2 fold ${fold_id} completed and was verified on the porsche PVC."
 trap - EXIT

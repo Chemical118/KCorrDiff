@@ -3,8 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 namespace=ws-md93se6gk3270
-training_job=kcorrdiff-stage2-folds-porsche-v2
-collector_job=kcorrdiff-stage2-fold-collector-porsche-v2
+training_job=kcorrdiff-stage2-folds-porsche-v3
+collector_job=kcorrdiff-stage2-fold-collector-porsche-v3
 manifest="${repo_root}/k8s/train-stage2-folds-porsche.yaml"
 
 for job in "${training_job}" "${collector_job}"; do

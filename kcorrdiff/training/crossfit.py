@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -144,12 +144,39 @@ def _semantic_hash(values: Iterable[object]) -> str:
 
 
 def checkpoint_set_hash(records: Sequence[CheckpointRecord]) -> str:
+    """Return the portable semantic identity of a regression checkpoint set.
+
+    ``CheckpointRecord.path`` is deliberately publication/audit metadata, not
+    checkpoint identity.  The same immutable checkpoint set may be mounted at
+    a different PVC root (or copied into a release tree) without changing the
+    identity bound by the OOF and residual-scale artifacts.  All content and
+    training-lineage fields remain part of the identity.
+    """
+
     if not records:
         raise ValueError("checkpoint record set is empty")
     identities = {(record.role, record.fold_id) for record in records}
     if len(identities) != len(records):
         raise ValueError("duplicate checkpoint role/fold identity")
-    return _semantic_hash(asdict(record) for record in sorted(records, key=lambda item: (item.role, item.fold_id if item.fold_id is not None else -1)))
+    ordered = sorted(
+        records,
+        key=lambda item: (
+            item.role,
+            item.fold_id if item.fold_id is not None else -1,
+        ),
+    )
+    return _semantic_hash(
+        {
+            "fold_id": record.fold_id,
+            "role": record.role,
+            "sha256": record.sha256,
+            "training_blocks_sha256": record.training_blocks_sha256,
+            "config_sha256": record.config_sha256,
+            "draw_manifest_sha256": record.draw_manifest_sha256,
+            "global_step": record.global_step,
+        }
+        for record in ordered
+    )
 
 
 __all__ = [

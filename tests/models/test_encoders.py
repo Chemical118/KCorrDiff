@@ -5,6 +5,7 @@ from dataclasses import fields
 import pytest
 import torch
 
+from kcorrdiff.models.common import build_validity_pyramid
 from kcorrdiff.models.condition_bank import ConditionBankInputs
 from kcorrdiff.data.radar_values import (
     CPRECNET_RAIN_RATE_MAX_MM_PER_HOUR,
@@ -24,6 +25,32 @@ from kcorrdiff.models.target_encoder import (
 )
 
 from .helpers import TEST_CONTEXT_WIDTHS, TEST_TARGET_WIDTHS, make_bank_inputs
+
+
+def test_validity_pyramid_matches_repeated_stride2_receptive_support() -> None:
+    full = torch.ones(1, 1, 16, 16)
+    pyramid = build_validity_pyramid(full)
+    torch.testing.assert_close(
+        pyramid.l3[0, 0],
+        torch.tensor(
+            [[(8.0 / 15.0) ** 2, 8.0 / 15.0], [8.0 / 15.0, 1.0]]
+        ),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+    torch.testing.assert_close(
+        pyramid.l4[0, 0, 0, 0],
+        torch.tensor((16.0 / 31.0) ** 2),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+
+    missing = full.clone()
+    missing[..., 8, 8] = 0.0
+    missing_pyramid = build_validity_pyramid(missing)
+    # The L3 token centred at input (8,8) covers the exact 15x15 support
+    # [1:16,1:16], so one missing cell removes exactly 1/225.
+    assert missing_pyramid.l3[0, 0, 1, 1].item() == pytest.approx(224.0 / 225.0)
 
 
 def test_full_five_level_shapes_and_context_l2_l3_l4_are_exposed() -> None:

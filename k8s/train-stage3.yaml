@@ -5,12 +5,12 @@
 apiVersion: v1
 kind: List
 metadata:
-  name: kcorrdiff-stage3-fullwidth-v1-1-3b
+  name: kcorrdiff-stage3-fullwidth-v1-1-3b-v2
 items:
   - apiVersion: v1
     kind: ConfigMap
     metadata:
-      name: kcorrdiff-stage3-runner-v1-1-3b
+      name: kcorrdiff-stage3-runner-v1-1-3b-v2
       namespace: ws-md93se6gk3270
       labels:
         app.kubernetes.io/name: kcorrdiff
@@ -23,23 +23,11 @@ items:
         set -euo pipefail
         umask 0007
 
-        source_root=/workspace/code/stage3-production-v1
+        source_root=/workspace/code/stage3-production-v2
         stage3_config=${source_root}/configs/stage3-full-width.yaml
-        stage2_config=${source_root}/configs/stage2-full-width.yaml
-        data_contract=${source_root}/configs/data-contract-v1.1.3b.json
-        radar_cache_root=/workspace/data/cache/radar-v1
-        era5_cache_root=/workspace/data/cache/era5-v1
-        manifest_root=/workspace/data/manifests/event-pretrain-production-v1
-        draw_manifest=${manifest_root}/training-draw-manifest.jsonl
-        candidate_manifest=${manifest_root}/candidate-manifest.json
-        bundle_metadata=${manifest_root}/bundle-metadata.json
-        static_path=/workspace/data/static/target_static.npz
-
         stage2_release=/workspace/releases/stage2/selected
-        stage2_manifest=${stage2_release}/stage2-manifest.json
-        stage2_manifest_sha_file=${stage2_release}/stage2-manifest.sha256
-        oof_artifact=${stage2_release}/oof/artifact
-        residual_scales=${stage2_release}/oof/residual-scales.json
+        stage2_release_index=${stage2_release}/release-index.json
+        stage2_release_index_sha_file=${stage2_release}/release-index.sha256
         oof_remote_credentials=/run/secrets/kcorrdiff-oof/credentials.env
         oof_remote_ca=/run/secrets/kcorrdiff-oof/server.crt
         oof_remote_cache=/tmp/oof-remote-cache
@@ -66,26 +54,16 @@ items:
         test -f "${source_root}/kcorrdiff/training/train_stage3.py"
         test -f "${source_root}/kcorrdiff/training/stage3_data.py"
         test -f "${stage3_config}"
-        test -f "${stage2_config}"
-        test -f "${data_contract}"
-        test -f "${radar_cache_root}/manifest.json"
-        test -f "${era5_cache_root}/manifest.json"
-        test -f "${draw_manifest}"
-        test -f "${candidate_manifest}"
-        test -f "${bundle_metadata}"
-        test -f "${static_path}"
-        test -f "${stage2_manifest}"
-        test -f "${stage2_manifest_sha_file}"
-        test -f "${oof_artifact}/manifest.json"
-        test -f "${residual_scales}"
+        test -f "${stage2_release_index}"
+        test -f "${stage2_release_index_sha_file}"
         test -r "${oof_remote_credentials}"
         test -r "${oof_remote_ca}"
         install -d -m 0700 "${oof_remote_cache}"
 
-        stage2_manifest_sha256="$(tr -d '\n' < "${stage2_manifest_sha_file}")"
-        [[ "${stage2_manifest_sha256}" =~ ^[0-9a-f]{64}$ ]]
-        test "$(sha256sum "${stage2_manifest}" | awk '{print $1}')" = \
-          "${stage2_manifest_sha256}"
+        stage2_release_index_sha256="$(tr -d '\n' < "${stage2_release_index_sha_file}")"
+        [[ "${stage2_release_index_sha256}" =~ ^[0-9a-f]{64}$ ]]
+        test "$(sha256sum "${stage2_release_index}" | awk '{print $1}')" = \
+          "${stage2_release_index_sha256}"
 
         case "${STAGE3_PHASE}" in
           screen)
@@ -201,21 +179,12 @@ items:
           -m kcorrdiff.training.train_stage3 \
           "${phase_arguments[@]}" \
           --config "${stage3_config}" \
-          --stage2-config "${stage2_config}" \
-          --stage2-manifest "${stage2_manifest}" \
-          --stage2-manifest-sha256 "${stage2_manifest_sha256}" \
-          --oof-artifact "${oof_artifact}" \
+          --stage2-release-index "${stage2_release_index}" \
+          --stage2-release-index-sha256 "${stage2_release_index_sha256}" \
+          --stage2-release-root "${stage2_release}" \
           --oof-remote-credentials "${oof_remote_credentials}" \
           --oof-remote-ca-certificate "${oof_remote_ca}" \
           --oof-remote-cache-root "${oof_remote_cache}" \
-          --residual-scales "${residual_scales}" \
-          --radar-cache-root "${radar_cache_root}" \
-          --era5-cache-root "${era5_cache_root}" \
-          --draw-manifest "${draw_manifest}" \
-          --candidate-manifest "${candidate_manifest}" \
-          --bundle-metadata "${bundle_metadata}" \
-          --data-contract "${data_contract}" \
-          --static-path "${static_path}" \
           --output-dir "${run_root}" \
           --require-world-size 2 \
           --precision float32 \
@@ -277,7 +246,7 @@ items:
             - name: trainer
               image: &stage3_image pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
               imagePullPolicy: IfNotPresent
-              workingDir: /workspace/code/stage3-production-v1
+              workingDir: /workspace/code/stage3-production-v2
               command: ["/bin/bash", "/opt/kcorrdiff/stage3-entrypoint.sh"]
               env:
                 - name: STAGE3_PHASE
@@ -291,7 +260,7 @@ items:
                 - name: KCORRDIFF_CONTAINER_IMAGE_SHA256
                   value: 6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
                 - name: PYTHONPATH
-                  value: /workspace/envs/stage2-python-v1:/workspace/code/stage3-production-v1
+                  value: /workspace/envs/stage2-python-v1:/workspace/code/stage3-production-v2
                 - name: PYTHONUNBUFFERED
                   value: "1"
                 - name: PYTHONDONTWRITEBYTECODE
@@ -387,7 +356,7 @@ items:
                 sizeLimit: 8Gi
             - name: stage3-runner
               configMap:
-                name: kcorrdiff-stage3-runner-v1-1-3b
+                name: kcorrdiff-stage3-runner-v1-1-3b-v2
                 defaultMode: 0555
             - name: oof-remote
               secret:

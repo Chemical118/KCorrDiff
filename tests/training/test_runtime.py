@@ -37,6 +37,24 @@ def test_runtime_contract_is_exact_and_fallbacks_fail_closed() -> None:
     with pytest.raises(ValueError, match="fallback"):
         contract_from_mapping(invalid)
 
+    for key, alias in (
+        ("era_grid_size", 33.0),
+        ("era_latent_channels", "128"),
+        ("precision", 32),
+    ):
+        invalid = full_mapping()
+        invalid[key] = alias
+        with pytest.raises(TypeError):
+            contract_from_mapping(invalid)
+    invalid = full_mapping()
+    invalid["target_widths"] = [64.0, 128, 256, 384, 512]
+    with pytest.raises(TypeError, match="integer"):
+        contract_from_mapping(invalid)
+    invalid = full_mapping()
+    invalid["unknown"] = True
+    with pytest.raises(ValueError, match="schema mismatch"):
+        contract_from_mapping(invalid)
+
 
 def test_float32_guard_and_cpu_diagnostic_path() -> None:
     module = torch.nn.Conv2d(2, 3, 3)

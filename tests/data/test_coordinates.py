@@ -3,6 +3,7 @@ import pytest
 
 from kcorrdiff.data.coordinates import (
     build_era_latlon_geometry,
+    build_repeated_stride2_geometry,
     build_token_geometry,
     normalize_lcc_coordinates,
     target_center_from_axes,
@@ -125,6 +126,79 @@ def test_nonuniform_footprints_and_validity_are_area_weighted() -> None:
     assert geometry.valid_fraction is not None
     assert geometry.valid_fraction[0, 0] == pytest.approx(expected)
     np.testing.assert_allclose(geometry.valid_fraction[1, :], 1.0)
+
+
+def test_stride2_convolution_geometry_matches_exact_lattice_and_support() -> None:
+    axes = np.arange(16, dtype=np.float64) * 0.5
+    geometry = build_repeated_stride2_geometry(
+        axes,
+        axes,
+        target_center_x_km=3.75,
+        target_center_y_km=3.75,
+        downsampling_levels=3,
+    )
+
+    # Three k3/s2/p1 convolutions sample input centres 0 and 8, not the
+    # midpoints of disjoint [0:8] and [8:16] blocks.
+    np.testing.assert_allclose(
+        geometry.x_shared,
+        [[-0.0375, 0.0025], [-0.0375, 0.0025]],
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    np.testing.assert_allclose(
+        geometry.y_shared,
+        [[-0.0375, -0.0375], [0.0025, 0.0025]],
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    # The physical token footprint remains the documented 8-cell lattice
+    # spacing.  Receptive support (15 cells) is a separate validity diagnostic.
+    np.testing.assert_allclose(geometry.footprint_width_km, 4.0)
+    np.testing.assert_allclose(geometry.footprint_height_km, 4.0)
+    assert geometry.valid_fraction is not None
+    np.testing.assert_allclose(
+        geometry.valid_fraction,
+        [[(8.0 / 15.0) ** 2, 8.0 / 15.0], [8.0 / 15.0, 1.0]],
+    )
+
+    level_four = build_repeated_stride2_geometry(
+        axes,
+        axes,
+        target_center_x_km=3.75,
+        target_center_y_km=3.75,
+        downsampling_levels=4,
+    )
+    np.testing.assert_allclose(level_four.x_shared, -0.0375)
+    np.testing.assert_allclose(level_four.footprint_width_km, 8.0)
+    assert level_four.valid_fraction is not None
+    np.testing.assert_allclose(level_four.valid_fraction, (16.0 / 31.0) ** 2)
+
+
+def test_stride2_geometry_area_weights_missing_nonuniform_source_support() -> None:
+    x = np.array([0.0, 1.0, 3.0, 6.0])
+    y = np.array([0.0, 2.0, 5.0, 9.0])
+    validity = np.ones((4, 4), dtype=np.float64)
+    validity[0, 0] = 0.0
+    geometry = build_repeated_stride2_geometry(
+        x,
+        y,
+        target_center_x_km=3.0,
+        target_center_y_km=4.5,
+        downsampling_levels=1,
+        valid_fraction=validity,
+    )
+    widths, heights = token_footprints(x, y)
+    # The first k3/p1 receptive support extends one boundary cell outward:
+    # width 3.5 km and height 6.5 km on these nonuniform axes.
+    nominal_area = 3.5 * 6.5
+    expected = (
+        widths[0, 1] * heights[0, 1]
+        + widths[1, 0] * heights[1, 0]
+        + widths[1, 1] * heights[1, 1]
+    ) / nominal_area
+    assert geometry.valid_fraction is not None
+    assert geometry.valid_fraction[0, 0] == pytest.approx(expected)
 
 
 def test_coordinate_axes_must_be_strictly_increasing() -> None:

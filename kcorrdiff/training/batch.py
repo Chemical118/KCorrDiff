@@ -27,18 +27,26 @@ from kcorrdiff.data.advection import (
 from kcorrdiff.data.condition_schema import (
     CONTEXT_DYNAMIC_CHANNEL_NAMES,
     Era5Conditions,
+    parse_condition_signature,
 )
 from kcorrdiff.data.context_regrid import ContextRegridOperator
 from kcorrdiff.data.coordinates import (
     DEFAULT_COORDINATE_SCALE_KM,
     TokenGeometry,
     build_era_latlon_geometry,
-    build_token_geometry,
+    build_repeated_stride2_geometry,
     normalize_lcc_coordinates,
     target_center_from_axes,
 )
 from kcorrdiff.data.dataset import TrainingSample
-from kcorrdiff.data.era5_reader import ERA5_NATIVE_HOURS, Era5MmapCache
+from kcorrdiff.data.era5_reader import (
+    ERA5_NATIVE_HOURS,
+    Era5MmapCache,
+    Era5WindowProvenance,
+    native_hour_times,
+    temporal_access_mask as expected_temporal_access_mask,
+    trajectory_window_mask as expected_trajectory_window_mask,
+)
 from kcorrdiff.data.provider_adapter import ERA5_CHANNEL_NAMES
 from kcorrdiff.data.radar_values import cprecnet_normalized_to_rain_rate
 from kcorrdiff.data.static_loader import TargetStaticArtifact
@@ -274,33 +282,33 @@ def _regression_geometry(
     spec: PhysicalGridSpec, *, device: torch.device
 ) -> RegressionGeometry:
     center_x, center_y = spec.target_center_lcc_km
-    target_l3 = build_token_geometry(
+    target_l3 = build_repeated_stride2_geometry(
         spec.target_x_lcc_km,
         spec.target_y_lcc_km,
         target_center_x_km=center_x,
         target_center_y_km=center_y,
-        block_shape=8,
+        downsampling_levels=3,
     )
-    target_l4 = build_token_geometry(
+    target_l4 = build_repeated_stride2_geometry(
         spec.target_x_lcc_km,
         spec.target_y_lcc_km,
         target_center_x_km=center_x,
         target_center_y_km=center_y,
-        block_shape=16,
+        downsampling_levels=4,
     )
-    context_l3 = build_token_geometry(
+    context_l3 = build_repeated_stride2_geometry(
         spec.context_x_lcc_km,
         spec.context_y_lcc_km,
         target_center_x_km=center_x,
         target_center_y_km=center_y,
-        block_shape=8,
+        downsampling_levels=3,
     )
-    context_l4 = build_token_geometry(
+    context_l4 = build_repeated_stride2_geometry(
         spec.context_x_lcc_km,
         spec.context_y_lcc_km,
         target_center_x_km=center_x,
         target_center_y_km=center_y,
-        block_shape=16,
+        downsampling_levels=4,
     )
     era = build_era_latlon_geometry(
         spec.era_latitude_degrees,
@@ -390,6 +398,39 @@ class EraModelInputs:
         )
         if any(len(value) != batch for value in metadata):
             raise ValueError("ERA metadata requires one entry per batch item")
+        for index, raw_signature in enumerate(self.condition_signatures):
+            signature = parse_condition_signature(raw_signature)
+            if bool(self.era_present[index].item()) != signature.era_present or bool(
+                self.tp_present[index].item()
+            ) != (signature.era_present and signature.tp_present):
+                raise ValueError("ERA source-presence flags mismatch condition signature")
+            access = self.temporal_access_mask[index]
+            trajectory = self.trajectory_window_mask[index]
+            if signature.temporal_access_mode == "no_era_access":
+                if bool(access.any().item()):
+                    raise ValueError("no-era condition must have no temporal access")
+            elif signature.temporal_access_mode == "full_trajectory":
+                if not torch.equal(access, trajectory):
+                    raise ValueError(
+                        "full-trajectory condition must expose its trajectory window"
+                    )
+            elif bool((access & ~trajectory).any().item()):
+                raise ValueError("causal temporal access must stay inside the trajectory")
+            provenance = self.provenance[index]
+            if not isinstance(provenance, Era5WindowProvenance):
+                raise TypeError("ERA provenance must be Era5WindowProvenance")
+            if provenance.condition_signature != signature.key:
+                raise ValueError("ERA provenance mismatch condition signature")
+            if (
+                provenance.valid_times_utc != self.valid_times_utc[index]
+                or provenance.tp_intervals_utc != self.tp_intervals_utc[index]
+            ):
+                raise ValueError("ERA provenance time metadata mismatch")
+            if (
+                signature.temporal_access_mode != "no_era_access"
+                and provenance.access_mode != signature.temporal_access_mode
+            ):
+                raise ValueError("ERA provenance access mode mismatch signature")
         if self.value_space == "physical_raw":
             if self.normalization_artifact_id is not None:
                 raise ValueError("raw ERA values cannot claim a normalization artifact")
@@ -398,6 +439,11 @@ class EraModelInputs:
                 raise ValueError("normalized ERA values require an artifact id")
         else:
             raise ValueError(f"unsupported ERA value space: {self.value_space!r}")
+
+    def validate(self) -> None:
+        """Revalidate mutable tensor contents at a model/inference boundary."""
+
+        self.__post_init__()
 
     @property
     def instantaneous(self) -> Tensor:
@@ -566,6 +612,9 @@ class RegressionModelBatch:
     provenance: BatchProvenance
 
     def __post_init__(self) -> None:
+        if not isinstance(self.embedding, ConditionEmbeddingInputs):
+            raise TypeError("embedding must be ConditionEmbeddingInputs")
+        self.embedding.validate()
         forbidden = sorted(
             {field.name.lower() for field in fields(self)} & _FUTURE_MODEL_FIELDS
         )
@@ -578,8 +627,79 @@ class RegressionModelBatch:
             raise ValueError("ERA/advection/model batches differ")
         if len(self.provenance.sample_ids) != batch:
             raise ValueError("batch provenance length differs from model tensors")
+        if any(
+            len(value) != batch
+            for value in (
+                self.provenance.block_ids,
+                self.provenance.fold_ids,
+                self.provenance.t0_utc,
+                self.provenance.history_times_utc,
+                self.provenance.condition_signatures,
+            )
+        ):
+            raise ValueError("all batch provenance fields require one item per row")
         if self.era.condition_signatures != self.provenance.condition_signatures:
             raise ValueError("ERA and batch condition signatures differ")
+        for index, raw_signature in enumerate(self.era.condition_signatures):
+            signature = parse_condition_signature(raw_signature)
+            t0 = self.provenance.t0_utc[index]
+            expected_cyclic = torch.tensor(
+                build_verification_time_features(
+                    t0, float(self.embedding.lead_hours[index].item())
+                ).cyclic_features,
+                dtype=torch.float32,
+                device=self.embedding.verification_cyclic.device,
+            )
+            if not torch.equal(
+                self.embedding.verification_cyclic[index], expected_cyclic
+            ):
+                raise ValueError(
+                    "embedding verification_cyclic disagrees with canonical "
+                    "FP32 t0/lead features"
+                )
+            expected_times = native_hour_times(t0)
+            if self.era.valid_times_utc[index] != expected_times:
+                raise ValueError("ERA valid times disagree with the batch issue time")
+            expected_intervals = tuple(
+                (value - timedelta(hours=1), value) for value in expected_times
+            )
+            if self.era.tp_intervals_utc[index] != expected_intervals:
+                raise ValueError("ERA precipitation intervals disagree with valid times")
+            expected_delta = torch.tensor(
+                [
+                    (value - t0.astimezone(UTC)).total_seconds() / 3600.0
+                    for value in expected_times
+                ],
+                dtype=torch.float32,
+                device=self.era.values.device,
+            )
+            if not torch.allclose(
+                self.era.delta_hours[index], expected_delta, rtol=0.0, atol=1.0e-6
+            ):
+                raise ValueError("ERA time deltas disagree with the batch issue time")
+            expected_trajectory = torch.as_tensor(
+                expected_trajectory_window_mask(t0),
+                dtype=torch.bool,
+                device=self.era.values.device,
+            )
+            if not torch.equal(
+                self.era.trajectory_window_mask[index], expected_trajectory
+            ):
+                raise ValueError("ERA trajectory mask disagrees with the issue time")
+            if signature.temporal_access_mode == "no_era_access":
+                expected_access = torch.zeros_like(expected_trajectory)
+            else:
+                expected_access = torch.as_tensor(
+                    expected_temporal_access_mask(
+                        t0,
+                        lead_hours=float(self.embedding.lead_hours[index].item()),
+                        access_mode=signature.temporal_access_mode,  # type: ignore[arg-type]
+                    ),
+                    dtype=torch.bool,
+                    device=self.era.values.device,
+                )
+            if not torch.equal(self.era.temporal_access_mask[index], expected_access):
+                raise ValueError("ERA temporal access disagrees with signature and lead")
         devices = (
             self.condition_bank.target.radar_history.device,
             self.condition_bank.context.dynamic_fields.device,
@@ -590,6 +710,13 @@ class RegressionModelBatch:
         )
         if any(device != devices[0] for device in devices):
             raise ValueError("all model conditions must share one device")
+
+    def validate(self) -> None:
+        """Revalidate semantic condition identity after possible tensor mutation."""
+
+        self.embedding.validate()
+        self.era.validate()
+        self.__post_init__()
 
     @property
     def device(self) -> torch.device:

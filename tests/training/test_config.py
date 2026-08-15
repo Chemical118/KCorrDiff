@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
-from kcorrdiff.training.config import load_stage2_config
+from kcorrdiff.training.config import load_stage2_config, thaw_config_mapping
 
 
 CONFIG = Path(__file__).parents[2] / "configs" / "stage2-full-width.yaml"
@@ -36,6 +38,45 @@ def test_production_stage2_config_is_strict_and_topology_bound() -> None:
         config.validate_topology(world_size=1)
 
 
+def test_stage2_raw_config_is_deeply_immutable_detached_and_hash_bound() -> None:
+    config = load_stage2_config(CONFIG)
+    config_sha256 = config.sha256
+
+    with pytest.raises(TypeError):
+        config.raw["model"]["advection"]["flow_pyramid_levels"] = 99  # type: ignore[index]
+    with pytest.raises(TypeError):
+        config.raw["data"]["condition_augmentation"]["entries"][0][  # type: ignore[index]
+            "target_probability"
+        ] = 1.0
+    with pytest.raises(TypeError):
+        config.raw["runtime"]["target_widths"][0] = 1  # type: ignore[index]
+
+    mutable = thaw_config_mapping(config.raw)
+    mutable["model"]["advection"]["flow_pyramid_levels"] = 99  # type: ignore[index]
+    assert config.raw["model"]["advection"]["flow_pyramid_levels"] == 4  # type: ignore[index]
+    assert config.sha256 == config_sha256
+    canonical = json.dumps(
+        thaw_config_mapping(config.raw), sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert hashlib.sha256(canonical).hexdigest() == config.sha256
+
+
+def test_stage2_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
+    source = CONFIG.read_text(encoding="utf-8")
+    duplicated = source.replace(
+        "  precision: float32",
+        "  precision: float16\n  precision: float32",
+        1,
+    )
+    path = tmp_path / "duplicate-precision.yaml"
+    path.write_text(duplicated, encoding="utf-8")
+
+    with pytest.raises(
+        yaml.constructor.ConstructorError, match="duplicate key 'precision'"
+    ):
+        load_stage2_config(path)
+
+
 def test_config_rejects_fallback_unknown_keys_and_weight_clipping(
     tmp_path: Path,
 ) -> None:
@@ -57,6 +98,60 @@ def test_config_rejects_fallback_unknown_keys_and_weight_clipping(
     changed["mystery"] = True
     path.write_text(yaml.safe_dump(changed))
     with pytest.raises(ValueError, match="schema mismatch"):
+        load_stage2_config(path)
+
+
+@pytest.mark.parametrize("invalid", [256.9, "256", True])
+def test_stage2_shape_contract_rejects_numeric_aliases(
+    tmp_path: Path, invalid: object
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text())
+    raw["data"]["target_shape"][0] = invalid
+    path = tmp_path / "invalid-shape.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(TypeError, match="only integers"):
+        load_stage2_config(path)
+
+
+def test_stage2_numeric_contract_rejects_string_and_boolean_aliases(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text())
+    for index, invalid in enumerate(("0.0002", True)):
+        changed = deepcopy(raw)
+        changed["optimization"]["learning_rate"] = invalid
+        path = tmp_path / f"invalid-learning-rate-{index}.yaml"
+        path.write_text(yaml.safe_dump(changed), encoding="utf-8")
+        with pytest.raises(TypeError, match="JSON number"):
+            load_stage2_config(path)
+
+
+@pytest.mark.parametrize(
+    "section", ["model", "loader_tuning", "tracking", "publication"]
+)
+def test_stage2_rejects_hidden_keys_in_every_execution_section(
+    tmp_path: Path, section: str
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text())
+    raw[section]["adversarial_extra"] = 123
+    path = tmp_path / f"extra-{section}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema mismatch"):
+        load_stage2_config(path)
+
+
+def test_stage2_rejects_hidden_nested_model_and_loader_keys(tmp_path: Path) -> None:
+    raw = yaml.safe_load(CONFIG.read_text())
+    raw["model"]["advection"]["adversarial_extra"] = True
+    path = tmp_path / "nested-extra.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="model.advection schema mismatch"):
+        load_stage2_config(path)
+
+    raw = yaml.safe_load(CONFIG.read_text())
+    raw["loader_tuning"]["candidates"]["adversarial_extra"] = [1]
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="loader_tuning.candidates schema mismatch"):
         load_stage2_config(path)
 
 

@@ -533,10 +533,64 @@ def build_validity_pyramid(level_zero: Tensor) -> ValidityPyramid:
         raise ValueError("level-zero validity must have one channel")
     if bool(((level_zero < 0.0) | (level_zero > 1.0)).any().item()):
         raise ValueError("level-zero validity must lie in [0,1]")
+    # Match the actual repeated k3/s2/p1 feature lattice.  Each level is
+    # computed from L0 over the complete nominal receptive field, rather than
+    # over disjoint 2x2 pooling blocks.  Padded positions are unsupported and
+    # therefore remain in the denominator.
     levels = [level_zero]
-    for _ in range(4):
-        levels.append(F.avg_pool2d(levels[-1], kernel_size=2, stride=2))
+    for downsampling_levels in range(1, 5):
+        jump = 1 << downsampling_levels
+        receptive_field = 2 * jump - 1
+        levels.append(
+            F.avg_pool2d(
+                level_zero,
+                kernel_size=receptive_field,
+                stride=jump,
+                padding=jump - 1,
+                count_include_pad=True,
+            )
+        )
     return ValidityPyramid(*levels)
+
+
+def sample_repeated_stride2_lattice(
+    level_zero: Tensor,
+    *,
+    downsampling_levels: int,
+    expected_shape: tuple[int, int],
+) -> Tensor:
+    """Sample L0 at the centres of repeated k3/s2/p1 CNN features.
+
+    Neither ``interpolate(..., align_corners=True)`` nor its half-pixel
+    counterpart lands on this lattice for a reduction such as 256 -> 32.
+    Repeated k3/s2/p1 centres are exactly input indices ``0, 2**L, ...``.
+    """
+
+    require_float32_tensor("level-zero lattice field", level_zero, ndim=4)
+    if isinstance(downsampling_levels, bool) or not isinstance(
+        downsampling_levels, int
+    ):
+        raise TypeError("downsampling_levels must be an integer")
+    if downsampling_levels < 0:
+        raise ValueError("downsampling_levels must be non-negative")
+    if (
+        len(expected_shape) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in expected_shape
+        )
+    ):
+        raise ValueError("expected_shape must contain two positive integers")
+    stride = 1 << downsampling_levels
+    sampled = level_zero[..., ::stride, ::stride]
+    if tuple(sampled.shape[-2:]) != tuple(expected_shape):
+        raise ValueError(
+            "repeated-stride2 lattice shape mismatch: "
+            f"sampled {tuple(sampled.shape[-2:])}, expected {tuple(expected_shape)}"
+        )
+    return sampled
 
 
 def count_parameters(modules: nn.Module | Iterable[nn.Module]) -> int:
@@ -571,6 +625,7 @@ __all__ = [
     "require_float32_tensor",
     "require_module_float32",
     "require_no_autocast",
+    "sample_repeated_stride2_lattice",
     "validate_input_size",
     "validate_widths",
 ]
