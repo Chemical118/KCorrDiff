@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -46,6 +46,7 @@ from kcorrdiff.data.split_manifest import canonical_sample_id
 from kcorrdiff.models.residual_edm import ResidualEDMConditions
 from kcorrdiff.models.regression_system import RegressionSystemOutput
 from kcorrdiff.training.batch import RegressionModelBatch, TrainingBatch
+from kcorrdiff.training.calibration import POOLING_ORDER, block_ess_tolerance
 from kcorrdiff.training.crossfit import CheckpointRecord, checkpoint_set_hash
 from kcorrdiff.training.data_factory import KCorrDiffDataFactory
 from kcorrdiff.training.oof import (
@@ -61,7 +62,11 @@ from kcorrdiff.training.oof_remote import (
     RemoteShardReceipt,
     RemoteShardStore,
 )
-from kcorrdiff.training.residual_scales import SCALE_FORMAT_VERSION
+from kcorrdiff.training.residual_scales import (
+    DEFAULT_MINIMUM_BLOCK_ESS,
+    DEFAULT_MINIMUM_INDEPENDENT_BLOCKS,
+    SCALE_FORMAT_VERSION,
+)
 
 
 STAGE2_MANIFEST_FORMAT = "kcorrdiff.stage2-training.v1"
@@ -103,6 +108,69 @@ _STAGE2_ROOT_KEYS = frozenset(
         "tracking_audit_path",
         "manual_release_required",
     }
+)
+_STAGE2_ROOT_KEYS_WITH_FOLD_IMPORT = _STAGE2_ROOT_KEYS | frozenset(
+    {"imported_fold_set"}
+)
+_IMPORTED_FOLD_SET_FORMAT = "kcorrdiff.stage2-verified-fold-set-import.v1"
+_IMPORTED_FOLD_SET_KEYS = frozenset(
+    {"format_version", "manifest_path", "manifest_sha256", "producer", "folds"}
+)
+_IMPORTED_FOLD_PRODUCER_KEYS = frozenset(
+    {
+        "protocol_version",
+        "config_sha256",
+        "draw_manifest_sha256",
+        "launch_identity",
+        "artifact_hashes",
+        "node_name",
+        "world_size",
+        "per_rank_microbatch_size",
+        "gradient_accumulation_steps",
+        "global_effective_batch_size",
+        "policy_sha256",
+    }
+)
+_IMPORTED_FOLD_KEYS = frozenset(
+    {
+        "fold_id",
+        "checkpoint_path",
+        "checkpoint_bytes",
+        "checkpoint_sha256",
+        "partial_manifest_path",
+        "partial_manifest_sha256",
+        "cursor",
+        "plan_semantic_sha256",
+        "plan_optimizer_steps",
+        "training_blocks_sha256",
+    }
+)
+_TRAINING_CURSOR_KEYS = frozenset(
+    {"epoch", "global_example_index", "optimizer_step", "microbatches_since_step"}
+)
+_STAGE2_SELECTION_LEGACY_KEYS = frozenset(
+    {"phases", "roles", "max_optimizer_steps"}
+)
+_STAGE2_SELECTION_KEYS = _STAGE2_SELECTION_LEGACY_KEYS | frozenset(
+    {
+        "bounded_training_year",
+        "expected_training_items",
+        "single_node_fold_worker",
+        "node_name",
+    }
+)
+_STAGE2_TOPOLOGY_LEGACY_KEYS = frozenset(
+    {
+        "world_size",
+        "per_rank_microbatch_size",
+        "gradient_accumulation_steps",
+        "precision",
+        "tf32",
+        "cursor_global_example_index_semantics",
+    }
+)
+_STAGE2_TOPOLOGY_KEYS = _STAGE2_TOPOLOGY_LEGACY_KEYS | frozenset(
+    {"global_effective_batch_size", "single_node_fold_policy_sha256"}
 )
 _STAGE2_LAUNCH_IDENTITY_KEYS = frozenset(
     {
@@ -217,6 +285,9 @@ _SCALE_ROOT_KEYS = frozenset(
     {
         "format_version",
         "epsilon_scale",
+        "minimum_independent_blocks",
+        "minimum_block_ess",
+        "pooling_order",
         "records",
         "oof_manifest_sha256",
         "regression_checkpoint_set_sha256",
@@ -229,6 +300,20 @@ _SCALE_RECORD_KEYS = frozenset(
         "scale",
         "raw_rms",
         "epsilon_applied",
+        "items",
+        "valid_pixels",
+        "importance_weight_sum",
+        "pooling_level",
+        "pooling_ladder",
+        "terminal_fallback",
+        "diffusion_scale_unsupported",
+    }
+)
+_SCALE_POOLING_LEVEL_KEYS = frozenset(
+    {
+        "level",
+        "block_count",
+        "block_ess",
         "items",
         "valid_pixels",
         "importance_weight_sum",
@@ -259,6 +344,23 @@ def _exact_keys(value: Mapping[str, object], expected: frozenset[str], *, name: 
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
         raise ValueError(f"{name} schema mismatch; missing={missing}, extra={extra}")
+
+
+def _exact_keys_one_of(
+    value: Mapping[str, object],
+    expected: tuple[frozenset[str], ...],
+    *,
+    name: str,
+) -> frozenset[str]:
+    """Accept one explicitly versioned schema without permitting arbitrary subsets."""
+
+    actual = frozenset(str(key) for key in value)
+    if actual not in expected:
+        accepted = [sorted(schema) for schema in expected]
+        raise ValueError(
+            f"{name} schema mismatch; actual={sorted(actual)}, accepted={accepted}"
+        )
+    return actual
 
 
 def _sha256_digest(value: object, *, name: str) -> str:
@@ -331,6 +433,17 @@ class Stage3ArtifactInputs:
     residual_scales: Path
     expected_grid_shape: tuple[int, int] = (256, 256)
     expected_target_builder_version: str = STAGE2_TARGET_BUILDER_VERSION
+    expected_residual_scale_minimum_independent_blocks: int = (
+        DEFAULT_MINIMUM_INDEPENDENT_BLOCKS
+    )
+    expected_residual_scale_minimum_block_ess: float = DEFAULT_MINIMUM_BLOCK_ESS
+    checkpoint_path_overrides: tuple[
+        tuple[str, int | None, Path], ...
+    ] = ()
+    imported_fold_set_manifest_override: Path | None = None
+    imported_fold_partial_manifest_overrides: tuple[
+        tuple[int, Path], ...
+    ] = ()
     remote_store: RemoteShardStore | None = None
     remote_cache_root: Path | None = None
 
@@ -346,6 +459,81 @@ class Stage3ArtifactInputs:
             object.__setattr__(
                 self, "remote_cache_root", Path(self.remote_cache_root).resolve()
             )
+        checkpoint_paths: dict[tuple[str, int | None], Path] = {}
+        for value in self.checkpoint_path_overrides:
+            if not isinstance(value, tuple) or len(value) != 3:
+                raise TypeError("checkpoint_path_overrides entries must be triples")
+            role, fold_id, path = value
+            identity = (role, fold_id)
+            fold_valid = (
+                role == "fold"
+                and not isinstance(fold_id, bool)
+                and isinstance(fold_id, int)
+                and fold_id in {0, 1, 2}
+            ) or (role != "fold" and fold_id is None)
+            if (
+                role not in {"fold", "deployment", "direct_mean", "direct_q50"}
+                or not fold_valid
+                or identity in checkpoint_paths
+            ):
+                raise ValueError("checkpoint path override identity is invalid")
+            checkpoint_paths[identity] = Path(path).resolve()
+        if checkpoint_paths and set(checkpoint_paths) != {
+            ("fold", 0),
+            ("fold", 1),
+            ("fold", 2),
+            ("deployment", None),
+            ("direct_mean", None),
+            ("direct_q50", None),
+        }:
+            raise ValueError("checkpoint path overrides must cover all six roles")
+        object.__setattr__(
+            self,
+            "checkpoint_path_overrides",
+            tuple(
+                (role, fold_id, checkpoint_paths[(role, fold_id)])
+                for role, fold_id in (
+                    ("fold", 0),
+                    ("fold", 1),
+                    ("fold", 2),
+                    ("deployment", None),
+                    ("direct_mean", None),
+                    ("direct_q50", None),
+                )
+                if (role, fold_id) in checkpoint_paths
+            ),
+        )
+        partials: dict[int, Path] = {}
+        for value in self.imported_fold_partial_manifest_overrides:
+            if not isinstance(value, tuple) or len(value) != 2:
+                raise TypeError(
+                    "imported_fold_partial_manifest_overrides entries must be pairs"
+                )
+            fold_id, path = value
+            if (
+                isinstance(fold_id, bool)
+                or not isinstance(fold_id, int)
+                or fold_id not in {0, 1, 2}
+                or fold_id in partials
+            ):
+                raise ValueError("imported fold partial override identity is invalid")
+            partials[fold_id] = Path(path).resolve()
+        if self.imported_fold_set_manifest_override is None:
+            if partials:
+                raise ValueError("imported fold partial overrides require the manifest")
+        else:
+            object.__setattr__(
+                self,
+                "imported_fold_set_manifest_override",
+                Path(self.imported_fold_set_manifest_override).resolve(),
+            )
+            if set(partials) != {0, 1, 2}:
+                raise ValueError("imported fold overrides must cover all three partials")
+        object.__setattr__(
+            self,
+            "imported_fold_partial_manifest_overrides",
+            tuple((fold_id, partials[fold_id]) for fold_id in sorted(partials)),
+        )
         _sha256_digest(
             self.expected_stage2_manifest_sha256,
             name="expected_stage2_manifest_sha256",
@@ -363,18 +551,55 @@ class Stage3ArtifactInputs:
             raise ValueError("expected_target_builder_version must be non-empty")
         if self.expected_target_builder_version != STAGE2_TARGET_BUILDER_VERSION:
             raise ValueError("Stage 3 target-builder contract differs from Stage 2")
+        minimum_blocks = self.expected_residual_scale_minimum_independent_blocks
+        minimum_ess = self.expected_residual_scale_minimum_block_ess
+        if (
+            isinstance(minimum_blocks, bool)
+            or not isinstance(minimum_blocks, int)
+            or minimum_blocks <= 0
+            or isinstance(minimum_ess, bool)
+            or not isinstance(minimum_ess, (int, float))
+            or not math.isfinite(float(minimum_ess))
+            or float(minimum_ess) <= 0.0
+        ):
+            raise ValueError("expected residual-scale support gates are invalid")
+        if self.expected_grid_shape == (256, 256) and (
+            minimum_blocks != DEFAULT_MINIMUM_INDEPENDENT_BLOCKS
+            or float(minimum_ess) != DEFAULT_MINIMUM_BLOCK_ESS
+        ):
+            raise ValueError(
+                "production residual-scale support gates are frozen at 30 blocks/ESS 20"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualScalePoolingLevel:
+    level: str
+    block_count: int
+    block_ess: float
+    items: int
+    valid_pixels: int
+    importance_weight_sum: float
+
+
+class DiffusionScaleUnsupportedError(LookupError):
+    """The exact cell must use the documented regression-only forecast."""
 
 
 @dataclass(frozen=True, slots=True)
 class ResidualScaleRecord:
     lead_hours: float
     condition_signature: str
-    scale: float
-    raw_rms: float
+    scale: float | None
+    raw_rms: float | None
     epsilon_applied: bool
     items: int
     valid_pixels: int
     importance_weight_sum: float
+    pooling_level: str | None
+    pooling_ladder: tuple[ResidualScalePoolingLevel, ...]
+    terminal_fallback: bool
+    diffusion_scale_unsupported: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,12 +890,48 @@ class Stage3ArtifactBundle:
         if len(self._scale_lookup) != len(scales):
             raise ValueError("duplicate residual-scale records survived verification")
 
-    def scale_record(self, row: DrawRow) -> ResidualScaleRecord:
-        key = (row.lead_hours, row.condition_signature)
+    def residual_scale_record(
+        self, *, lead_hours: float, condition_signature: str
+    ) -> ResidualScaleRecord:
+        """Return verified scale audit state, including unsupported cells."""
+
+        if isinstance(lead_hours, bool) or not isinstance(lead_hours, (int, float)):
+            raise TypeError("residual scale lead_hours must be a JSON-real scalar")
+        lead = float(lead_hours)
+        if lead not in _OFFICIAL_LEADS:
+            raise ValueError("residual scale lead_hours is not an official lead")
+        canonical_signature = parse_condition_signature(condition_signature).key
+        key = (lead, canonical_signature)
         try:
             return self._scale_lookup[key]
         except KeyError as error:
             raise KeyError(f"draw row has no exact residual-scale cell: {key}") from error
+
+    def scale_record(self, row: DrawRow) -> ResidualScaleRecord:
+        record = self.residual_scale_record(
+            lead_hours=row.lead_hours,
+            condition_signature=row.condition_signature,
+        )
+        key = (row.lead_hours, row.condition_signature)
+        if record.diffusion_scale_unsupported:
+            raise DiffusionScaleUnsupportedError(
+                f"diffusion scale unsupported for exact cell: {key}"
+            )
+        if record.scale is None:  # pragma: no cover - guaranteed by preflight.
+            raise AssertionError("supported residual-scale record lost its scale")
+        return record
+
+    @property
+    def diffusion_supported_row_indices(self) -> tuple[int, ...]:
+        """Original draw indices eligible for normalized diffusion training."""
+
+        return tuple(
+            index
+            for index, row in enumerate(self.rows)
+            if not self._scale_lookup[
+                (row.lead_hours, row.condition_signature)
+            ].diffusion_scale_unsupported
+        )
 
     @property
     def deployment_checkpoint(self) -> CheckpointRecord:
@@ -678,6 +939,225 @@ class Stage3ArtifactBundle:
         if len(matches) != 1:  # pragma: no cover - guaranteed by preflight.
             raise AssertionError("verified Stage 2 publication lost deployment checkpoint")
         return matches[0]
+
+
+def _verified_absolute_file(
+    value: object,
+    expected_sha256: object,
+    *,
+    name: str,
+) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value) or not Path(value).is_absolute():
+        raise ValueError(f"{name} path must be a non-empty absolute path")
+    path = Path(value)
+    _verified_file(path, expected_sha256, name=name)
+    return path
+
+
+def _validate_imported_fold_set(
+    value: object,
+    *,
+    config_sha256: str,
+    draw_manifest_sha256: str,
+    checkpoints: Mapping[tuple[str, int | None], CheckpointRecord],
+    role_states: Mapping[tuple[str, int | None], Mapping[str, object]],
+    checkpoint_path_overrides: Mapping[
+        tuple[str, int | None], Path
+    ],
+    manifest_path_override: Path | None,
+    partial_path_overrides: Mapping[int, Path],
+) -> None:
+    """Validate the complete B12 producer audit without conflating topologies."""
+
+    if value is None:
+        if manifest_path_override is not None or partial_path_overrides:
+            raise ValueError("Stage 2 has no imported fold set to override")
+        return
+    if checkpoint_path_overrides and (
+        manifest_path_override is None or set(partial_path_overrides) != {0, 1, 2}
+    ):
+        raise ValueError(
+            "portable imported fold set requires its manifest and all partials"
+        )
+    imported = _mapping(value, name="Stage 2 imported_fold_set")
+    _exact_keys(imported, _IMPORTED_FOLD_SET_KEYS, name="Stage 2 imported_fold_set")
+    if imported.get("format_version") != _IMPORTED_FOLD_SET_FORMAT:
+        raise ValueError("Stage 2 imported fold-set format mismatch")
+    manifest_hash = _sha256_digest(
+        imported.get("manifest_sha256"),
+        name="Stage 2 imported fold-set manifest_sha256",
+    )
+    _verified_absolute_file(
+        (
+            manifest_path_override
+            if manifest_path_override is not None
+            else imported.get("manifest_path")
+        ),
+        manifest_hash,
+        name="Stage 2 imported fold-set manifest",
+    )
+
+    producer = _mapping(
+        imported.get("producer"), name="Stage 2 imported fold-set producer"
+    )
+    _exact_keys(
+        producer,
+        _IMPORTED_FOLD_PRODUCER_KEYS,
+        name="Stage 2 imported fold-set producer",
+    )
+    if (
+        producer.get("protocol_version") != PROTOCOL_VERSION
+        or producer.get("config_sha256") != config_sha256
+        or producer.get("draw_manifest_sha256") != draw_manifest_sha256
+    ):
+        raise ValueError("Stage 2 imported fold-set producer lineage mismatch")
+    launch_identity = _mapping(
+        producer.get("launch_identity"),
+        name="Stage 2 imported fold-set producer launch_identity",
+    )
+    _exact_keys(
+        launch_identity,
+        _STAGE2_LAUNCH_IDENTITY_KEYS,
+        name="Stage 2 imported fold-set producer launch_identity",
+    )
+    for name, digest in launch_identity.items():
+        _sha256_digest(
+            digest, name=f"Stage 2 imported fold-set producer launch identity {name}"
+        )
+    artifact_hashes = _mapping(
+        producer.get("artifact_hashes"),
+        name="Stage 2 imported fold-set producer artifact_hashes",
+    )
+    if not artifact_hashes:
+        raise ValueError("Stage 2 imported fold-set producer artifact lineage is empty")
+    for name, digest in artifact_hashes.items():
+        _sha256_digest(
+            digest, name=f"Stage 2 imported fold-set producer artifact hash {name}"
+        )
+    if artifact_hashes.get("draw_manifest") != draw_manifest_sha256:
+        raise ValueError("Stage 2 imported fold-set producer draw lineage mismatch")
+    producer_topology = tuple(
+        _integer(
+            producer.get(name),
+            name=f"Stage 2 imported producer {name}",
+            minimum=1,
+        )
+        for name in (
+            "world_size",
+            "per_rank_microbatch_size",
+            "gradient_accumulation_steps",
+            "global_effective_batch_size",
+        )
+    )
+    if producer.get("node_name") != "porsche" or producer_topology != (1, 12, 1, 12):
+        raise ValueError("Stage 2 imported fold-set producer topology mismatch")
+    _sha256_digest(
+        producer.get("policy_sha256"),
+        name="Stage 2 imported fold-set producer policy_sha256",
+    )
+
+    raw_folds = imported.get("folds")
+    if not isinstance(raw_folds, list) or len(raw_folds) != 3:
+        raise ValueError("Stage 2 imported fold-set must contain exactly three folds")
+    observed_folds: set[int] = set()
+    checkpoint_paths: set[Path] = set()
+    partial_manifest_paths: set[Path] = set()
+    for index, raw in enumerate(raw_folds):
+        fold = _mapping(raw, name=f"Stage 2 imported fold {index}")
+        _exact_keys(fold, _IMPORTED_FOLD_KEYS, name=f"Stage 2 imported fold {index}")
+        fold_id = fold.get("fold_id")
+        if (
+            isinstance(fold_id, bool)
+            or not isinstance(fold_id, int)
+            or fold_id not in {0, 1, 2}
+            or fold_id in observed_folds
+        ):
+            raise ValueError("Stage 2 imported fold IDs must be exactly 0, 1 and 2")
+        observed_folds.add(fold_id)
+        checkpoint_hash = _sha256_digest(
+            fold.get("checkpoint_sha256"),
+            name=f"Stage 2 imported fold {fold_id} checkpoint_sha256",
+        )
+        checkpoint_path = _verified_absolute_file(
+            checkpoint_path_overrides.get(
+                ("fold", fold_id), fold.get("checkpoint_path")
+            ),
+            checkpoint_hash,
+            name=f"Stage 2 imported fold {fold_id} checkpoint",
+        ).resolve()
+        checkpoint_bytes = _integer(
+            fold.get("checkpoint_bytes"),
+            name=f"Stage 2 imported fold {fold_id} checkpoint_bytes",
+            minimum=1,
+        )
+        if checkpoint_path.stat().st_size != checkpoint_bytes:
+            raise ValueError("Stage 2 imported fold checkpoint byte size mismatch")
+        partial_hash = _sha256_digest(
+            fold.get("partial_manifest_sha256"),
+            name=f"Stage 2 imported fold {fold_id} partial_manifest_sha256",
+        )
+        partial_path = _verified_absolute_file(
+            partial_path_overrides.get(
+                fold_id, fold.get("partial_manifest_path")
+            ),
+            partial_hash,
+            name=f"Stage 2 imported fold {fold_id} partial manifest",
+        ).resolve()
+        if (
+            checkpoint_path in checkpoint_paths
+            or partial_path in partial_manifest_paths
+        ):
+            raise ValueError("Stage 2 imported fold artifact paths must be unique")
+        checkpoint_paths.add(checkpoint_path)
+        partial_manifest_paths.add(partial_path)
+
+        cursor = _mapping(
+            fold.get("cursor"), name=f"Stage 2 imported fold {fold_id} cursor"
+        )
+        _exact_keys(
+            cursor,
+            _TRAINING_CURSOR_KEYS,
+            name=f"Stage 2 imported fold {fold_id} cursor",
+        )
+        for name in _TRAINING_CURSOR_KEYS:
+            _integer(
+                cursor.get(name),
+                name=f"Stage 2 imported fold {fold_id} cursor {name}",
+            )
+        _sha256_digest(
+            fold.get("plan_semantic_sha256"),
+            name=f"Stage 2 imported fold {fold_id} plan_semantic_sha256",
+        )
+        plan_steps = _integer(
+            fold.get("plan_optimizer_steps"),
+            name=f"Stage 2 imported fold {fold_id} plan_optimizer_steps",
+            minimum=1,
+        )
+        training_blocks_hash = _sha256_digest(
+            fold.get("training_blocks_sha256"),
+            name=f"Stage 2 imported fold {fold_id} training_blocks_sha256",
+        )
+        identity = ("fold", fold_id)
+        checkpoint = checkpoints.get(identity)
+        state = role_states.get(identity)
+        if checkpoint is None or state is None:  # pragma: no cover
+            raise ValueError(
+                "Stage 2 imported fold has no published checkpoint identity"
+            )
+        state_cursor = _mapping(
+            state.get("cursor"), name=f"Stage 2 fold {fold_id} role cursor"
+        )
+        if (
+            checkpoint_hash != checkpoint.sha256
+            or plan_steps != checkpoint.global_step
+            or training_blocks_hash != checkpoint.training_blocks_sha256
+            or dict(cursor) != dict(state_cursor)
+            or cursor.get("optimizer_step") != plan_steps
+            or cursor.get("microbatches_since_step") != 0
+        ):
+            raise ValueError("Stage 2 imported fold audit/checkpoint mismatch")
+    if observed_folds != {0, 1, 2}:  # pragma: no cover
+        raise ValueError("Stage 2 imported fold IDs must be exactly 0, 1 and 2")
 
 
 def _validate_stage2_manifest(
@@ -691,7 +1171,11 @@ def _validate_stage2_manifest(
         name="Stage 2 manifest",
     )
     manifest = _read_canonical_json(inputs.stage2_manifest, name="Stage 2 manifest")
-    _exact_keys(manifest, _STAGE2_ROOT_KEYS, name="Stage 2 manifest")
+    _exact_keys_one_of(
+        manifest,
+        (_STAGE2_ROOT_KEYS, _STAGE2_ROOT_KEYS_WITH_FOLD_IMPORT),
+        name="Stage 2 manifest",
+    )
     if (
         manifest.get("format_version") != STAGE2_MANIFEST_FORMAT
         or manifest.get("protocol_version") != PROTOCOL_VERSION
@@ -718,9 +1202,9 @@ def _validate_stage2_manifest(
     for name, value in launch_identity.items():
         _sha256_digest(value, name=f"Stage 2 launch identity {name}")
     selection = _mapping(manifest.get("selection"), name="Stage 2 selection")
-    _exact_keys(
+    selection_keys = _exact_keys_one_of(
         selection,
-        frozenset({"phases", "roles", "max_optimizer_steps"}),
+        (_STAGE2_SELECTION_LEGACY_KEYS, _STAGE2_SELECTION_KEYS),
         name="Stage 2 selection",
     )
     if (
@@ -729,19 +1213,19 @@ def _validate_stage2_manifest(
         or selection.get("max_optimizer_steps") is not None
     ):
         raise ValueError("Stage 2 publication does not cover the complete training DAG")
+    if selection_keys == _STAGE2_SELECTION_KEYS and (
+        selection.get("bounded_training_year") is not None
+        or selection.get("expected_training_items") is not None
+        or selection.get("single_node_fold_worker") is not False
+        or selection.get("node_name") is not None
+    ):
+        raise ValueError(
+            "complete Stage 2 publication has partial-only selection state"
+        )
     topology = _mapping(manifest.get("topology"), name="Stage 2 topology")
-    _exact_keys(
+    topology_keys = _exact_keys_one_of(
         topology,
-        frozenset(
-            {
-                "world_size",
-                "per_rank_microbatch_size",
-                "gradient_accumulation_steps",
-                "precision",
-                "tf32",
-                "cursor_global_example_index_semantics",
-            }
-        ),
+        (_STAGE2_TOPOLOGY_LEGACY_KEYS, _STAGE2_TOPOLOGY_KEYS),
         name="Stage 2 topology",
     )
     if (
@@ -752,16 +1236,27 @@ def _validate_stage2_manifest(
         != "rank_local_plan_slots_consumed_including_padding"
     ):
         raise ValueError("Stage 2 topology/precision contract mismatch")
-    _integer(
+    microbatch = _integer(
         topology.get("per_rank_microbatch_size"),
         name="Stage 2 per-rank microbatch",
         minimum=1,
     )
-    _integer(
+    accumulation = _integer(
         topology.get("gradient_accumulation_steps"),
         name="Stage 2 gradient accumulation",
         minimum=1,
     )
+    if topology_keys == _STAGE2_TOPOLOGY_KEYS:
+        global_batch = _integer(
+            topology.get("global_effective_batch_size"),
+            name="Stage 2 global effective batch",
+            minimum=1,
+        )
+        if (
+            global_batch != 2 * microbatch * accumulation
+            or topology.get("single_node_fold_policy_sha256") is not None
+        ):
+            raise ValueError("Stage 2 topology execution metadata mismatch")
 
     artifact_hashes = _mapping(
         manifest.get("artifact_hashes"), name="Stage 2 artifact_hashes"
@@ -773,10 +1268,18 @@ def _validate_stage2_manifest(
     if artifact_hashes.get("draw_manifest") != draw_hash:
         raise ValueError("Stage 2 draw hash disagrees with its artifact lineage")
 
+    checkpoint_path_overrides = {
+        (role, fold_id): path
+        for role, fold_id, path in inputs.checkpoint_path_overrides
+    }
+    imported_partial_overrides = dict(
+        inputs.imported_fold_partial_manifest_overrides
+    )
     raw_records = manifest.get("role_checkpoints")
     if not isinstance(raw_records, list):
         raise TypeError("Stage 2 role_checkpoints must be a list")
     records: list[CheckpointRecord] = []
+    manifest_records: list[CheckpointRecord] = []
     for index, raw in enumerate(raw_records):
         record_mapping = _mapping(raw, name=f"Stage 2 checkpoint record {index}")
         _exact_keys(
@@ -807,8 +1310,13 @@ def _validate_stage2_manifest(
         _sha256_digest(
             record.training_blocks_sha256, name="checkpoint training_blocks_sha256"
         )
-        _verified_file(Path(record.path), record.sha256, name=f"{record.role} checkpoint")
-        records.append(record)
+        identity = (record.role, record.fold_id)
+        selected_path = checkpoint_path_overrides.get(identity, Path(record.path))
+        _verified_file(
+            selected_path, record.sha256, name=f"{record.role} checkpoint"
+        )
+        manifest_records.append(record)
+        records.append(replace(record, path=str(selected_path.resolve())))
     expected_roles = {
         ("fold", 0),
         ("fold", 1),
@@ -850,10 +1358,14 @@ def _validate_stage2_manifest(
             raise ValueError("Stage 2 role states must be unique and complete")
         states[identity] = state
     by_identity = {(record.role, record.fold_id): record for record in records}
+    manifest_by_identity = {
+        (record.role, record.fold_id): record for record in manifest_records
+    }
     if set(states) != set(by_identity):
         raise ValueError("Stage 2 role states/checkpoint identities differ")
     for identity, state in states.items():
         record = by_identity[identity]
+        manifest_record = manifest_by_identity[identity]
         cursor = _mapping(state.get("cursor"), name="Stage 2 role cursor")
         _exact_keys(
             cursor,
@@ -871,12 +1383,23 @@ def _validate_stage2_manifest(
             _integer(cursor[name], name=f"Stage 2 cursor {name}")
         if (
             Path(str(state.get("checkpoint_path"))).resolve()
-            != Path(record.path).resolve()
+            != Path(manifest_record.path).resolve()
             or state.get("checkpoint_sha256") != record.sha256
             or cursor.get("optimizer_step") != record.global_step
             or cursor.get("microbatches_since_step") != 0
         ):
             raise ValueError("Stage 2 final role state/checkpoint mismatch")
+
+    _validate_imported_fold_set(
+        manifest.get("imported_fold_set"),
+        config_sha256=config_hash,
+        draw_manifest_sha256=draw_hash,
+        checkpoints=by_identity,
+        role_states=states,
+        checkpoint_path_overrides=checkpoint_path_overrides,
+        manifest_path_override=inputs.imported_fold_set_manifest_override,
+        partial_path_overrides=imported_partial_overrides,
+    )
 
     fold_records = tuple(
         record for record in records if record.role == "fold"
@@ -1268,6 +1791,8 @@ def _validate_residual_scales(
     expected_sha256: str,
     expected_oof_sha256: str,
     expected_fold_set_sha256: str,
+    expected_minimum_independent_blocks: int,
+    expected_minimum_block_ess: float,
     rows: tuple[DrawRow, ...],
 ) -> tuple[tuple[ResidualScaleRecord, ...], str]:
     actual_hash = _verified_file(path, expected_sha256, name="residual scales")
@@ -1281,6 +1806,23 @@ def _validate_residual_scales(
     ):
         raise ValueError("residual-scale format or exact provenance mismatch")
     epsilon = _finite_positive(root.get("epsilon_scale"), name="residual scale epsilon")
+    minimum_blocks = _integer(
+        root.get("minimum_independent_blocks"),
+        name="residual scale minimum independent blocks",
+        minimum=1,
+    )
+    minimum_ess = _finite_positive(
+        root.get("minimum_block_ess"), name="residual scale minimum block ESS"
+    )
+    if (
+        minimum_blocks != expected_minimum_independent_blocks
+        or minimum_ess != float(expected_minimum_block_ess)
+    ):
+        raise ValueError(
+            "residual-scale support gates differ from the frozen consumer contract"
+        )
+    if tuple(root.get("pooling_order", ())) != POOLING_ORDER:
+        raise ValueError("residual-scale pooling order is not the frozen ladder")
     raw_records = root.get("records")
     if not isinstance(raw_records, list) or not raw_records:
         raise ValueError("residual-scale table is empty")
@@ -1309,28 +1851,143 @@ def _validate_residual_scales(
         if previous_key is not None and key <= previous_key:
             raise ValueError("residual-scale records are duplicated or non-canonical")
         previous_key = key
-        scale = _finite_positive(record.get("scale"), name="residual scale")
-        raw_raw_rms = record.get("raw_rms")
-        if isinstance(raw_raw_rms, bool) or not isinstance(raw_raw_rms, (int, float)):
-            raise TypeError("residual raw_rms must be a JSON number")
-        raw_rms = float(raw_raw_rms)
-        if not math.isfinite(raw_rms) or raw_rms < 0.0:
-            raise ValueError("residual raw_rms must be finite and non-negative")
         epsilon_applied = record.get("epsilon_applied")
         if not isinstance(epsilon_applied, bool):
             raise TypeError("residual epsilon_applied must be boolean")
-        if not math.isclose(scale, max(raw_rms, epsilon), rel_tol=0.0, abs_tol=0.0):
-            raise ValueError("residual scale does not equal max(raw_rms, epsilon)")
-        if epsilon_applied != (raw_rms < epsilon):
-            raise ValueError("residual epsilon_applied flag is inconsistent")
         items = _integer(record.get("items"), name="residual scale items", minimum=1)
         valid_pixels = _integer(
-            record.get("valid_pixels"), name="residual scale valid_pixels", minimum=1
+            record.get("valid_pixels"), name="residual scale valid_pixels", minimum=0
         )
-        mass = _finite_positive(
-            record.get("importance_weight_sum"),
-            name="residual scale importance mass",
+        raw_mass = record.get("importance_weight_sum")
+        if isinstance(raw_mass, bool) or not isinstance(raw_mass, (int, float)):
+            raise TypeError("residual scale importance mass must be a JSON number")
+        mass = float(raw_mass)
+        if not math.isfinite(mass) or mass < 0.0:
+            raise ValueError("residual scale importance mass must be finite/non-negative")
+        raw_ladder = record.get("pooling_ladder")
+        if not isinstance(raw_ladder, list) or len(raw_ladder) != len(POOLING_ORDER):
+            raise ValueError("residual-scale record must contain the complete pooling ladder")
+        ladder: list[ResidualScalePoolingLevel] = []
+        expected_pooling_level: str | None = None
+        for ladder_index, raw_level in enumerate(raw_ladder):
+            level_record = _mapping(
+                raw_level, name=f"residual scale pooling level {ladder_index}"
+            )
+            _exact_keys(
+                level_record,
+                _SCALE_POOLING_LEVEL_KEYS,
+                name=f"residual scale pooling level {ladder_index}",
+            )
+            level = str(level_record.get("level", ""))
+            if level != POOLING_ORDER[ladder_index]:
+                raise ValueError("residual-scale pooling ladder order changed")
+            block_count = _integer(
+                level_record.get("block_count"),
+                name="residual scale block count",
+                minimum=0,
+            )
+            raw_ess = level_record.get("block_ess")
+            if isinstance(raw_ess, bool) or not isinstance(raw_ess, (int, float)):
+                raise TypeError("residual scale block ESS must be a JSON number")
+            block_ess = float(raw_ess)
+            if (
+                not math.isfinite(block_ess)
+                or block_ess < 0.0
+                or block_ess > block_count + block_ess_tolerance(block_count)
+            ):
+                raise ValueError("residual scale block ESS is invalid")
+            level_items = _integer(
+                level_record.get("items"),
+                name="residual scale pooling items",
+                minimum=1,
+            )
+            level_valid_pixels = _integer(
+                level_record.get("valid_pixels"),
+                name="residual scale pooling valid pixels",
+                minimum=0,
+            )
+            raw_level_mass = level_record.get("importance_weight_sum")
+            if isinstance(raw_level_mass, bool) or not isinstance(
+                raw_level_mass, (int, float)
+            ):
+                raise TypeError("residual scale pooling mass must be a JSON number")
+            level_mass = float(raw_level_mass)
+            if not math.isfinite(level_mass) or level_mass < 0.0:
+                raise ValueError("residual scale pooling mass must be finite/non-negative")
+            if (
+                (block_count == 0) != (block_ess == 0.0)
+                or (block_count == 0) != (level_mass == 0.0)
+                or (level_valid_pixels == 0) != (level_mass == 0.0)
+            ):
+                raise ValueError("residual scale block support/mass is inconsistent")
+            if (
+                expected_pooling_level is None
+                and block_count >= minimum_blocks
+                and block_ess >= minimum_ess
+            ):
+                expected_pooling_level = level
+            ladder.append(
+                ResidualScalePoolingLevel(
+                    level=level,
+                    block_count=block_count,
+                    block_ess=block_ess,
+                    items=level_items,
+                    valid_pixels=level_valid_pixels,
+                    importance_weight_sum=level_mass,
+                )
+            )
+        if ladder[0].items != items:
+            raise ValueError("residual-scale exact-cell item count changed")
+        terminal = record.get("terminal_fallback")
+        unsupported = record.get("diffusion_scale_unsupported")
+        if not isinstance(terminal, bool) or not isinstance(unsupported, bool):
+            raise TypeError("residual-scale terminal flags must be boolean")
+        serialized_level = record.get("pooling_level")
+        if serialized_level != expected_pooling_level:
+            raise ValueError("residual-scale pooling decision disagrees with support")
+        expected_terminal = expected_pooling_level is None
+        if terminal != expected_terminal or unsupported != expected_terminal:
+            raise ValueError("residual-scale terminal/unsupported flags are inconsistent")
+        selected_audit = ladder[-1] if expected_terminal else next(
+            item for item in ladder if item.level == expected_pooling_level
         )
+        if (
+            valid_pixels != selected_audit.valid_pixels
+            or not math.isclose(
+                mass,
+                selected_audit.importance_weight_sum,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+        ):
+            raise ValueError("residual-scale selected pooling evidence changed")
+        if expected_terminal:
+            if (
+                record.get("scale") is not None
+                or record.get("raw_rms") is not None
+                or epsilon_applied
+            ):
+                raise ValueError(
+                    "diffusion_scale_unsupported must not substitute an identity/global scale"
+                )
+            scale: float | None = None
+            raw_rms: float | None = None
+        else:
+            scale = _finite_positive(record.get("scale"), name="residual scale")
+            raw_raw_rms = record.get("raw_rms")
+            if isinstance(raw_raw_rms, bool) or not isinstance(
+                raw_raw_rms, (int, float)
+            ):
+                raise TypeError("residual raw_rms must be a JSON number")
+            raw_rms = float(raw_raw_rms)
+            if not math.isfinite(raw_rms) or raw_rms < 0.0:
+                raise ValueError("residual raw_rms must be finite and non-negative")
+            if not math.isclose(
+                scale, max(raw_rms, epsilon), rel_tol=0.0, abs_tol=0.0
+            ):
+                raise ValueError("residual scale does not equal max(raw_rms, epsilon)")
+            if epsilon_applied != (raw_rms < epsilon):
+                raise ValueError("residual epsilon_applied flag is inconsistent")
         parsed.append(
             ResidualScaleRecord(
                 lead_hours=lead,
@@ -1341,6 +1998,10 @@ def _validate_residual_scales(
                 items=items,
                 valid_pixels=valid_pixels,
                 importance_weight_sum=mass,
+                pooling_level=expected_pooling_level,
+                pooling_ladder=tuple(ladder),
+                terminal_fallback=terminal,
+                diffusion_scale_unsupported=unsupported,
             )
         )
     actual_items = {(item.lead_hours, item.condition_signature): item.items for item in parsed}
@@ -1376,6 +2037,12 @@ def load_stage3_artifacts(inputs: Stage3ArtifactInputs) -> Stage3ArtifactBundle:
         expected_sha256=str(stage2["residual_scales_sha256"]),
         expected_oof_sha256=oof_hash,
         expected_fold_set_sha256=fold_set_hash,
+        expected_minimum_independent_blocks=(
+            inputs.expected_residual_scale_minimum_independent_blocks
+        ),
+        expected_minimum_block_ess=(
+            inputs.expected_residual_scale_minimum_block_ess
+        ),
         rows=rows,
     )
     deployment = next(record for record in checkpoints if record.role == "deployment")
@@ -1480,7 +2147,13 @@ def build_stage3_distributed_plan(
     per_rank_microbatch_size: int,
     gradient_accumulation_steps: int,
 ) -> Stage3DistributedPlan:
-    """Shard every original draw once into two accumulation-aligned ranks."""
+    """Shard each diffusion-supported draw into accumulation-aligned ranks.
+
+    Draws whose exact scale cell exhausted the documented pooling ladder stay
+    in the verified bundle/OOF audit but are deliberately absent from diffusion
+    optimization.  Operational inference must route those cells to the
+    regression-only path.
+    """
 
     if not isinstance(bundle, Stage3ArtifactBundle):
         raise TypeError("bundle must be a verified Stage3ArtifactBundle")
@@ -1495,15 +2168,20 @@ def build_stage3_distributed_plan(
     rows = bundle.rows
     if any(row.global_example_index != index for index, row in enumerate(rows)):
         raise ValueError("verified draw rows lost canonical ordering")
+    supported_indices = bundle.diffusion_supported_row_indices
+    if not supported_indices:
+        raise ValueError(
+            "no diffusion-supported residual-scale cells remain for Stage 3 training"
+        )
     width = world_size * per_rank_microbatch_size * gradient_accumulation_steps
-    padded_length = ((len(rows) + width - 1) // width) * width
+    padded_length = ((len(supported_indices) + width - 1) // width) * width
     flat = [
-        Stage3DrawSlot(logical_position=index, row_index=index)
-        for index in range(len(rows))
+        Stage3DrawSlot(logical_position=position, row_index=row_index)
+        for position, row_index in enumerate(supported_indices)
     ]
     flat.extend(
         Stage3DrawSlot(logical_position=index, row_index=None)
-        for index in range(len(rows), padded_length)
+        for index in range(len(supported_indices), padded_length)
     )
     rank_slots: list[tuple[Stage3DrawSlot, ...]] = []
     for rank in range(world_size):
@@ -1523,22 +2201,22 @@ def build_stage3_distributed_plan(
         for slot in local
         if slot.row_index is not None
     ]
-    if sorted(actual) != list(range(len(rows))) or len(actual) != len(set(actual)):
+    if sorted(actual) != sorted(supported_indices) or len(actual) != len(set(actual)):
         raise AssertionError("Stage 3 plan duplicated or dropped a draw position")
     payload = {
         "artifact_identity_sha256": bundle.provenance.semantic_sha256,
         "source_global_example_indices": [
-            row.global_example_index for row in rows
+            rows[index].global_example_index for index in supported_indices
         ],
         "world_size": world_size,
         "per_rank_microbatch_size": per_rank_microbatch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
-        "padding_slots": padded_length - len(rows),
+        "padding_slots": padded_length - len(supported_indices),
     }
     return Stage3DistributedPlan(
         artifact_identity_sha256=bundle.provenance.semantic_sha256,
         source_global_example_indices=tuple(
-            row.global_example_index for row in rows
+            rows[index].global_example_index for index in supported_indices
         ),
         world_size=world_size,
         per_rank_microbatch_size=per_rank_microbatch_size,
@@ -1986,6 +2664,7 @@ class Stage3ModelConditions:
             probability_wet=self.occurrence_probability_oof,
             e_cond=deployment.e_cond,
             geometry=self.regression.geometry,
+            sample_ids=self.regression.provenance.sample_ids,
             condition_signatures=self.condition_signatures,
             lead_indices=self.lead_indices,
         )
@@ -2309,8 +2988,10 @@ __all__ = [
     "PROTOCOL_VERSION",
     "STAGE2_TARGET_BUILDER_VERSION",
     "STAGE3_DATA_FORMAT",
+    "DiffusionScaleUnsupportedError",
     "LazyOOFFieldReader",
     "ResidualScaleRecord",
+    "ResidualScalePoolingLevel",
     "Stage2FactoryTargetLoader",
     "Stage2FactoryTargetLoaderFactory",
     "Stage3ArtifactBundle",

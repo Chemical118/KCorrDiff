@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 namespace=ws-md93se6gk3270
 pod=kcorrdiff-stage2-fold-source-publisher
-snapshot=stage2-folds-porsche-v2
+snapshot=stage2-folds-porsche-v3
 temporary="/workspace/code/.${snapshot}.incomplete"
 destination="/workspace/code/${snapshot}"
 run_root="/workspace/runs/${snapshot}"

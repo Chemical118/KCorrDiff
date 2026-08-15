@@ -21,6 +21,7 @@ from .common import (
     count_parameters,
     require_float32_tensor,
     require_no_autocast,
+    sample_repeated_stride2_lattice,
     validate_widths,
 )
 from .condition_bank import ConditionBankCache
@@ -308,12 +309,13 @@ class RegressionUNet(nn.Module):
             raise ValueError("regression and condition-bank context widths differ")
         target = list(inputs.condition_bank.target.features.levels)
         target_with_advection: list[Tensor] = []
-        for adapter, feature in zip(self.advection_adapters, target, strict=True):
-            resized = functional.interpolate(
+        for level, (adapter, feature) in enumerate(
+            zip(self.advection_adapters, target, strict=True)
+        ):
+            resized = sample_repeated_stride2_lattice(
                 inputs.advection_features,
-                size=feature.shape[-2:],
-                mode="bilinear",
-                align_corners=True,
+                downsampling_levels=level,
+                expected_shape=tuple(feature.shape[-2:]),
             )
             confidence = resized[:, 6:7].clamp(0.0, 1.0)
             target_with_advection.append(

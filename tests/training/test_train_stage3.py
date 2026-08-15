@@ -149,6 +149,7 @@ def test_full_width_config_and_frozen_seed_contract() -> None:
     assert config.target_widths == (64, 128, 256, 384, 512)
     assert config.context_widths == (32, 64, 128, 256, 384)
     assert config.activation_checkpoint is True
+    assert config.query_chunk_size == 128
     assert config.condition_augmentation_sha256 == (
         "813d7395ac59897a7a258ed07205fff289c262b7e8df93cd2cef4deeace9c9f8"
     )
@@ -169,6 +170,108 @@ def test_full_width_config_and_frozen_seed_contract() -> None:
     assert REPEAT_TRAINING_SEEDS == (11103, 11105, 11106)
     assert COMMON_ENSEMBLE_SEED == 11104
     assert DEPLOYMENT_TRAINING_SEED == 11103
+
+
+def test_stage3_raw_config_is_deeply_immutable_and_hash_bound() -> None:
+    config = load_stage3_config(CONFIG_PATH)
+    config_sha256 = config.sha256
+
+    with pytest.raises(TypeError):
+        config.raw["data"]["draw_manifest"] = "/tmp/unhashed-draw.jsonl"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        config.raw["model"]["candidates"][0]["name"] = "unhashed-arm"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        config.raw["data"]["condition_signatures"][0] = "unhashed-signature"  # type: ignore[index]
+
+    assert config.sha256 == config_sha256
+    assert config.raw["data"]["draw_manifest"] != "/tmp/unhashed-draw.jsonl"  # type: ignore[index]
+
+
+def test_stage3_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
+    source = CONFIG_PATH.read_text(encoding="utf-8")
+    duplicated = source.replace("seed: 11103", "seed: 99999\nseed: 11103", 1)
+    path = tmp_path / "duplicate-seed.yaml"
+    path.write_text(duplicated, encoding="utf-8")
+
+    with pytest.raises(yaml.constructor.ConstructorError, match="duplicate key 'seed'"):
+        load_stage3_config(path)
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "stage2_contract",
+        "model",
+        "sampling_profiles",
+        "model_selection",
+        "calibration",
+        "inference",
+        "publication",
+    ),
+)
+def test_stage3_rejects_unknown_keys_in_hashed_contract_sections(
+    tmp_path: Path, section: str
+) -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw[section]["unimplemented_contract_option"] = True
+    path = tmp_path / f"invalid-{section}.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema mismatch"):
+        load_stage3_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "match"),
+    (
+        ("model", "physical_attention_heads", 4, "frozen architecture"),
+        ("model", "state_channels", True, "frozen architecture"),
+        ("sampling_profiles", "solver", "euler", "sampler contract"),
+        (
+            "model_selection",
+            "sampler_bias_d_candidates",
+            ["disabled"],
+            "model-selection governance",
+        ),
+        ("inference", "ensemble_median", "interpolated", "inference contract"),
+        ("inference", "inverse_transform_a0_mm", True, "inference contract"),
+        (
+            "publication",
+            "require_stage2_hash_lineage",
+            False,
+            "publication requirement",
+        ),
+    ),
+)
+def test_stage3_rejects_changed_fixed_hashed_contract_values(
+    tmp_path: Path,
+    section: str,
+    key: str,
+    value: object,
+    match: str,
+) -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw[section][key] = value
+    path = tmp_path / f"changed-{section}-{key}.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        load_stage3_config(path)
+
+
+def test_stage3_rejects_changed_candidate_architecture(tmp_path: Path) -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["model"]["candidates"][0]["static_and_advection_conditions"] = False
+    path = tmp_path / "changed-candidate.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="candidate architecture"):
+        load_stage3_config(path)
+
+
+def test_stage3_allows_only_runtime_wired_architecture_tuning(tmp_path: Path) -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["model"]["physical_attention_query_chunk_size"] = 64
+    path = tmp_path / "query-chunk.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    assert load_stage3_config(path).query_chunk_size == 64
 
 
 def test_stage3_rejects_non_power_of_two_batch_choice(tmp_path: Path) -> None:
@@ -763,6 +866,7 @@ def test_final_decision_requires_all_three_seeds_and_edm_b_dispersion_gate(
         "d_enabled": False,
         "probability_mapping_family": "monotone_logit_linear",
         "pooling_order": [
+            "full_cell",
             "lead_provider_era_present",
             "lead_provider",
             "lead_only",

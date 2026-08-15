@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+from numbers import Integral, Real
 import os
 from pathlib import Path
 import re
@@ -45,6 +46,9 @@ from kcorrdiff.training.calibration import (
     fit_location_total_scale,
     fit_monotone_logit_linear_probability,
     fit_sampler_bias_and_spread,
+    identity_location_total_scale,
+    identity_monotone_logit_linear_probability,
+    identity_sampler_bias_and_spread,
     independent_block_support,
     monotone_logit_linear_probability,
     select_pooling_level,
@@ -55,7 +59,7 @@ from kcorrdiff.training.edm_sampling import (
 )
 
 
-CALIBRATION_ARTIFACT_FORMAT = "kcorrdiff.calibration.v1"
+CALIBRATION_ARTIFACT_FORMAT = "kcorrdiff.calibration.v2"
 MONOTONE_LOGIT_LINEAR_FAMILY = "monotone_logit_linear"
 OFFICIAL_LEADS_HOURS = tuple(index / 2.0 for index in range(1, 13))
 OFFICIAL_ENSEMBLE_THRESHOLDS_MM = (A_WET_MM, 1.0, 5.0)
@@ -72,7 +76,7 @@ def _require_sha256(value: str, *, name: str) -> str:
 
 
 def _lead(value: float) -> float:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError("lead_hours must be a real scalar")
     result = float(value)
     if result not in OFFICIAL_LEADS_HOURS:
@@ -112,14 +116,18 @@ def _sampler_core_dict(value: SamplerCoreSignature) -> dict[str, object]:
 
 def _sampler_core_from_dict(raw: Mapping[str, object]) -> SamplerCoreSignature:
     return SamplerCoreSignature(
-        checkpoint_id=str(raw["checkpoint_id"]),
-        checkpoint_kind=str(raw["checkpoint_kind"]),  # type: ignore[arg-type]
-        edm_steps=int(raw["edm_steps"]),
-        solver=str(raw["solver"]),  # type: ignore[arg-type]
-        sigma_schedule=str(raw["sigma_schedule"]),  # type: ignore[arg-type]
-        sigma_min=float(raw["sigma_min"]),
-        sigma_max=float(raw["sigma_max"]),
-        rho=float(raw["rho"]),
+        checkpoint_id=_json_string(raw["checkpoint_id"], name="checkpoint_id"),
+        checkpoint_kind=_json_string(  # type: ignore[arg-type]
+            raw["checkpoint_kind"], name="checkpoint_kind"
+        ),
+        edm_steps=_json_int(raw["edm_steps"], name="edm_steps"),
+        solver=_json_string(raw["solver"], name="solver"),  # type: ignore[arg-type]
+        sigma_schedule=_json_string(  # type: ignore[arg-type]
+            raw["sigma_schedule"], name="sigma_schedule"
+        ),
+        sigma_min=_json_real(raw["sigma_min"], name="sigma_min"),
+        sigma_max=_json_real(raw["sigma_max"], name="sigma_max"),
+        rho=_json_real(raw["rho"], name="rho"),
     )
 
 
@@ -133,7 +141,7 @@ def _ensemble_dict(value: EnsembleSignature) -> dict[str, object]:
 def _ensemble_from_dict(raw: Mapping[str, object]) -> EnsembleSignature:
     return EnsembleSignature(
         sampler_core=_sampler_core_from_dict(_as_mapping(raw["sampler_core"])),
-        member_count=int(raw["member_count"]),
+        member_count=_json_int(raw["member_count"], name="member_count"),
     )
 
 
@@ -147,6 +155,46 @@ def _as_list(value: object, *, name: str) -> list[object]:
     if not isinstance(value, list):
         raise TypeError(f"{name} must be a JSON list")
     return value
+
+
+def _json_string(value: object, *, name: str) -> str:
+    """Parse a JSON string without accepting coercible aliases."""
+
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    return value
+
+
+def _json_real(value: object, *, name: str) -> float:
+    """Parse a JSON number while excluding booleans and string aliases."""
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _json_int(value: object, *, name: str) -> int:
+    """Parse a JSON integer while excluding booleans and numeric strings."""
+
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer")
+    return int(value)
+
+
+def _json_bool(value: object, *, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be boolean")
+    return value
+
+
+def _json_string_list(value: object, *, name: str) -> tuple[str, ...]:
+    return tuple(
+        _json_string(item, name=f"{name} item")
+        for item in _as_list(value, name=name)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,13 +230,19 @@ class FrozenModelSelectionDecision:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "FrozenModelSelectionDecision":
         return cls(
-            decision_sha256=str(raw["decision_sha256"]),
-            architecture_sha256=str(raw["architecture_sha256"]),
-            d_enabled=raw["d_enabled"],  # type: ignore[arg-type]
-            probability_mapping_family=str(raw["probability_mapping_family"]),
-            pooling_order=tuple(
-                str(value)
-                for value in _as_list(raw["pooling_order"], name="pooling_order")
+            decision_sha256=_json_string(
+                raw["decision_sha256"], name="decision_sha256"
+            ),
+            architecture_sha256=_json_string(
+                raw["architecture_sha256"], name="architecture_sha256"
+            ),
+            d_enabled=_json_bool(raw["d_enabled"], name="d_enabled"),
+            probability_mapping_family=_json_string(
+                raw["probability_mapping_family"],
+                name="probability_mapping_family",
+            ),
+            pooling_order=_json_string_list(
+                raw["pooling_order"], name="pooling_order"
             ),
         )
 
@@ -225,7 +279,17 @@ class CalibrationProvenance:
     def from_mapping(cls, raw: Mapping[str, str]) -> "CalibrationProvenance":
         if not isinstance(raw, Mapping):
             raise TypeError("provenance_hashes must be a mapping")
-        return cls(tuple(sorted((str(name), value) for name, value in raw.items())))
+        return cls(
+            tuple(
+                sorted(
+                    (
+                        _json_string(name, name="provenance name"),
+                        _json_string(value, name="provenance digest"),
+                    )
+                    for name, value in raw.items()
+                )
+            )
+        )
 
     @property
     def mapping(self) -> Mapping[str, str]:
@@ -281,15 +345,16 @@ class LocationScaleKey:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "LocationScaleKey":
         return cls(
-            lead_hours=float(raw["lead_hours"]),
-            condition_signature=str(raw["condition_signature"]),
-            fold_checkpoint_sha256s=tuple(
-                str(value)
-                for value in _as_list(
-                    raw["fold_checkpoint_sha256s"], name="fold_checkpoint_sha256s"
-                )
+            lead_hours=_json_real(raw["lead_hours"], name="lead_hours"),
+            condition_signature=_json_string(
+                raw["condition_signature"], name="condition_signature"
             ),
-            full_checkpoint_sha256=str(raw["full_checkpoint_sha256"]),
+            fold_checkpoint_sha256s=_json_string_list(
+                raw["fold_checkpoint_sha256s"], name="fold_checkpoint_sha256s"
+            ),
+            full_checkpoint_sha256=_json_string(
+                raw["full_checkpoint_sha256"], name="full_checkpoint_sha256"
+            ),
         )
 
 
@@ -323,8 +388,10 @@ class SamplerBiasKey:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "SamplerBiasKey":
         return cls(
-            lead_hours=float(raw["lead_hours"]),
-            condition_signature=str(raw["condition_signature"]),
+            lead_hours=_json_real(raw["lead_hours"], name="lead_hours"),
+            condition_signature=_json_string(
+                raw["condition_signature"], name="condition_signature"
+            ),
             sampler_core=_sampler_core_from_dict(_as_mapping(raw["sampler_core"])),
         )
 
@@ -359,8 +426,10 @@ class SpreadKey:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "SpreadKey":
         return cls(
-            lead_hours=float(raw["lead_hours"]),
-            condition_signature=str(raw["condition_signature"]),
+            lead_hours=_json_real(raw["lead_hours"], name="lead_hours"),
+            condition_signature=_json_string(
+                raw["condition_signature"], name="condition_signature"
+            ),
             ensemble_signature=_ensemble_from_dict(
                 _as_mapping(raw["ensemble_signature"])
             ),
@@ -381,6 +450,10 @@ class RegressionProbabilityKey:
         object.__setattr__(
             self, "condition_signature", _condition(self.condition_signature)
         )
+        if isinstance(self.threshold_mm, bool) or not isinstance(
+            self.threshold_mm, Real
+        ):
+            raise TypeError("regression probability threshold must be a real scalar")
         threshold = float(self.threshold_mm)
         if threshold != A_WET_MM:
             raise ValueError("regression p_cal threshold must be exactly A_wet")
@@ -404,10 +477,15 @@ class RegressionProbabilityKey:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "RegressionProbabilityKey":
         return cls(
-            lead_hours=float(raw["lead_hours"]),
-            threshold_mm=float(raw["threshold_mm"]),
-            condition_signature=str(raw["condition_signature"]),
-            regression_checkpoint_sha256=str(raw["regression_checkpoint_sha256"]),
+            lead_hours=_json_real(raw["lead_hours"], name="lead_hours"),
+            threshold_mm=_json_real(raw["threshold_mm"], name="threshold_mm"),
+            condition_signature=_json_string(
+                raw["condition_signature"], name="condition_signature"
+            ),
+            regression_checkpoint_sha256=_json_string(
+                raw["regression_checkpoint_sha256"],
+                name="regression_checkpoint_sha256",
+            ),
         )
 
 
@@ -425,6 +503,10 @@ class EnsembleProbabilityKey:
         object.__setattr__(
             self, "condition_signature", _condition(self.condition_signature)
         )
+        if isinstance(self.threshold_mm, bool) or not isinstance(
+            self.threshold_mm, Real
+        ):
+            raise TypeError("ensemble probability threshold must be a real scalar")
         threshold = float(self.threshold_mm)
         if not math.isfinite(threshold) or threshold <= 0.0:
             raise ValueError("ensemble probability threshold must be finite and positive")
@@ -449,9 +531,11 @@ class EnsembleProbabilityKey:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "EnsembleProbabilityKey":
         return cls(
-            lead_hours=float(raw["lead_hours"]),
-            threshold_mm=float(raw["threshold_mm"]),
-            condition_signature=str(raw["condition_signature"]),
+            lead_hours=_json_real(raw["lead_hours"], name="lead_hours"),
+            threshold_mm=_json_real(raw["threshold_mm"], name="threshold_mm"),
+            condition_signature=_json_string(
+                raw["condition_signature"], name="condition_signature"
+            ),
             ensemble_signature=_ensemble_from_dict(
                 _as_mapping(raw["ensemble_signature"])
             ),
@@ -465,6 +549,7 @@ class PoolingEvidence:
     block_id: Sequence[str]
     weight: ArrayLike
     observation: ArrayLike | None = None
+    row_id: Sequence[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +565,8 @@ class PoolingLevelAudit:
         if (
             isinstance(self.record_count, bool)
             or isinstance(self.positive_weight_record_count, bool)
+            or not isinstance(self.record_count, Integral)
+            or not isinstance(self.positive_weight_record_count, Integral)
             or self.record_count < 0
             or self.positive_weight_record_count < 0
             or self.positive_weight_record_count > self.record_count
@@ -502,14 +589,23 @@ class PoolingLevelAudit:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "PoolingLevelAudit":
         return cls(
-            level=str(raw["level"]),
-            record_count=int(raw["record_count"]),
-            positive_weight_record_count=int(raw["positive_weight_record_count"]),
+            level=_json_string(raw["level"], name="pooling level"),
+            record_count=_json_int(raw["record_count"], name="record_count"),
+            positive_weight_record_count=_json_int(
+                raw["positive_weight_record_count"],
+                name="positive_weight_record_count",
+            ),
             support=IndependentBlockSupport(
-                block_count=int(raw["block_count"]),
-                block_ess=float(raw["block_ess"]),
-                positive_support_blocks=int(raw["positive_support_blocks"]),
-                negative_support_blocks=int(raw["negative_support_blocks"]),
+                block_count=_json_int(raw["block_count"], name="block_count"),
+                block_ess=_json_real(raw["block_ess"], name="block_ess"),
+                positive_support_blocks=_json_int(
+                    raw["positive_support_blocks"],
+                    name="positive_support_blocks",
+                ),
+                negative_support_blocks=_json_int(
+                    raw["negative_support_blocks"],
+                    name="negative_support_blocks",
+                ),
             ),
         )
 
@@ -520,26 +616,41 @@ class PoolingAudit:
 
     probability_gate: bool
     ladder: tuple[PoolingLevelAudit, ...]
-    decision: PoolingDecision
+    decision: PoolingDecision | None
+    terminal_fallback: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ladder", tuple(self.ladder))
         if not isinstance(self.probability_gate, bool):
             raise TypeError("probability_gate must be boolean")
+        if not isinstance(self.terminal_fallback, bool):
+            raise TypeError("terminal_fallback must be boolean")
         if tuple(item.level for item in self.ladder) != POOLING_ORDER:
             raise ValueError("pooling audit must record every level in declared order")
-        expected = select_pooling_level(
-            {item.level: item.support for item in self.ladder},
-            probability_gate=self.probability_gate,
-        )
-        if self.decision != expected:
+        try:
+            expected: PoolingDecision | None = select_pooling_level(
+                {item.level: item.support for item in self.ladder},
+                probability_gate=self.probability_gate,
+            )
+        except ValueError as error:
+            if "no predeclared calibration pooling level" not in str(error):
+                raise
+            expected = None
+        if expected is None:
+            if self.decision is not None or not self.terminal_fallback:
+                raise ValueError(
+                    "failed lead-only support must be an explicit terminal fallback"
+                )
+        elif self.decision != expected or self.terminal_fallback:
             raise ValueError("pooling decision is not the deterministic first-passing level")
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "decision_level": self.decision.level,
+            "decision_level": None if self.decision is None else self.decision.level,
             "ladder": [item.to_dict() for item in self.ladder],
             "probability_gate": self.probability_gate,
+            "terminal_fallback": self.terminal_fallback,
+            "uncalibrated": self.terminal_fallback,
         }
 
     @classmethod
@@ -551,21 +662,47 @@ class PoolingAudit:
         probability_gate = raw["probability_gate"]
         if not isinstance(probability_gate, bool):
             raise TypeError("probability_gate must be boolean")
-        decision = select_pooling_level(
-            {item.level: item.support for item in ladder},
-            probability_gate=probability_gate,
-        )
-        if str(raw["decision_level"]) != decision.level:
+        terminal_fallback = raw["terminal_fallback"]
+        uncalibrated = raw["uncalibrated"]
+        if not isinstance(terminal_fallback, bool) or not isinstance(uncalibrated, bool):
+            raise TypeError("terminal fallback flags must be boolean")
+        if uncalibrated != terminal_fallback:
+            raise ValueError("uncalibrated and terminal_fallback flags must agree")
+        try:
+            decision: PoolingDecision | None = select_pooling_level(
+                {item.level: item.support for item in ladder},
+                probability_gate=probability_gate,
+            )
+        except ValueError as error:
+            if "no predeclared calibration pooling level" not in str(error):
+                raise
+            decision = None
+        serialized_level = raw["decision_level"]
+        if serialized_level != (None if decision is None else decision.level):
             raise ValueError("serialized pooling decision does not match support")
-        return cls(probability_gate, ladder, decision)
+        return cls(
+            probability_gate,
+            ladder,
+            decision,
+            terminal_fallback=terminal_fallback,
+        )
 
 
 def build_pooling_audit(
     evidence_by_level: Mapping[str, PoolingEvidence],
     *,
     probability_gate: bool,
+    fit_row_id: Sequence[str],
+    fit_weight: ArrayLike,
+    fit_observation: ArrayLike | None = None,
 ) -> PoolingAudit:
-    """Compute all ladder counts/support in fixed order, then select once."""
+    """Compute the full ladder and bind its selected evidence to fit inputs.
+
+    Pooling levels may contain different row sets because each fallback widens
+    the cell.  The selected level (or ``lead_only`` on terminal failure) must
+    therefore carry the exact ordered row IDs, weights, and probability labels
+    used by the corresponding fit/identity record.
+    """
 
     if not isinstance(probability_gate, bool):
         raise TypeError("probability_gate must be boolean")
@@ -583,6 +720,12 @@ def build_pooling_audit(
         weights = np.asarray(evidence.weight, dtype=np.float64).reshape(-1)
         if len(evidence.block_id) != weights.size:
             raise ValueError("pooling block IDs and weights must share length")
+        if evidence.row_id is None or len(evidence.row_id) != weights.size:
+            raise ValueError("one pooling row_id is required per evidence weight")
+        if any(not isinstance(value, str) or not value for value in evidence.row_id):
+            raise ValueError("pooling row IDs must be non-empty strings")
+        if len(set(evidence.row_id)) != len(evidence.row_id):
+            raise ValueError("pooling row IDs must be unique within a level")
         observation = evidence.observation
         if probability_gate and observation is None:
             raise ValueError("probability pooling requires binary observations")
@@ -602,10 +745,51 @@ def build_pooling_audit(
             )
         )
     support_by_level = {item.level: item.support for item in ladder}
-    decision = select_pooling_level(
-        support_by_level, probability_gate=probability_gate
+    try:
+        decision: PoolingDecision | None = select_pooling_level(
+            support_by_level, probability_gate=probability_gate
+        )
+    except ValueError as error:
+        if "no predeclared calibration pooling level" not in str(error):
+            raise
+        decision = None
+    bound_level = POOLING_ORDER[-1] if decision is None else decision.level
+    bound = evidence_by_level[bound_level]
+    actual_row_ids = tuple(fit_row_id)
+    if (
+        len(actual_row_ids) != len(set(actual_row_ids))
+        or any(not isinstance(value, str) or not value for value in actual_row_ids)
+    ):
+        raise ValueError("fit row IDs must be unique non-empty strings")
+    if tuple(bound.row_id or ()) != actual_row_ids:
+        raise ValueError("selected pooling evidence row IDs differ from fitted rows")
+    actual_weights = np.asarray(fit_weight, dtype=np.float64).reshape(-1)
+    evidence_weights = np.asarray(bound.weight, dtype=np.float64).reshape(-1)
+    if actual_weights.shape != evidence_weights.shape or not np.array_equal(
+        actual_weights, evidence_weights
+    ):
+        raise ValueError("selected pooling evidence weights differ from fitted weights")
+    if probability_gate:
+        if fit_observation is None or bound.observation is None:
+            raise ValueError("probability pooling must bind fitted observations")
+        actual_observations = np.asarray(fit_observation, dtype=np.float64).reshape(-1)
+        evidence_observations = np.asarray(
+            bound.observation, dtype=np.float64
+        ).reshape(-1)
+        if actual_observations.shape != evidence_observations.shape or not np.array_equal(
+            actual_observations, evidence_observations
+        ):
+            raise ValueError(
+                "selected pooling evidence observations differ from fitted observations"
+            )
+    elif fit_observation is not None:
+        raise ValueError("residual pooling must not bind outcome classes")
+    return PoolingAudit(
+        probability_gate,
+        tuple(ladder),
+        decision,
+        terminal_fallback=decision is None,
     )
-    return PoolingAudit(probability_gate, tuple(ladder), decision)
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,6 +802,11 @@ class LocationScaleRecord:
     def __post_init__(self) -> None:
         if self.pooling.probability_gate:
             raise ValueError("b/c requires residual pooling support")
+        if self.pooling.terminal_fallback and (
+            self.calibration.location_b != 0.0
+            or self.calibration.total_scale_c != 1.0
+        ):
+            raise ValueError("terminal b/c fallback must be the exact b=0,c=1 identity")
         _require_sha256(self.provenance_sha256, name="record provenance")
 
     def to_dict(self) -> dict[str, object]:
@@ -643,19 +832,32 @@ class LocationScaleRecord:
         return cls(
             key=LocationScaleKey.from_dict(_as_mapping(raw["key"])),
             calibration=LocationScaleCalibration(
-                location_b=float(params["location_b"]),
-                total_scale_c=float(params["total_scale_c"]),
-                fold_weights=tuple(
-                    float(value)
-                    for value in _as_list(params["fold_weights"], name="fold_weights")
+                location_b=_json_real(params["location_b"], name="location_b"),
+                total_scale_c=_json_real(
+                    params["total_scale_c"], name="total_scale_c"
                 ),
-                fold_mixture_mean=float(params["fold_mixture_mean"]),
-                fold_mixture_variance=float(params["fold_mixture_variance"]),
-                full_mean=float(params["full_mean"]),
-                full_variance=float(params["full_variance"]),
+                fold_weights=tuple(
+                    _json_real(value, name="fold_weights item")
+                    for value in _as_list(
+                        params["fold_weights"], name="fold_weights"
+                    )
+                ),
+                fold_mixture_mean=_json_real(
+                    params["fold_mixture_mean"], name="fold_mixture_mean"
+                ),
+                fold_mixture_variance=_json_real(
+                    params["fold_mixture_variance"],
+                    name="fold_mixture_variance",
+                ),
+                full_mean=_json_real(params["full_mean"], name="full_mean"),
+                full_variance=_json_real(
+                    params["full_variance"], name="full_variance"
+                ),
             ),
             pooling=PoolingAudit.from_dict(_as_mapping(raw["pooling"])),
-            provenance_sha256=str(raw["provenance_sha256"]),
+            provenance_sha256=_json_string(
+                raw["provenance_sha256"], name="provenance_sha256"
+            ),
         )
 
 
@@ -673,12 +875,16 @@ class SamplerBiasRecord:
         if not isinstance(self.d_enabled, bool):
             raise TypeError("d_enabled must be boolean")
         values = self.sampler_bias_d, self.bias_fraction
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
+            raise TypeError("sampler-bias record values must be real scalars")
         if not all(math.isfinite(value) for value in values) or self.bias_fraction < 0.0:
             raise ValueError("invalid sampler-bias record")
         if not self.d_enabled and self.sampler_bias_d != 0.0:
             raise ValueError("d must be zero for the disabled frozen arm")
         if self.pooling.probability_gate:
             raise ValueError("d requires residual pooling support")
+        if self.pooling.terminal_fallback and self.sampler_bias_d != 0.0:
+            raise ValueError("terminal d fallback must be the exact d=0 identity")
         _require_sha256(self.location_scale_key_sha256, name="location-scale key")
         _require_sha256(self.provenance_sha256, name="record provenance")
 
@@ -697,12 +903,19 @@ class SamplerBiasRecord:
     def from_dict(cls, raw: Mapping[str, object]) -> "SamplerBiasRecord":
         return cls(
             key=SamplerBiasKey.from_dict(_as_mapping(raw["key"])),
-            sampler_bias_d=float(raw["sampler_bias_d"]),
-            d_enabled=raw["d_enabled"],  # type: ignore[arg-type]
-            bias_fraction=float(raw["bias_fraction"]),
-            location_scale_key_sha256=str(raw["location_scale_key_sha256"]),
+            sampler_bias_d=_json_real(
+                raw["sampler_bias_d"], name="sampler_bias_d"
+            ),
+            d_enabled=_json_bool(raw["d_enabled"], name="d_enabled"),
+            bias_fraction=_json_real(raw["bias_fraction"], name="bias_fraction"),
+            location_scale_key_sha256=_json_string(
+                raw["location_scale_key_sha256"],
+                name="location_scale_key_sha256",
+            ),
             pooling=PoolingAudit.from_dict(_as_mapping(raw["pooling"])),
-            provenance_sha256=str(raw["provenance_sha256"]),
+            provenance_sha256=_json_string(
+                raw["provenance_sha256"], name="provenance_sha256"
+            ),
         )
 
 
@@ -715,10 +928,17 @@ class SpreadRecord:
     provenance_sha256: str
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.spread_gamma) or self.spread_gamma <= 0.0:
+        if (
+            isinstance(self.spread_gamma, bool)
+            or not isinstance(self.spread_gamma, Real)
+            or not math.isfinite(self.spread_gamma)
+            or self.spread_gamma <= 0.0
+        ):
             raise ValueError("spread gamma must be finite and positive")
         if self.pooling.probability_gate:
             raise ValueError("gamma requires residual pooling support")
+        if self.pooling.terminal_fallback and self.spread_gamma != 1.0:
+            raise ValueError("terminal gamma fallback must be the exact gamma=1 identity")
         _require_sha256(self.sampler_bias_key_sha256, name="sampler-bias key")
         _require_sha256(self.provenance_sha256, name="record provenance")
 
@@ -735,10 +955,15 @@ class SpreadRecord:
     def from_dict(cls, raw: Mapping[str, object]) -> "SpreadRecord":
         return cls(
             key=SpreadKey.from_dict(_as_mapping(raw["key"])),
-            spread_gamma=float(raw["spread_gamma"]),
-            sampler_bias_key_sha256=str(raw["sampler_bias_key_sha256"]),
+            spread_gamma=_json_real(raw["spread_gamma"], name="spread_gamma"),
+            sampler_bias_key_sha256=_json_string(
+                raw["sampler_bias_key_sha256"],
+                name="sampler_bias_key_sha256",
+            ),
             pooling=PoolingAudit.from_dict(_as_mapping(raw["pooling"])),
-            provenance_sha256=str(raw["provenance_sha256"]),
+            provenance_sha256=_json_string(
+                raw["provenance_sha256"], name="provenance_sha256"
+            ),
         )
 
 
@@ -768,7 +993,7 @@ class RegressionProbabilityRecord:
             RegressionProbabilityKey.from_dict(_as_mapping(raw["key"])),
             calibration,
             pooling,
-            str(raw["provenance_sha256"]),
+            _json_string(raw["provenance_sha256"], name="provenance_sha256"),
         )
 
 
@@ -795,7 +1020,7 @@ class EnsembleProbabilityRecord:
             EnsembleProbabilityKey.from_dict(_as_mapping(raw["key"])),
             calibration,
             pooling,
-            str(raw["provenance_sha256"]),
+            _json_string(raw["provenance_sha256"], name="provenance_sha256"),
         )
 
 
@@ -804,7 +1029,12 @@ def _validate_probability_record(
 ) -> None:
     if not pooling.probability_gate:
         raise ValueError("probability mapping requires probability pooling support")
-    if calibration.pooling != pooling.decision:
+    if pooling.terminal_fallback:
+        if not calibration.identity or calibration.pooling is not None:
+            raise ValueError(
+                "terminal probability fallback must be an explicit raw identity"
+            )
+    elif calibration.identity or calibration.pooling != pooling.decision:
         raise ValueError("probability fit and persisted pooling decision disagree")
 
 
@@ -819,6 +1049,7 @@ def _probability_record_dict(
         "parameters": {
             "alpha": calibration.alpha,
             "beta_raw": calibration.beta_raw,
+            "identity": calibration.identity,
             "iterations": calibration.iterations,
             "slope": calibration.slope,
             "weighted_log_loss": calibration.weighted_log_loss,
@@ -833,17 +1064,197 @@ def _probability_from_dict(
 ) -> tuple[ProbabilityCalibration, PoolingAudit]:
     params = _as_mapping(raw["parameters"])
     pooling = PoolingAudit.from_dict(_as_mapping(raw["pooling"]))
+    identity = _json_bool(params["identity"], name="probability identity")
     return (
         ProbabilityCalibration(
-            alpha=float(params["alpha"]),
-            beta_raw=float(params["beta_raw"]),
-            slope=float(params["slope"]),
-            weighted_log_loss=float(params["weighted_log_loss"]),
-            iterations=int(params["iterations"]),
-            pooling=pooling.decision,
+            alpha=_json_real(params["alpha"], name="probability alpha"),
+            beta_raw=_json_real(
+                params["beta_raw"], name="probability beta_raw"
+            ),
+            slope=_json_real(params["slope"], name="probability slope"),
+            weighted_log_loss=_json_real(
+                params["weighted_log_loss"],
+                name="probability weighted_log_loss",
+            ),
+            iterations=_json_int(
+                params["iterations"], name="probability iterations"
+            ),
+            pooling=None if identity else pooling.decision,
+            identity=identity,
         ),
         pooling,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationCoverage:
+    """Predeclared exact key universe required by a complete release.
+
+    All 12 official leads are implicit.  The selected condition signatures,
+    regression checkpoints, and ensemble signatures are explicit so optional
+    candidates that were not selected do not accidentally become mandatory.
+    The three official ``q_cal`` thresholds are always required; supported
+    auxiliary 10 mm cells must be declared individually.
+    """
+
+    condition_signatures: tuple[str, ...]
+    fold_checkpoint_sha256s: tuple[str, ...]
+    full_checkpoint_sha256: str
+    ensemble_signatures: tuple[EnsembleSignature, ...]
+    auxiliary_q10_keys: tuple[EnsembleProbabilityKey, ...] = ()
+
+    def __post_init__(self) -> None:
+        conditions = tuple(_condition(value) for value in self.condition_signatures)
+        if not conditions or conditions != tuple(sorted(conditions)):
+            raise ValueError(
+                "coverage condition signatures must be non-empty canonical order"
+            )
+        if len(set(conditions)) != len(conditions):
+            raise ValueError("coverage condition signatures must be unique")
+        object.__setattr__(self, "condition_signatures", conditions)
+
+        folds = tuple(self.fold_checkpoint_sha256s)
+        if len(folds) < 2 or len(set(folds)) != len(folds):
+            raise ValueError("coverage requires at least two unique fold checkpoints")
+        for index, value in enumerate(folds):
+            _require_sha256(value, name=f"coverage fold checkpoint {index}")
+        object.__setattr__(self, "fold_checkpoint_sha256s", folds)
+        _require_sha256(self.full_checkpoint_sha256, name="coverage full checkpoint")
+
+        ensembles = tuple(self.ensemble_signatures)
+        if not ensembles or any(
+            not isinstance(value, EnsembleSignature) for value in ensembles
+        ):
+            raise ValueError("coverage requires at least one exact ensemble signature")
+        ensemble_digests = tuple(
+            _semantic_sha256(_ensemble_dict(value)) for value in ensembles
+        )
+        if ensemble_digests != tuple(sorted(ensemble_digests)) or len(
+            set(ensemble_digests)
+        ) != len(ensemble_digests):
+            raise ValueError(
+                "coverage ensemble signatures must have unique canonical hash order"
+            )
+        object.__setattr__(self, "ensemble_signatures", ensembles)
+
+        auxiliary = tuple(self.auxiliary_q10_keys)
+        auxiliary_digests = tuple(value.semantic_sha256 for value in auxiliary)
+        if auxiliary_digests != tuple(sorted(auxiliary_digests)) or len(
+            set(auxiliary_digests)
+        ) != len(auxiliary_digests):
+            raise ValueError("auxiliary q10 keys must have unique canonical hash order")
+        allowed_ensembles = set(ensemble_digests)
+        for key in auxiliary:
+            if key.threshold_mm != 10.0:
+                raise ValueError("auxiliary coverage may declare only 10 mm q_cal keys")
+            if key.condition_signature not in conditions:
+                raise ValueError("auxiliary q10 condition is outside coverage")
+            if _semantic_sha256(_ensemble_dict(key.ensemble_signature)) not in (
+                allowed_ensembles
+            ):
+                raise ValueError("auxiliary q10 ensemble is outside coverage")
+        object.__setattr__(self, "auxiliary_q10_keys", auxiliary)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "auxiliary_q10_keys": [key.to_dict() for key in self.auxiliary_q10_keys],
+            "condition_signatures": list(self.condition_signatures),
+            "ensemble_signatures": [
+                _ensemble_dict(value) for value in self.ensemble_signatures
+            ],
+            "fold_checkpoint_sha256s": list(self.fold_checkpoint_sha256s),
+            "full_checkpoint_sha256": self.full_checkpoint_sha256,
+        }
+
+    @property
+    def semantic_sha256(self) -> str:
+        return _semantic_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> "CalibrationCoverage":
+        return cls(
+            condition_signatures=_json_string_list(
+                raw["condition_signatures"],
+                name="coverage condition_signatures",
+            ),
+            fold_checkpoint_sha256s=_json_string_list(
+                raw["fold_checkpoint_sha256s"],
+                name="coverage fold_checkpoint_sha256s",
+            ),
+            full_checkpoint_sha256=_json_string(
+                raw["full_checkpoint_sha256"],
+                name="coverage full_checkpoint_sha256",
+            ),
+            ensemble_signatures=tuple(
+                _ensemble_from_dict(_as_mapping(value))
+                for value in _as_list(
+                    raw["ensemble_signatures"], name="coverage ensemble_signatures"
+                )
+            ),
+            auxiliary_q10_keys=tuple(
+                EnsembleProbabilityKey.from_dict(_as_mapping(value))
+                for value in _as_list(
+                    raw["auxiliary_q10_keys"], name="coverage auxiliary_q10_keys"
+                )
+            ),
+        )
+
+    def required_location_scale_keys(self) -> tuple[LocationScaleKey, ...]:
+        return tuple(
+            LocationScaleKey(
+                lead,
+                condition,
+                self.fold_checkpoint_sha256s,
+                self.full_checkpoint_sha256,
+            )
+            for lead in OFFICIAL_LEADS_HOURS
+            for condition in self.condition_signatures
+        )
+
+    def required_sampler_bias_keys(self) -> tuple[SamplerBiasKey, ...]:
+        cores: dict[tuple[object, ...], SamplerCoreSignature] = {}
+        for ensemble in self.ensemble_signatures:
+            cores[ensemble.sampler_core.canonical] = ensemble.sampler_core
+        return tuple(
+            SamplerBiasKey(lead, condition, core)
+            for lead in OFFICIAL_LEADS_HOURS
+            for condition in self.condition_signatures
+            for _canonical, core in sorted(cores.items(), key=lambda item: repr(item[0]))
+        )
+
+    def required_spread_keys(self) -> tuple[SpreadKey, ...]:
+        return tuple(
+            SpreadKey(lead, condition, ensemble)
+            for lead in OFFICIAL_LEADS_HOURS
+            for condition in self.condition_signatures
+            for ensemble in self.ensemble_signatures
+        )
+
+    def required_regression_probability_keys(
+        self,
+    ) -> tuple[RegressionProbabilityKey, ...]:
+        return tuple(
+            RegressionProbabilityKey(
+                lead,
+                A_WET_MM,
+                condition,
+                self.full_checkpoint_sha256,
+            )
+            for lead in OFFICIAL_LEADS_HOURS
+            for condition in self.condition_signatures
+        )
+
+    def required_ensemble_probability_keys(
+        self,
+    ) -> tuple[EnsembleProbabilityKey, ...]:
+        official = tuple(
+            EnsembleProbabilityKey(lead, threshold, condition, ensemble)
+            for lead in OFFICIAL_LEADS_HOURS
+            for condition in self.condition_signatures
+            for ensemble in self.ensemble_signatures
+            for threshold in OFFICIAL_ENSEMBLE_THRESHOLDS_MM
+        )
+        return official + self.auxiliary_q10_keys
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,6 +1265,7 @@ class CalibrationArtifact:
     release_status: ReleaseStatus
     model_selection: FrozenModelSelectionDecision
     provenance: CalibrationProvenance
+    coverage: CalibrationCoverage | None = None
     location_scale: tuple[LocationScaleRecord, ...] = ()
     sampler_bias: tuple[SamplerBiasRecord, ...] = ()
     spread: tuple[SpreadRecord, ...] = ()
@@ -878,6 +1290,10 @@ class CalibrationArtifact:
             raise TypeError("model_selection must be frozen before calibration")
         if not isinstance(self.provenance, CalibrationProvenance):
             raise TypeError("provenance must be CalibrationProvenance")
+        if self.coverage is not None and not isinstance(
+            self.coverage, CalibrationCoverage
+        ):
+            raise TypeError("coverage must be CalibrationCoverage")
         if not isinstance(self.calibration_absent_identity, bool):
             raise TypeError("calibration_absent_identity must be boolean")
         expected_provenance = self.provenance.semantic_sha256
@@ -891,6 +1307,12 @@ class CalibrationArtifact:
             raise ValueError("provenance does not bind the frozen decision hash")
         if architecture_hash != self.model_selection.architecture_sha256:
             raise ValueError("provenance does not bind the selected architecture hash")
+        coverage_hash = self.provenance.mapping.get("calibration_coverage_sha256")
+        if self.coverage is None:
+            if coverage_hash is not None:
+                raise ValueError("provenance declares calibration coverage without a contract")
+        elif coverage_hash != self.coverage.semantic_sha256:
+            raise ValueError("provenance does not bind the calibration coverage contract")
         groups: tuple[tuple[object, ...], ...] = (
             self.location_scale,
             self.sampler_bias,
@@ -910,6 +1332,36 @@ class CalibrationArtifact:
             raise ValueError(
                 "an empty development artifact must explicitly declare absent-calibration identity"
             )
+        if self.release_status == "complete":
+            if self.coverage is None:
+                raise ValueError("a complete release requires an exact coverage contract")
+            expected_groups: tuple[tuple[object, ...], ...] = (
+                self.coverage.required_location_scale_keys(),
+                self.coverage.required_sampler_bias_keys(),
+                self.coverage.required_spread_keys(),
+                self.coverage.required_regression_probability_keys(),
+                self.coverage.required_ensemble_probability_keys(),
+            )
+            names = ("b/c", "d", "gamma", "p_cal", "q_cal")
+            for name, records, expected_keys in zip(names, groups, expected_groups):
+                actual = {record.key.semantic_sha256 for record in records}  # type: ignore[attr-defined]
+                expected = {key.semantic_sha256 for key in expected_keys}  # type: ignore[attr-defined]
+                if actual != expected:
+                    raise ValueError(
+                        f"complete calibration {name} coverage mismatch; "
+                        f"missing={len(expected - actual)}, extras={len(actual - expected)}"
+                    )
+            auxiliary = {
+                key.semantic_sha256 for key in self.coverage.auxiliary_q10_keys
+            }
+            for record in self.ensemble_probability:
+                if (
+                    record.key.semantic_sha256 in auxiliary
+                    and record.pooling.terminal_fallback
+                ):
+                    raise ValueError(
+                        "auxiliary 10 mm q_cal may be published only with passing support"
+                    )
         for records in groups:
             digests = tuple(record.key.semantic_sha256 for record in records)  # type: ignore[attr-defined]
             if digests != tuple(sorted(digests)) or len(set(digests)) != len(digests):
@@ -952,6 +1404,7 @@ class CalibrationArtifact:
     def semantic_dict(self) -> dict[str, object]:
         return {
             "calibration_absent_identity": self.calibration_absent_identity,
+            "coverage": None if self.coverage is None else self.coverage.to_dict(),
             "ensemble_probability": [
                 record.to_dict() for record in self.ensemble_probability
             ],
@@ -981,7 +1434,9 @@ class CalibrationArtifact:
     def from_dict(cls, raw: Mapping[str, object]) -> "CalibrationArtifact":
         if raw.get("format_version") != CALIBRATION_ARTIFACT_FORMAT:
             raise ValueError("unsupported calibration artifact format")
-        supplied_hash = str(raw.get("semantic_sha256", ""))
+        supplied_hash = _json_string(
+            raw.get("semantic_sha256"), name="calibration semantic digest"
+        )
         _require_sha256(supplied_hash, name="calibration semantic digest")
         semantic = dict(raw)
         semantic.pop("semantic_sha256", None)
@@ -989,13 +1444,18 @@ class CalibrationArtifact:
             raise ValueError("calibration artifact semantic SHA-256 mismatch")
         provenance_raw = _as_mapping(raw["provenance_hashes"])
         result = cls(
-            split=str(raw["split"]),
-            release_status=str(raw["release_status"]),  # type: ignore[arg-type]
+            split=_json_string(raw["split"], name="split"),
+            release_status=_json_string(  # type: ignore[arg-type]
+                raw["release_status"], name="release_status"
+            ),
             model_selection=FrozenModelSelectionDecision.from_dict(
                 _as_mapping(raw["model_selection"])
             ),
-            provenance=CalibrationProvenance.from_mapping(
-                {str(name): str(value) for name, value in provenance_raw.items()}
+            provenance=CalibrationProvenance.from_mapping(provenance_raw),  # type: ignore[arg-type]
+            coverage=(
+                None
+                if raw["coverage"] is None
+                else CalibrationCoverage.from_dict(_as_mapping(raw["coverage"]))
             ),
             location_scale=tuple(
                 LocationScaleRecord.from_dict(_as_mapping(value))
@@ -1021,7 +1481,10 @@ class CalibrationArtifact:
                     raw["ensemble_probability"], name="ensemble_probability"
                 )
             ),
-            calibration_absent_identity=raw["calibration_absent_identity"],  # type: ignore[arg-type]
+            calibration_absent_identity=_json_bool(
+                raw["calibration_absent_identity"],
+                name="calibration_absent_identity",
+            ),
         )
         if result.to_dict() != dict(raw):
             raise ValueError("calibration artifact typed round trip is not canonical")
@@ -1037,6 +1500,7 @@ class CalibrationArtifactBuilder:
         split: str,
         model_selection: FrozenModelSelectionDecision,
         provenance_hashes: Mapping[str, str],
+        coverage: CalibrationCoverage | None = None,
     ) -> None:
         if split != CALIBRATION_SPLIT:
             raise ValueError("final calibration fitting requires split='calibration'")
@@ -1044,6 +1508,8 @@ class CalibrationArtifactBuilder:
             raise TypeError("model_selection must be frozen before fitting")
         if not provenance_hashes:
             raise ValueError("at least one calibration input provenance hash is required")
+        if coverage is not None and not isinstance(coverage, CalibrationCoverage):
+            raise TypeError("coverage must be CalibrationCoverage")
         hashes = dict(provenance_hashes)
         for name, expected in (
             ("model_selection_decision_sha256", model_selection.decision_sha256),
@@ -1052,8 +1518,17 @@ class CalibrationArtifactBuilder:
             supplied = hashes.setdefault(name, expected)
             if supplied != expected:
                 raise ValueError(f"{name} conflicts with the frozen decision")
+        if coverage is not None:
+            supplied = hashes.setdefault(
+                "calibration_coverage_sha256", coverage.semantic_sha256
+            )
+            if supplied != coverage.semantic_sha256:
+                raise ValueError(
+                    "calibration_coverage_sha256 conflicts with the coverage contract"
+                )
         self.split = split
         self.model_selection = model_selection
+        self.coverage = coverage
         self.provenance = CalibrationProvenance.from_mapping(hashes)
         self._location: dict[str, LocationScaleRecord] = {}
         self._bias: dict[str, SamplerBiasRecord] = {}
@@ -1066,8 +1541,17 @@ class CalibrationArtifactBuilder:
         evidence: Mapping[str, PoolingEvidence],
         *,
         probability_gate: bool,
+        fit_row_id: Sequence[str],
+        fit_weight: ArrayLike,
+        fit_observation: ArrayLike | None = None,
     ) -> PoolingAudit:
-        return build_pooling_audit(evidence, probability_gate=probability_gate)
+        return build_pooling_audit(
+            evidence,
+            probability_gate=probability_gate,
+            fit_row_id=fit_row_id,
+            fit_weight=fit_weight,
+            fit_observation=fit_observation,
+        )
 
     @staticmethod
     def _insert(target: dict[str, object], key_sha256: str, record: object) -> None:
@@ -1083,8 +1567,20 @@ class CalibrationArtifactBuilder:
         full_residual: ArrayLike,
         calibration_weight: ArrayLike,
         pooling_evidence: Mapping[str, PoolingEvidence],
+        fit_row_id: Sequence[str],
     ) -> LocationScaleRecord:
-        calibration = fit_location_total_scale(
+        pooling = self._audit(
+            pooling_evidence,
+            probability_gate=False,
+            fit_row_id=fit_row_id,
+            fit_weight=calibration_weight,
+        )
+        fitter = (
+            identity_location_total_scale
+            if pooling.terminal_fallback
+            else fit_location_total_scale
+        )
+        calibration = fitter(
             folds=folds,
             full_residual=full_residual,
             calibration_weight=calibration_weight,
@@ -1095,7 +1591,7 @@ class CalibrationArtifactBuilder:
         record = LocationScaleRecord(
             key,
             calibration,
-            self._audit(pooling_evidence, probability_gate=False),
+            pooling,
             self.provenance.semantic_sha256,
         )
         self._insert(self._location, key.semantic_sha256, record)
@@ -1111,6 +1607,7 @@ class CalibrationArtifactBuilder:
         full_residual: ArrayLike,
         calibration_weight: ArrayLike,
         pooling_evidence: Mapping[str, PoolingEvidence],
+        fit_row_id: Sequence[str],
     ) -> tuple[SamplerBiasRecord, SpreadRecord]:
         if (
             bias_key.lead_hours != spread_key.lead_hours
@@ -1127,7 +1624,18 @@ class CalibrationArtifactBuilder:
             location_record = self._location[location_scale_key.semantic_sha256]
         except KeyError as error:
             raise KeyError("fit and freeze b/c before d/gamma") from error
-        fitted: SamplerCalibration = fit_sampler_bias_and_spread(
+        pooling = self._audit(
+            pooling_evidence,
+            probability_gate=False,
+            fit_row_id=fit_row_id,
+            fit_weight=calibration_weight,
+        )
+        fitter = (
+            identity_sampler_bias_and_spread
+            if pooling.terminal_fallback
+            else fit_sampler_bias_and_spread
+        )
+        fitted: SamplerCalibration = fitter(
             restored_members=restored_members,
             full_residual=full_residual,
             calibration_weight=calibration_weight,
@@ -1135,7 +1643,6 @@ class CalibrationArtifactBuilder:
             d_enabled=self.model_selection.d_enabled,
             split=self.split,
         )
-        pooling = self._audit(pooling_evidence, probability_gate=False)
         bias = SamplerBiasRecord(
             key=bias_key,
             sampler_bias_d=fitted.sampler_bias_d,
@@ -1164,15 +1671,31 @@ class CalibrationArtifactBuilder:
         observation: ArrayLike,
         weight: ArrayLike,
         pooling_evidence: Mapping[str, PoolingEvidence],
+        fit_row_id: Sequence[str],
     ) -> RegressionProbabilityRecord:
-        pooling = self._audit(pooling_evidence, probability_gate=True)
-        fitted = fit_monotone_logit_linear_probability(
-            probability,
-            observation,
-            weight,
-            split=self.split,
-            pooling=pooling.decision,
+        pooling = self._audit(
+            pooling_evidence,
+            probability_gate=True,
+            fit_row_id=fit_row_id,
+            fit_weight=weight,
+            fit_observation=observation,
         )
+        if pooling.terminal_fallback:
+            fitted = identity_monotone_logit_linear_probability(
+                probability,
+                observation,
+                weight,
+                split=self.split,
+            )
+        else:
+            assert pooling.decision is not None
+            fitted = fit_monotone_logit_linear_probability(
+                probability,
+                observation,
+                weight,
+                split=self.split,
+                pooling=pooling.decision,
+            )
         record = RegressionProbabilityRecord(
             key, fitted, pooling, self.provenance.semantic_sha256
         )
@@ -1187,15 +1710,31 @@ class CalibrationArtifactBuilder:
         observation: ArrayLike,
         weight: ArrayLike,
         pooling_evidence: Mapping[str, PoolingEvidence],
+        fit_row_id: Sequence[str],
     ) -> EnsembleProbabilityRecord:
-        pooling = self._audit(pooling_evidence, probability_gate=True)
-        fitted = fit_monotone_logit_linear_probability(
-            probability,
-            observation,
-            weight,
-            split=self.split,
-            pooling=pooling.decision,
+        pooling = self._audit(
+            pooling_evidence,
+            probability_gate=True,
+            fit_row_id=fit_row_id,
+            fit_weight=weight,
+            fit_observation=observation,
         )
+        if pooling.terminal_fallback:
+            fitted = identity_monotone_logit_linear_probability(
+                probability,
+                observation,
+                weight,
+                split=self.split,
+            )
+        else:
+            assert pooling.decision is not None
+            fitted = fit_monotone_logit_linear_probability(
+                probability,
+                observation,
+                weight,
+                split=self.split,
+                pooling=pooling.decision,
+            )
         record = EnsembleProbabilityRecord(
             key, fitted, pooling, self.provenance.semantic_sha256
         )
@@ -1216,6 +1755,7 @@ class CalibrationArtifactBuilder:
             release_status=release_status,
             model_selection=self.model_selection,
             provenance=self.provenance,
+            coverage=self.coverage,
             location_scale=ordered(self._location),  # type: ignore[arg-type]
             sampler_bias=ordered(self._bias),  # type: ignore[arg-type]
             spread=ordered(self._spread),  # type: ignore[arg-type]
@@ -1433,6 +1973,9 @@ class CalibrationResolver:
             kind="p_cal",
         )
         assert isinstance(record, RegressionProbabilityRecord)
+        if record.pooling.terminal_fallback:
+            _validate_identity_probability(probability)
+            return probability
         return monotone_logit_linear_probability(
             probability,
             alpha=record.calibration.alpha,
@@ -1452,6 +1995,9 @@ class CalibrationResolver:
             kind="q_cal",
         )
         assert isinstance(record, EnsembleProbabilityRecord)
+        if record.pooling.terminal_fallback:
+            _validate_identity_probability(probability)
+            return probability
         return monotone_logit_linear_probability(
             probability,
             alpha=record.calibration.alpha,
@@ -1478,6 +2024,7 @@ __all__ = [
     "MONOTONE_LOGIT_LINEAR_FAMILY",
     "CalibrationArtifact",
     "CalibrationArtifactBuilder",
+    "CalibrationCoverage",
     "CalibrationProvenance",
     "CalibrationResolver",
     "EnsembleProbabilityKey",

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Literal, Mapping, Sequence
 
 import numpy as np
@@ -23,15 +23,23 @@ from kcorrdiff.data.radar_values import A0_MM, A_WET_MM
 
 CALIBRATION_SPLIT = "calibration"
 POOLING_ORDER = (
+    "full_cell",
     "lead_provider_era_present",
     "lead_provider",
     "lead_only",
 )
 PoolingLevel = Literal[
+    "full_cell",
     "lead_provider_era_present",
     "lead_provider",
     "lead_only",
 ]
+
+
+def block_ess_tolerance(block_count: int) -> float:
+    """Shared numerical tolerance for the theoretical ESS upper bound."""
+
+    return 1.0e-12 * max(1.0, float(block_count))
 
 
 def _field(value: ArrayLike, *, name: str) -> NDArray[np.float64]:
@@ -56,10 +64,14 @@ def _weighted_moments(
     if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
         raise ValueError("weights must be finite and non-negative")
     mass = float(weights.sum())
+    if not math.isfinite(mass) or mass <= 0.0:
+        raise OverflowError("weighted moment mass overflowed float64")
     mean = float(np.sum(weights * np.where(selected, values, 0.0)) / mass)
     variance = float(
         np.sum(weights * np.where(selected, (values - mean) ** 2, 0.0)) / mass
     )
+    if not math.isfinite(mean) or not math.isfinite(variance):
+        raise OverflowError("weighted moment statistics overflowed float64")
     return mean, max(variance, 0.0), mass
 
 
@@ -83,8 +95,18 @@ class IndependentBlockSupport:
             for value in integers
         ):
             raise ValueError("block support counts must be non-negative integers")
-        if not math.isfinite(self.block_ess) or self.block_ess < 0.0:
+        if (
+            isinstance(self.block_ess, bool)
+            or not isinstance(self.block_ess, Real)
+            or not math.isfinite(self.block_ess)
+            or self.block_ess < 0.0
+        ):
             raise ValueError("block ESS must be finite and non-negative")
+        if (self.block_count == 0) != (self.block_ess == 0.0):
+            raise ValueError("zero block count and zero block ESS must agree")
+        tolerance = block_ess_tolerance(self.block_count)
+        if self.block_ess > self.block_count + tolerance:
+            raise ValueError("block ESS cannot exceed block count")
         if self.positive_support_blocks > self.block_count:
             raise ValueError("positive block support cannot exceed block count")
         if self.negative_support_blocks > self.block_count:
@@ -125,9 +147,25 @@ def independent_block_support(
     never from the much larger number of overlapping pixels/windows.
     """
 
-    weights = _field(weight, name="block weights").reshape(-1)
-    if len(block_id) != weights.size or any(not value for value in block_id):
-        raise ValueError("one non-empty block_id is required per weight")
+    weights = np.asarray(weight, dtype=np.float64).reshape(-1)
+    if weights.size == 0:
+        if len(block_id) != 0:
+            raise ValueError("one block_id is required per weight")
+        if observation is not None:
+            labels = np.asarray(observation, dtype=np.float64).reshape(-1)
+            if labels.size != 0:
+                raise ValueError("block observations must match weights")
+        # A genuinely empty narrow cell is the same absence of support as a
+        # populated cell whose weights are all zero.  It must not abort the
+        # deterministic fallback to a broader pooling rung.
+        return IndependentBlockSupport(0, 0.0, 0, 0)
+    if len(block_id) != weights.size or any(
+        not isinstance(value, str) or not value or value.strip() != value
+        for value in block_id
+    ):
+        raise ValueError(
+            "one canonical non-empty string block_id is required per weight"
+        )
     if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
         raise ValueError("block weights must be finite and non-negative")
     labels: NDArray[np.float64] | None = None
@@ -140,18 +178,26 @@ def independent_block_support(
     masses: dict[str, float] = {}
     positive: set[str] = set()
     negative: set[str] = set()
-    for index, raw_block in enumerate(block_id):
-        block = str(raw_block)
+    for index, block in enumerate(block_id):
         item_weight = float(weights[index])
         if item_weight <= 0.0:
             continue
         masses[block] = masses.get(block, 0.0) + item_weight
+        if not math.isfinite(masses[block]):
+            raise OverflowError("independent-block mass overflowed float64")
         if labels is not None:
             (positive if labels[index] == 1.0 else negative).add(block)
     if not masses:
-        raise ValueError("independent-block support has no positive mass")
+        # An empty/zero-mass narrow cell is ordinary evidence that this rung
+        # cannot pass.  Returning explicit zero support lets the deterministic
+        # ladder continue to broader cells instead of aborting calibration.
+        return IndependentBlockSupport(0, 0.0, 0, 0)
     values = np.asarray(tuple(masses.values()), dtype=np.float64)
-    ess = float(values.sum() ** 2 / np.square(values).sum())
+    scale = float(values.max())
+    normalized = values / scale
+    ess = float(normalized.sum() ** 2 / np.square(normalized).sum())
+    if not math.isfinite(ess):
+        raise OverflowError("independent-block ESS overflowed float64")
     return IndependentBlockSupport(
         block_count=len(masses),
         block_ess=ess,
@@ -204,17 +250,31 @@ class FoldCalibrationMoments:
     calibration_second_moment: float
 
     def __post_init__(self) -> None:
-        if isinstance(self.fold_id, bool) or self.fold_id < 0:
+        if (
+            isinstance(self.fold_id, bool)
+            or not isinstance(self.fold_id, Integral)
+            or self.fold_id < 0
+        ):
             raise ValueError("fold_id must be non-negative")
         values = (
             self.oof_valid_mass,
             self.calibration_mean,
             self.calibration_second_moment,
         )
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
+            raise ValueError("fold calibration moments must be real scalars")
         if not all(math.isfinite(value) for value in values):
             raise ValueError("fold calibration moments must be finite")
         if self.oof_valid_mass <= 0.0 or self.calibration_second_moment < 0.0:
             raise ValueError("fold mass must be positive and q_k non-negative")
+        squared_mean = float(self.calibration_mean) * float(self.calibration_mean)
+        if not math.isfinite(squared_mean):
+            raise ValueError("fold mean squared must remain finite")
+        tolerance = 1.0e-12 * max(
+            1.0, abs(self.calibration_second_moment), squared_mean
+        )
+        if self.calibration_second_moment + tolerance < squared_mean:
+            raise ValueError("fold second moment q_k cannot be smaller than m_k squared")
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,12 +297,20 @@ class LocationScaleCalibration:
             self.full_variance,
             *self.fold_weights,
         )
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in scalars):
+            raise TypeError("location/scale calibration must contain real scalars")
         if not all(math.isfinite(value) for value in scalars):
             raise ValueError("location/scale calibration must be finite")
         if self.total_scale_c <= 0.0:
             raise ValueError("total residual scale c must be positive")
-        if not self.fold_weights or not math.isclose(
-            sum(self.fold_weights), 1.0, rel_tol=0.0, abs_tol=1.0e-12
+        if self.fold_mixture_variance < 0.0 or self.full_variance < 0.0:
+            raise ValueError("residual variances must be non-negative")
+        if (
+            not self.fold_weights
+            or any(weight < 0.0 for weight in self.fold_weights)
+            or not math.isclose(
+                sum(self.fold_weights), 1.0, rel_tol=0.0, abs_tol=1.0e-12
+            )
         ):
             raise ValueError("fold weights must form a probability vector")
 
@@ -290,6 +358,52 @@ def fit_location_total_scale(
     )
 
 
+def identity_location_total_scale(
+    *,
+    folds: Sequence[FoldCalibrationMoments],
+    full_residual: ArrayLike,
+    calibration_weight: ArrayLike,
+    split: str,
+) -> LocationScaleCalibration:
+    """Build the documented terminal ``b=0,c=1`` calibration record.
+
+    The moments are retained as audit diagnostics, but they never influence
+    the identity parameters.  This is intentionally separate from
+    :func:`fit_location_total_scale`: sparse terminal cells must not attempt a
+    fit and then silently publish whatever that fit happened to return.
+    """
+
+    if split != CALIBRATION_SPLIT:
+        raise ValueError(
+            "terminal b/c identity may be recorded only on the independent calibration split"
+        )
+    ordered = tuple(sorted(folds, key=lambda item: item.fold_id))
+    if len(ordered) < 2 or len({item.fold_id for item in ordered}) != len(ordered):
+        raise ValueError("at least two unique fold moment records are required")
+    total_mass = sum(item.oof_valid_mass for item in ordered)
+    pi = tuple(item.oof_valid_mass / total_mass for item in ordered)
+    mixture_mean = sum(
+        weight * item.calibration_mean for weight, item in zip(pi, ordered)
+    )
+    mixture_second = sum(
+        weight * item.calibration_second_moment
+        for weight, item in zip(pi, ordered)
+    )
+    mixture_variance = max(mixture_second - mixture_mean**2, 0.0)
+    full_mean, full_variance, _ = _weighted_moments(
+        full_residual, calibration_weight
+    )
+    return LocationScaleCalibration(
+        location_b=0.0,
+        total_scale_c=1.0,
+        fold_weights=pi,
+        fold_mixture_mean=mixture_mean,
+        fold_mixture_variance=mixture_variance,
+        full_mean=full_mean,
+        full_variance=full_variance,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SamplerCalibration:
     sampler_bias_d: float
@@ -299,8 +413,12 @@ class SamplerCalibration:
 
     def __post_init__(self) -> None:
         values = (self.sampler_bias_d, self.spread_gamma, self.bias_fraction)
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
+            raise TypeError("sampler calibration must contain real scalars")
         if not all(math.isfinite(value) for value in values):
             raise ValueError("sampler calibration must be finite")
+        if not isinstance(self.d_enabled, bool):
+            raise TypeError("d_enabled must be a frozen boolean")
         if self.spread_gamma <= 0.0 or self.bias_fraction < 0.0:
             raise ValueError("gamma must be positive and bias_fraction non-negative")
         if not self.d_enabled and self.sampler_bias_d != 0.0:
@@ -321,6 +439,8 @@ def fit_sampler_bias_and_spread(
 
     if split != CALIBRATION_SPLIT:
         raise ValueError("final d/gamma require the independent calibration split")
+    if not isinstance(d_enabled, bool):
+        raise TypeError("d_enabled must be a frozen boolean")
     members = _field(restored_members, name="restored_members")
     residual = _field(full_residual, name="full_residual")
     weight = _field(calibration_weight, name="calibration_weight")
@@ -357,8 +477,58 @@ def fit_sampler_bias_and_spread(
     return SamplerCalibration(
         sampler_bias_d=bias,
         spread_gamma=gamma,
-        d_enabled=bool(d_enabled),
+        d_enabled=d_enabled,
         bias_fraction=bias_fraction,
+    )
+
+
+def identity_sampler_bias_and_spread(
+    *,
+    restored_members: ArrayLike,
+    full_residual: ArrayLike,
+    calibration_weight: ArrayLike,
+    location_scale: LocationScaleCalibration,
+    d_enabled: bool,
+    split: str,
+    epsilon: float = 1.0e-12,
+) -> SamplerCalibration:
+    """Build documented terminal ``d=0,gamma=1`` parameters.
+
+    Inputs still undergo the same shape, finiteness, and positive-mass checks
+    as a real fit.  ``bias_fraction`` remains a diagnostic; it cannot activate
+    the frozen ``d`` arm in a terminal cell.
+    """
+
+    if split != CALIBRATION_SPLIT:
+        raise ValueError(
+            "terminal d/gamma identity requires the independent calibration split"
+        )
+    if not isinstance(d_enabled, bool):
+        raise TypeError("d_enabled must be a frozen boolean")
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("epsilon must be finite and positive")
+    members = _field(restored_members, name="restored_members")
+    residual = _field(full_residual, name="full_residual")
+    weight = _field(calibration_weight, name="calibration_weight")
+    if members.ndim < 2 or members.shape[0] != residual.shape[0]:
+        raise ValueError("members must have shape [items,N,...]")
+    if members.shape[2:] != residual.shape[1:] or residual.shape != weight.shape:
+        raise ValueError("member, residual, and weight shapes disagree")
+    if members.shape[1] < 2:
+        raise ValueError("gamma requires at least two ensemble members")
+    if not np.all(np.isfinite(members)):
+        raise ValueError("restored_members must be finite")
+    member_mean = members.mean(axis=1)
+    e0 = residual - (
+        location_scale.location_b + location_scale.total_scale_c * member_mean
+    )
+    mean_e0, _variance_e0, _ = _weighted_moments(e0, weight)
+    rmse = math.sqrt(_weighted_moments(e0**2, weight)[0])
+    return SamplerCalibration(
+        sampler_bias_d=0.0,
+        spread_gamma=1.0,
+        d_enabled=d_enabled,
+        bias_fraction=abs(mean_e0) / max(rmse, epsilon),
     )
 
 
@@ -381,9 +551,29 @@ def apply_residual_calibration(
         raise ValueError("calibration parameters must be finite")
     if total_scale_c <= 0.0 or spread_gamma <= 0.0:
         raise ValueError("c and gamma must be positive")
+    if not bool(torch.isfinite(restored_members).all().item()):
+        raise ValueError("restored_members must be finite")
+    if (
+        location_b == 0.0
+        and total_scale_c == 1.0
+        and sampler_bias_d == 0.0
+        and spread_gamma == 1.0
+    ):
+        # The documented terminal identity is a literal raw pass-through.
+        # Avoiding an algebraically equivalent mean/anomaly reconstruction is
+        # important because that reconstruction is not bitwise neutral in
+        # float32.
+        return restored_members
     first = location_b + sampler_bias_d + total_scale_c * restored_members
+    if not bool(torch.isfinite(first).all().item()):
+        raise OverflowError("residual location/scale calibration overflowed float32")
+    if spread_gamma == 1.0:
+        return first
     member_mean = first.mean(dim=1, keepdim=True)
-    return member_mean + spread_gamma * (first - member_mean)
+    result = member_mean + spread_gamma * (first - member_mean)
+    if not bool(torch.isfinite(result).all().item()):
+        raise OverflowError("residual spread calibration overflowed float32")
+    return result
 
 
 def transformed_members_to_physical(
@@ -399,7 +589,20 @@ def transformed_members_to_physical(
     if residual.dtype is not torch.float32 or mu_z_full.dtype is not torch.float32:
         raise TypeError("transformed forecast fields must remain float32")
     z = mu_z_full[:, None] + residual
-    amount = A0_MM * torch.expm1(torch.clamp_min(z, 0.0))
+    if not bool(torch.isfinite(z).all().item()):
+        raise OverflowError("transformed forecast members overflowed float32")
+    positive_z = torch.clamp_min(z, 0.0)
+    # ``torch.expm1`` returns +inf for otherwise finite float32 inputs above
+    # the representable physical-amount range.  A finalized forecast may never
+    # contain that silent overflow, so fail before applying the inverse.
+    maximum_z = math.log1p(torch.finfo(torch.float32).max / A0_MM)
+    if bool((positive_z > maximum_z).any().item()):
+        raise OverflowError(
+            "finite transformed forecast exceeds the representable float32 physical range"
+        )
+    amount = A0_MM * torch.expm1(positive_z)
+    if not bool(torch.isfinite(amount).all().item()):
+        raise OverflowError("physical inverse transform overflowed float32")
     return torch.where(amount >= A_WET_MM, amount, torch.zeros_like(amount))
 
 
@@ -427,8 +630,23 @@ def monotone_logit_linear_probability(
     logit = torch.logit(clipped)
     alpha_tensor = torch.as_tensor(alpha, dtype=torch.float32, device=probability.device)
     beta_tensor = torch.as_tensor(beta_raw, dtype=torch.float32, device=probability.device)
+    if alpha_tensor.numel() != 1 or beta_tensor.numel() != 1:
+        raise ValueError("probability calibration parameters must be scalars")
+    if not bool(torch.isfinite(alpha_tensor).all().item()) or not bool(
+        torch.isfinite(beta_tensor).all().item()
+    ):
+        raise OverflowError("probability calibration parameters overflowed float32")
     slope = torch.nn.functional.softplus(beta_tensor)
-    return torch.sigmoid(alpha_tensor + slope * logit)
+    if not bool(torch.isfinite(slope).all().item()) or not bool((slope > 0.0).all().item()):
+        raise OverflowError(
+            "softplus(beta_raw) must remain finite and strictly positive in float32"
+        )
+    result = torch.sigmoid(alpha_tensor + slope * logit)
+    if not bool(torch.isfinite(result).all().item()) or bool(
+        ((result < 0.0) | (result > 1.0)).any().item()
+    ):
+        raise OverflowError("probability calibration mapping produced invalid float32")
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,17 +658,64 @@ class ProbabilityCalibration:
     slope: float
     weighted_log_loss: float
     iterations: int
-    pooling: PoolingDecision
+    pooling: PoolingDecision | None
+    identity: bool = False
 
     def __post_init__(self) -> None:
         scalars = self.alpha, self.beta_raw, self.slope, self.weighted_log_loss
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in scalars):
+            raise TypeError("probability calibration must contain real scalars")
         if not all(math.isfinite(value) for value in scalars):
             raise ValueError("probability calibration parameters must be finite")
-        if self.slope <= 0.0 or self.weighted_log_loss < 0.0:
+        execution_parameters = torch.tensor(
+            [self.alpha, self.beta_raw, self.slope], dtype=torch.float32
+        )
+        if not bool(torch.isfinite(execution_parameters).all().item()):
+            raise ValueError(
+                "probability calibration parameters must be representable in float32"
+            )
+        if (
+            self.slope <= 0.0
+            or execution_parameters[2].item() <= 0.0
+            or self.weighted_log_loss < 0.0
+        ):
             raise ValueError("probability slope must be positive and loss non-negative")
-        if isinstance(self.iterations, bool) or self.iterations < 0:
+        # Validate the parameterization in the same dtype used by inference.
+        # A double-precision softplus plus a fixed absolute tolerance can
+        # approve a tiny stored slope even when float32 softplus underflows to
+        # zero and the operational mapping becomes flat.  A relative-only
+        # comparison remains meaningful at every nonzero scale.
+        expected_slope = float(
+            torch.nn.functional.softplus(execution_parameters[1]).item()
+        )
+        if not math.isfinite(expected_slope) or expected_slope <= 0.0:
+            raise ValueError(
+                "softplus(beta_raw) must remain finite and strictly positive in float32"
+            )
+        float32_relative_tolerance = 8.0 * float(torch.finfo(torch.float32).eps)
+        if not math.isclose(
+            self.slope,
+            expected_slope,
+            rel_tol=float32_relative_tolerance,
+            abs_tol=0.0,
+        ):
+            raise ValueError(
+                "probability slope must equal float32 softplus(beta_raw)"
+            )
+        if (
+            isinstance(self.iterations, bool)
+            or not isinstance(self.iterations, Integral)
+            or self.iterations < 0
+        ):
             raise ValueError("probability calibration iterations must be non-negative")
-        if not self.pooling.probability_gate:
+        if not isinstance(self.identity, bool):
+            raise TypeError("probability identity flag must be boolean")
+        if self.identity:
+            if self.pooling is not None:
+                raise ValueError("terminal probability identity cannot claim a pooling decision")
+            if self.alpha != 0.0 or self.slope != 1.0:
+                raise ValueError("terminal probability identity must use alpha=0 and slope=1")
+        elif self.pooling is None or not self.pooling.probability_gate:
             raise ValueError("probability calibration requires probability support")
 
 
@@ -564,7 +829,61 @@ def fit_monotone_logit_linear_probability(
     )
 
 
+def identity_monotone_logit_linear_probability(
+    probability: ArrayLike,
+    observation: ArrayLike,
+    weight: ArrayLike,
+    *,
+    split: str,
+) -> ProbabilityCalibration:
+    """Return an explicitly flagged raw pass-through terminal mapping."""
+
+    if split != CALIBRATION_SPLIT:
+        raise ValueError(
+            "terminal probability identity requires the independent calibration split"
+        )
+    forecast = _field(probability, name="probability").reshape(-1)
+    target = _field(observation, name="observation").reshape(-1)
+    weights = _field(weight, name="probability weight").reshape(-1)
+    if not (forecast.shape == target.shape == weights.shape):
+        raise ValueError("probability, observation, and weight must share shape")
+    if not np.all(np.isfinite(forecast)) or np.any(
+        (forecast < 0.0) | (forecast > 1.0)
+    ):
+        raise ValueError("probability must be finite and lie in [0,1]")
+    if not np.all(np.isfinite(target)) or np.any(
+        (target != 0.0) & (target != 1.0)
+    ):
+        raise ValueError("probability observations must be binary")
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("probability weights must be finite and non-negative")
+    selected = weights > 0.0
+    if not np.any(selected):
+        raise ValueError("probability calibration has no positive weight")
+    clipped = np.clip(forecast[selected], 1.0e-6, 1.0 - 1.0e-6)
+    loss = float(
+        np.sum(
+            weights[selected]
+            * (
+                -target[selected] * np.log(clipped)
+                - (1.0 - target[selected]) * np.log1p(-clipped)
+            )
+        )
+        / np.sum(weights[selected])
+    )
+    return ProbabilityCalibration(
+        alpha=0.0,
+        beta_raw=_inverse_softplus(1.0),
+        slope=1.0,
+        weighted_log_loss=loss,
+        iterations=0,
+        pooling=None,
+        identity=True,
+    )
+
+
 __all__ = [
+    "block_ess_tolerance",
     "CALIBRATION_SPLIT",
     "FoldCalibrationMoments",
     "IndependentBlockSupport",
@@ -576,8 +895,11 @@ __all__ = [
     "apply_residual_calibration",
     "empirical_lower_median",
     "fit_location_total_scale",
+    "identity_location_total_scale",
     "fit_monotone_logit_linear_probability",
     "fit_sampler_bias_and_spread",
+    "identity_monotone_logit_linear_probability",
+    "identity_sampler_bias_and_spread",
     "independent_block_support",
     "monotone_logit_linear_probability",
     "select_pooling_level",

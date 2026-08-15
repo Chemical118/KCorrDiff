@@ -64,14 +64,19 @@ def contract_from_mapping(raw: Mapping[str, object]) -> RuntimeContract:
         "allow_era_grid_fallback",
     }
     missing = sorted(required - set(raw))
-    if missing:
-        raise ValueError(f"runtime contract is incomplete: {missing}")
+    extra = sorted(set(raw) - required)
+    if missing or extra:
+        raise ValueError(
+            f"runtime contract schema mismatch: missing={missing}, extra={extra}"
+        )
     result = RuntimeContract(
-        target_widths=tuple(int(value) for value in _sequence(raw["target_widths"])),
-        context_widths=tuple(int(value) for value in _sequence(raw["context_widths"])),
-        era_latent_channels=int(raw["era_latent_channels"]),
-        era_grid_size=int(raw["era_grid_size"]),
-        precision=str(raw["precision"]),
+        target_widths=_integer_sequence(raw["target_widths"], "target_widths"),
+        context_widths=_integer_sequence(raw["context_widths"], "context_widths"),
+        era_latent_channels=_strict_int(
+            raw["era_latent_channels"], "era_latent_channels"
+        ),
+        era_grid_size=_strict_int(raw["era_grid_size"], "era_grid_size"),
+        precision=_strict_string(raw["precision"], "precision"),
         tf32=_strict_bool(raw["tf32"], "tf32"),
         allow_cpu_fallback=_strict_bool(
             raw["allow_cpu_fallback"], "allow_cpu_fallback"
@@ -93,6 +98,23 @@ def contract_from_mapping(raw: Mapping[str, object]) -> RuntimeContract:
 def _sequence(value: object) -> Sequence[object]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError("width declarations must be sequences")
+    return value
+
+
+def _strict_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    return value
+
+
+def _integer_sequence(value: object, name: str) -> tuple[int, ...]:
+    selected = _sequence(value)
+    return tuple(_strict_int(item, f"{name}[{index}]") for index, item in enumerate(selected))
+
+
+def _strict_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"{name} must be a non-empty string")
     return value
 
 

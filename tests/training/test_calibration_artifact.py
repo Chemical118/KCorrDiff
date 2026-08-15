@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ from kcorrdiff.training.calibration import FoldCalibrationMoments, POOLING_ORDER
 from kcorrdiff.training.calibration_artifact import (
     CalibrationArtifact,
     CalibrationArtifactBuilder,
+    CalibrationCoverage,
     CalibrationResolver,
     EnsembleProbabilityKey,
     FrozenModelSelectionDecision,
@@ -20,6 +23,8 @@ from kcorrdiff.training.calibration_artifact import (
     RegressionProbabilityKey,
     SamplerBiasKey,
     SpreadKey,
+    OFFICIAL_ENSEMBLE_THRESHOLDS_MM,
+    OFFICIAL_LEADS_HOURS,
     build_pooling_audit,
     publish_calibration_artifact,
     read_calibration_artifact,
@@ -38,7 +43,21 @@ def _decision(*, d_enabled: bool = False) -> FrozenModelSelectionDecision:
     )
 
 
-def _builder(*, d_enabled: bool = False) -> CalibrationArtifactBuilder:
+def _coverage() -> CalibrationCoverage:
+    ensemble = EnsembleSignature(
+        SamplerCoreSignature(checkpoint_id="f" * 64, edm_steps=12), 32
+    )
+    return CalibrationCoverage(
+        condition_signatures=(CONDITION,),
+        fold_checkpoint_sha256s=("1" * 64, "2" * 64, "3" * 64),
+        full_checkpoint_sha256="4" * 64,
+        ensemble_signatures=(ensemble,),
+    )
+
+
+def _builder(
+    *, d_enabled: bool = False, complete_coverage: bool = False
+) -> CalibrationArtifactBuilder:
     return CalibrationArtifactBuilder(
         split="calibration",
         model_selection=_decision(d_enabled=d_enabled),
@@ -47,24 +66,31 @@ def _builder(*, d_enabled: bool = False) -> CalibrationArtifactBuilder:
             "calibration_manifest_sha256": "d" * 64,
             "residual_scales_sha256": "e" * 64,
         },
+        coverage=_coverage() if complete_coverage else None,
     )
 
 
 def _evidence(
     *,
     probability: bool,
-    counts: tuple[int, int, int] = (40, 40, 40),
+    counts: tuple[int, int, int, int] = (40, 40, 40, 40),
+    observation: np.ndarray | None = None,
 ) -> dict[str, PoolingEvidence]:
     result: dict[str, PoolingEvidence] = {}
     for level, count in zip(POOLING_ORDER, counts):
         block_id = tuple(f"{level}-{index:03d}" for index in range(count))
         weight = np.ones(count, dtype=np.float64)
-        observation = (
-            np.asarray([index % 2 for index in range(count)], dtype=np.float64)
-            if probability
-            else None
-        )
-        result[level] = PoolingEvidence(block_id, weight, observation)
+        level_observation = None
+        if probability:
+            level_observation = (
+                np.asarray(observation, dtype=np.float64)
+                if observation is not None and len(observation) == count
+                else np.asarray(
+                    [index % 2 for index in range(count)], dtype=np.float64
+                )
+            )
+        row_id = tuple(f"row-{index:03d}" for index in range(count))
+        result[level] = PoolingEvidence(block_id, weight, level_observation, row_id)
     return result
 
 
@@ -95,23 +121,218 @@ def _keys(
 
 
 def _fit_complete() -> tuple[CalibrationArtifact, tuple[object, ...]]:
-    builder = _builder(d_enabled=False)
-    location_key, bias_key, spread_key, p_key, q_key = _keys()
-    residual = np.linspace(-1.0, 1.0, 40, dtype=np.float64)[:, None]
+    builder = _builder(d_enabled=False, complete_coverage=True)
+    residual = np.linspace(-1.0, 1.0, 60, dtype=np.float64)[:, None]
     weight = np.ones_like(residual)
+    rng = np.random.default_rng(17)
+    members = rng.normal(0.0, 0.7, size=(60, 32, 1))
+    probability = np.linspace(0.04, 0.96, 60, dtype=np.float64)
+    # Both classes are present and overlap across the predictor range.
+    observation = np.asarray(
+        [int((index % 5) not in (0, 1)) for index in range(60)],
+        dtype=np.float64,
+    )
+    probability_weight = np.ones(60, dtype=np.float64)
+    rows = tuple(f"row-{index:03d}" for index in range(60))
+    selected: tuple[object, ...] | None = None
+    for lead_hours in OFFICIAL_LEADS_HOURS:
+        location_key, bias_key, spread_key, p_key, wet_q_key = _keys(
+            lead_hours=lead_hours
+        )
+        location = builder.fit_location_scale(
+            location_key,
+            folds=(
+                FoldCalibrationMoments(0, 10.0, -0.2, 1.0),
+                FoldCalibrationMoments(1, 20.0, 0.0, 0.9),
+                FoldCalibrationMoments(2, 30.0, 0.2, 1.1),
+            ),
+            full_residual=residual,
+            calibration_weight=weight,
+            pooling_evidence=_evidence(probability=False, counts=(60, 60, 60, 60)),
+            fit_row_id=rows,
+        )
+        bias, spread = builder.fit_sampler(
+            bias_key=bias_key,
+            spread_key=spread_key,
+            location_scale_key=location_key,
+            restored_members=members,
+            full_residual=residual,
+            calibration_weight=weight,
+            pooling_evidence=_evidence(probability=False, counts=(60, 60, 60, 60)),
+            fit_row_id=rows,
+        )
+        p_record = builder.fit_regression_probability(
+            p_key,
+            probability=probability,
+            observation=observation,
+            weight=probability_weight,
+            pooling_evidence=_evidence(
+                probability=True,
+                counts=(60, 60, 60, 60),
+                observation=observation,
+            ),
+            fit_row_id=rows,
+        )
+        wet_q_record = None
+        for threshold in OFFICIAL_ENSEMBLE_THRESHOLDS_MM:
+            q_key = EnsembleProbabilityKey(
+                lead_hours,
+                threshold,
+                CONDITION,
+                spread_key.ensemble_signature,
+            )
+            q_record = builder.fit_ensemble_probability(
+                q_key,
+                probability=probability[::-1].copy(),
+                observation=observation,
+                weight=probability_weight,
+                pooling_evidence=_evidence(
+                    probability=True,
+                    counts=(60, 60, 60, 60),
+                    observation=observation,
+                ),
+                fit_row_id=rows,
+            )
+            if threshold == A_WET_MM:
+                wet_q_record = q_record
+        if lead_hours == 1.0:
+            assert wet_q_record is not None
+            selected = (
+                location_key,
+                bias_key,
+                spread_key,
+                p_key,
+                wet_q_key,
+                location,
+                bias,
+                spread,
+                p_record,
+                wet_q_record,
+            )
+    artifact = builder.build(release_status="complete")
+    assert selected is not None
+    return artifact, selected
+
+
+def test_pooling_ladder_is_deterministic_and_records_all_support() -> None:
+    evidence = _evidence(probability=False, counts=(10, 10, 35, 40))
+    audit = build_pooling_audit(
+        evidence,
+        probability_gate=False,
+        fit_row_id=tuple(evidence["lead_provider"].row_id or ()),
+        fit_weight=evidence["lead_provider"].weight,
+    )
+    assert audit.decision.level == "lead_provider"
+    assert tuple(level.level for level in audit.ladder) == POOLING_ORDER
+    assert [level.record_count for level in audit.ladder] == [10, 10, 35, 40]
+    assert [level.positive_weight_record_count for level in audit.ladder] == [10, 10, 35, 40]
+    assert audit.ladder[2].support.block_count == 35
+    assert audit.ladder[2].support.block_ess == pytest.approx(35.0)
+    assert audit.ladder[2].support.positive_support_blocks == 0
+    assert audit.ladder[2].support.negative_support_blocks == 0
+
+
+def test_zero_mass_narrow_cell_falls_through_to_supported_broader_cell() -> None:
+    evidence = _evidence(probability=False, counts=(10, 10, 35, 40))
+    narrow = evidence["full_cell"]
+    evidence["full_cell"] = PoolingEvidence(
+        block_id=narrow.block_id,
+        weight=np.zeros(10),
+        row_id=narrow.row_id,
+    )
+
+    audit = build_pooling_audit(
+        evidence,
+        probability_gate=False,
+        fit_row_id=tuple(evidence["lead_provider"].row_id or ()),
+        fit_weight=evidence["lead_provider"].weight,
+    )
+
+    assert audit.ladder[0].support.block_count == 0
+    assert audit.decision is not None
+    assert audit.decision.level == "lead_provider"
+
+
+def test_probability_pooling_records_both_class_block_counts() -> None:
+    evidence = _evidence(probability=True)
+    audit = build_pooling_audit(
+        evidence,
+        probability_gate=True,
+        fit_row_id=tuple(evidence["full_cell"].row_id or ()),
+        fit_weight=evidence["full_cell"].weight,
+        fit_observation=evidence["full_cell"].observation,
+    )
+    assert audit.decision.level == "full_cell"
+    assert audit.decision.support.positive_support_blocks == 20
+    assert audit.decision.support.negative_support_blocks == 20
+    with pytest.raises(ValueError, match="binary observations"):
+        build_pooling_audit(
+            _evidence(probability=False),
+            probability_gate=True,
+            fit_row_id=tuple(f"row-{index:03d}" for index in range(40)),
+            fit_weight=np.ones(40),
+            fit_observation=np.zeros(40),
+        )
+
+
+def test_pooling_evidence_is_bound_to_selected_fit_rows_weights_and_labels() -> None:
+    evidence = _evidence(probability=True)
+    rows = tuple(evidence["full_cell"].row_id or ())
+    weights = np.asarray(evidence["full_cell"].weight)
+    observation = np.asarray(evidence["full_cell"].observation)
+    with pytest.raises(ValueError, match="row IDs differ"):
+        build_pooling_audit(
+            evidence,
+            probability_gate=True,
+            fit_row_id=tuple(reversed(rows)),
+            fit_weight=weights,
+            fit_observation=observation,
+        )
+    changed_weight = weights.copy()
+    changed_weight[0] = 2.0
+    with pytest.raises(ValueError, match="weights differ"):
+        build_pooling_audit(
+            evidence,
+            probability_gate=True,
+            fit_row_id=rows,
+            fit_weight=changed_weight,
+            fit_observation=observation,
+        )
+    changed_observation = observation.copy()
+    changed_observation[0] = 1.0 - changed_observation[0]
+    with pytest.raises(ValueError, match="observations differ"):
+        build_pooling_audit(
+            evidence,
+            probability_gate=True,
+            fit_row_id=rows,
+            fit_weight=weights,
+            fit_observation=changed_observation,
+        )
+
+
+def test_terminal_pooling_publishes_explicit_identity_for_every_mapping() -> None:
+    builder = _builder()
+    location_key, bias_key, spread_key, p_key, q_key = _keys()
+    count = 10
+    rows = tuple(f"row-{index:03d}" for index in range(count))
+    residual = np.linspace(-1.0, 1.0, count, dtype=np.float64)[:, None]
+    weight = np.ones_like(residual)
+    residual_evidence = _evidence(
+        probability=False, counts=(count, count, count, count)
+    )
     location = builder.fit_location_scale(
         location_key,
         folds=(
-            FoldCalibrationMoments(0, 10.0, -0.2, 1.0),
-            FoldCalibrationMoments(1, 20.0, 0.0, 0.9),
-            FoldCalibrationMoments(2, 30.0, 0.2, 1.1),
+            FoldCalibrationMoments(0, 1.0, -0.1, 0.5),
+            FoldCalibrationMoments(1, 1.0, 0.1, 0.5),
+            FoldCalibrationMoments(2, 1.0, 0.0, 0.5),
         ),
         full_residual=residual,
         calibration_weight=weight,
-        pooling_evidence=_evidence(probability=False),
+        pooling_evidence=residual_evidence,
+        fit_row_id=rows,
     )
-    rng = np.random.default_rng(17)
-    members = rng.normal(0.0, 0.7, size=(40, 32, 1))
+    members = np.stack((residual - 0.5, residual + 0.5), axis=1)
     bias, spread = builder.fit_sampler(
         bias_key=bias_key,
         spread_key=spread_key,
@@ -119,68 +340,51 @@ def _fit_complete() -> tuple[CalibrationArtifact, tuple[object, ...]]:
         restored_members=members,
         full_residual=residual,
         calibration_weight=weight,
-        pooling_evidence=_evidence(probability=False),
+        pooling_evidence=residual_evidence,
+        fit_row_id=rows,
     )
-    probability = np.linspace(0.04, 0.96, 40, dtype=np.float64)
-    # Both classes are present and overlap across the predictor range.
-    observation = np.asarray(
-        [int((index % 5) not in (0, 1)) for index in range(40)],
-        dtype=np.float64,
+    probability = np.linspace(0.1, 0.9, count)
+    observation = np.asarray([index % 2 for index in range(count)], dtype=np.float64)
+    probability_evidence = _evidence(
+        probability=True,
+        counts=(count, count, count, count),
+        observation=observation,
     )
-    probability_weight = np.ones(40, dtype=np.float64)
     p_record = builder.fit_regression_probability(
         p_key,
         probability=probability,
         observation=observation,
-        weight=probability_weight,
-        pooling_evidence=_evidence(probability=True),
+        weight=np.ones(count),
+        pooling_evidence=probability_evidence,
+        fit_row_id=rows,
     )
     q_record = builder.fit_ensemble_probability(
         q_key,
-        probability=probability[::-1].copy(),
+        probability=probability,
         observation=observation,
-        weight=probability_weight,
-        pooling_evidence=_evidence(probability=True),
+        weight=np.ones(count),
+        pooling_evidence=probability_evidence,
+        fit_row_id=rows,
     )
-    artifact = builder.build(release_status="complete")
-    return artifact, (
-        location_key,
-        bias_key,
-        spread_key,
-        p_key,
-        q_key,
-        location,
-        bias,
-        spread,
-        p_record,
-        q_record,
+    artifact = builder.build(release_status="development")
+    assert all(
+        record.pooling.terminal_fallback
+        for record in (location, bias, spread, p_record, q_record)
     )
-
-
-def test_pooling_ladder_is_deterministic_and_records_all_support() -> None:
-    audit = build_pooling_audit(
-        _evidence(probability=False, counts=(10, 35, 40)),
-        probability_gate=False,
+    assert (location.calibration.location_b, location.calibration.total_scale_c) == (
+        0.0,
+        1.0,
     )
-    assert audit.decision.level == "lead_provider"
-    assert tuple(level.level for level in audit.ladder) == POOLING_ORDER
-    assert [level.record_count for level in audit.ladder] == [10, 35, 40]
-    assert [level.positive_weight_record_count for level in audit.ladder] == [10, 35, 40]
-    assert audit.ladder[1].support.block_count == 35
-    assert audit.ladder[1].support.block_ess == pytest.approx(35.0)
-    assert audit.ladder[1].support.positive_support_blocks == 0
-    assert audit.ladder[1].support.negative_support_blocks == 0
-
-
-def test_probability_pooling_records_both_class_block_counts() -> None:
-    audit = build_pooling_audit(
-        _evidence(probability=True), probability_gate=True
+    assert bias.sampler_bias_d == 0.0
+    assert spread.spread_gamma == 1.0
+    assert p_record.calibration.identity and q_record.calibration.identity
+    resolver = CalibrationResolver(artifact)
+    raw_probability = torch.tensor([0.0, 0.3, 1.0], dtype=torch.float32)
+    assert (
+        resolver.apply_regression_probability(raw_probability, key=p_key)
+        is raw_probability
     )
-    assert audit.decision.level == "lead_provider_era_present"
-    assert audit.decision.support.positive_support_blocks == 20
-    assert audit.decision.support.negative_support_blocks == 20
-    with pytest.raises(ValueError, match="binary observations"):
-        build_pooling_audit(_evidence(probability=False), probability_gate=True)
+    assert resolver.apply_ensemble_probability(raw_probability, key=q_key) is raw_probability
 
 
 def test_split_and_frozen_decision_are_mandatory_before_fit() -> None:
@@ -231,17 +435,21 @@ def test_builder_fits_each_exact_table_and_d_is_not_label_selected() -> None:
     artifact, values = _fit_complete()
     location_key, bias_key, spread_key, p_key, q_key = values[:5]
     assert artifact.release_status == "complete"
-    assert len(artifact.location_scale) == 1
-    assert len(artifact.sampler_bias) == 1
-    assert len(artifact.spread) == 1
-    assert len(artifact.regression_probability) == 1
-    assert len(artifact.ensemble_probability) == 1
-    assert artifact.sampler_bias[0].sampler_bias_d == 0.0
-    assert artifact.sampler_bias[0].d_enabled is False
-    assert artifact.sampler_bias[0].location_scale_key_sha256 == (
+    assert len(artifact.location_scale) == 12
+    assert len(artifact.sampler_bias) == 12
+    assert len(artifact.spread) == 12
+    assert len(artifact.regression_probability) == 12
+    assert len(artifact.ensemble_probability) == 36
+    bias_record = next(
+        item for item in artifact.sampler_bias if item.key == bias_key
+    )
+    spread_record = next(item for item in artifact.spread if item.key == spread_key)
+    assert bias_record.sampler_bias_d == 0.0
+    assert bias_record.d_enabled is False
+    assert bias_record.location_scale_key_sha256 == (
         location_key.semantic_sha256
     )
-    assert artifact.spread[0].sampler_bias_key_sha256 == bias_key.semantic_sha256
+    assert spread_record.sampler_bias_key_sha256 == bias_key.semantic_sha256
     assert spread_key.ensemble_signature.member_count == 32
     assert p_key.threshold_mm == A_WET_MM
     assert q_key.threshold_mm == A_WET_MM
@@ -257,6 +465,22 @@ def test_builder_fits_each_exact_table_and_d_is_not_label_selected() -> None:
             artifact.ensemble_probability,
         )
         for record in records
+    )
+
+
+def test_complete_release_requires_exact_predeclared_key_coverage() -> None:
+    artifact, _ = _fit_complete()
+    with pytest.raises(ValueError, match="gamma coverage mismatch"):
+        replace(artifact, spread=artifact.spread[1:])
+    with pytest.raises(ValueError, match="q_cal coverage mismatch"):
+        replace(artifact, ensemble_probability=artifact.ensemble_probability[1:])
+
+    # Disabled d remains an explicit zero-valued record at every required cell.
+    assert artifact.model_selection.d_enabled is False
+    assert len(artifact.sampler_bias) == len(OFFICIAL_LEADS_HOURS)
+    assert all(
+        not record.d_enabled and record.sampler_bias_d == 0.0
+        for record in artifact.sampler_bias
     )
 
 
@@ -422,3 +646,67 @@ def test_complete_artifact_typed_roundtrip_rejects_unknown_or_wrong_links() -> N
     ).hexdigest()
     with pytest.raises(ValueError, match="lacks its exact sampler-bias"):
         CalibrationArtifact.from_dict(linked)
+
+
+def test_artifact_deserialization_rejects_boolean_numeric_aliases() -> None:
+    artifact, _ = _fit_complete()
+    original = artifact.to_dict()
+    mutations = (
+        (("location_scale", 0, "key", "lead_hours"), True),
+        (
+            ("sampler_bias", 0, "key", "sampler_core", "edm_steps"),
+            True,
+        ),
+        (
+            (
+                "spread",
+                0,
+                "key",
+                "ensemble_signature",
+                "member_count",
+            ),
+            False,
+        ),
+        (("regression_probability", 0, "key", "threshold_mm"), True),
+        (("ensemble_probability", 0, "key", "threshold_mm"), False),
+        (("location_scale", 0, "pooling", "ladder", 0, "record_count"), True),
+        (("location_scale", 0, "pooling", "ladder", 0, "block_ess"), True),
+        (("location_scale", 0, "parameters", "full_mean"), True),
+        (("sampler_bias", 0, "sampler_bias_d"), False),
+        (("spread", 0, "spread_gamma"), True),
+        (("regression_probability", 0, "parameters", "alpha"), True),
+        (("ensemble_probability", 0, "parameters", "iterations"), False),
+    )
+    for path, replacement in mutations:
+        raw = deepcopy(original)
+        target: object = raw
+        for component in path[:-1]:
+            target = target[component]  # type: ignore[index]
+        target[path[-1]] = replacement  # type: ignore[index]
+        semantic = dict(raw)
+        semantic.pop("semantic_sha256")
+        raw["semantic_sha256"] = __import__("hashlib").sha256(
+            json.dumps(
+                semantic,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        with pytest.raises(TypeError):
+            CalibrationArtifact.from_dict(raw)
+
+
+def test_artifact_deserialization_rejects_string_scalar_aliases() -> None:
+    artifact, _ = _fit_complete()
+    raw = artifact.to_dict()
+    raw["ensemble_probability"][0]["parameters"]["iterations"] = "12"  # type: ignore[index]
+    semantic = dict(raw)
+    semantic.pop("semantic_sha256")
+    raw["semantic_sha256"] = __import__("hashlib").sha256(
+        json.dumps(
+            semantic, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+    with pytest.raises(TypeError, match="must be an integer"):
+        CalibrationArtifact.from_dict(raw)

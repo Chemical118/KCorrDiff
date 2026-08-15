@@ -51,6 +51,7 @@ data:
   persistent_workers: true
 
 model:
+  implementation_contract: kcorrdiff.regression-geometry-advection-era.v2
   condition_dimension: 512
   activation_checkpoint: true
   physical_attention_query_chunk_size: 128

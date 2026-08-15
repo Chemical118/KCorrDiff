@@ -560,6 +560,8 @@ class LeadForecast:
         ):
             if value.shape != members.shape or value.dtype is not torch.float32:
                 raise TypeError(f"{name} must be float32 and match physical members")
+            if not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"{name} must contain only finite values")
         point_shape = (members.shape[0], 1, *members.shape[-2:])
         for name, value in (
             ("ensemble_mean_mm", self.ensemble_mean_mm),
@@ -567,9 +569,15 @@ class LeadForecast:
         ):
             if value.shape != point_shape or value.dtype is not torch.float32:
                 raise TypeError(f"{name} must be float32 [B,1,H,W]")
+            if not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"{name} must contain only finite values")
         expected_q = (members.shape[0], len(self.q_thresholds_mm), 1, *members.shape[-2:])
         if self.q_fractions.shape != expected_q or self.q_fractions.dtype is not torch.float32:
             raise TypeError("q_fractions must be float32 [B,T,1,H,W]")
+        if not bool(torch.isfinite(self.q_fractions).all().item()) or bool(
+            ((self.q_fractions < 0.0) | (self.q_fractions > 1.0)).any().item()
+        ):
+            raise ValueError("q_fractions must be finite and lie in [0,1]")
 
     @property
     def wet_fraction(self) -> Tensor:
@@ -617,6 +625,8 @@ def finalize_lead_forecast(
 
     scale = _scale_for_members(oof_residual_scale, members)
     restored = members * scale
+    if not bool(torch.isfinite(restored).all().item()):
+        raise OverflowError("OOF residual scale restoration overflowed float32")
     calibrated = apply_residual_calibration(
         restored,
         location_b=location_b,
@@ -625,6 +635,8 @@ def finalize_lead_forecast(
         spread_gamma=spread_gamma,
     )
     transformed = mu_z_full[:, None] + calibrated
+    if not bool(torch.isfinite(transformed).all().item()):
+        raise OverflowError("transformed forecast members overflowed float32")
     physical = transformed_members_to_physical(mu_z_full, calibrated)
     ensemble_mean = physical.mean(dim=1)
     ensemble_median = empirical_lower_median(physical)

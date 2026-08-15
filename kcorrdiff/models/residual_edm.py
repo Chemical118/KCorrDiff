@@ -47,6 +47,7 @@ from .common import (
     require_float32_tensor,
     require_module_float32,
     require_no_autocast,
+    sample_repeated_stride2_lattice,
     validate_input_size,
     validate_widths,
 )
@@ -180,6 +181,7 @@ class ResidualEDMConditions:
     probability_wet: Tensor
     e_cond: Tensor
     geometry: RegressionGeometry
+    sample_ids: tuple[str, ...]
     condition_signatures: tuple[str, ...]
     lead_indices: Tensor
 
@@ -250,6 +252,10 @@ class ResidualEDMConditions:
             raise TypeError("lead_indices must use int64")
         if bool(((self.lead_indices < 0) | (self.lead_indices > 11)).any().item()):
             raise ValueError("lead_indices must lie in [0,11]")
+        if len(self.sample_ids) != batch or any(
+            not isinstance(value, str) or not value for value in self.sample_ids
+        ):
+            raise ValueError("one non-empty sample identity is required per item")
         if len(self.condition_signatures) != batch or any(
             not isinstance(value, str) or not value for value in self.condition_signatures
         ):
@@ -265,6 +271,79 @@ class ResidualEDMConditions:
         )
         if any(device != devices[0] for device in devices):
             raise ValueError("all residual EDM conditions must share one device")
+
+
+def _source_cache_tensors(
+    conditions: ResidualEDMConditions,
+) -> tuple[tuple[str, Tensor], ...]:
+    """Return every tensor that determines cached source K/V or geometry."""
+
+    bank = conditions.condition_bank
+    selected: list[tuple[str, Tensor]] = [
+        ("context_l3", bank.context.l3),
+        ("context_l4", bank.context.l4),
+        ("context_validity_l3", bank.context.validity.l3),
+        ("context_validity_l4", bank.context.validity.l4),
+        ("era_features", conditions.era.features),
+        ("era_valid_token_mask", conditions.era.valid_token_mask),
+        ("era_tp_token_mask", conditions.era.tp_token_mask),
+        ("era_used_source_null", conditions.era.used_source_null),
+        ("era_used_masked_null", conditions.era.used_masked_null),
+    ]
+    for geometry_name in (
+        "target_l3",
+        "target_l4",
+        "context_l3",
+        "context_l4",
+        "era_native",
+    ):
+        geometry = getattr(conditions.geometry, geometry_name)
+        selected.extend(
+            (
+                (f"geometry_{geometry_name}_x", geometry.x_shared),
+                (f"geometry_{geometry_name}_y", geometry.y_shared),
+                (
+                    f"geometry_{geometry_name}_footprint_width",
+                    geometry.footprint_width,
+                ),
+                (
+                    f"geometry_{geometry_name}_footprint_height",
+                    geometry.footprint_height,
+                ),
+            )
+        )
+    return tuple(selected)
+
+
+@dataclass(frozen=True, slots=True)
+class _TensorCacheBinding:
+    name: str
+    tensor: Tensor
+    version: int | None
+    snapshot: Tensor | None
+
+    @classmethod
+    def capture(cls, name: str, tensor: Tensor) -> "_TensorCacheBinding":
+        try:
+            version: int | None = int(tensor._version)
+        except RuntimeError:
+            version = None
+        # `_version` catches normal in-place writes cheaply, but PyTorch's
+        # legacy `.data`/raw-storage paths can bypass it.  Cache correctness is
+        # more important than that shortcut: keep an exact private snapshot of
+        # every relatively small source/KV-dependent tensor and compare it on
+        # reuse.  This also covers inference tensors, which have no counter.
+        snapshot = tensor.detach().clone()
+        return cls(name=name, tensor=tensor, version=version, snapshot=snapshot)
+
+    def validate(self, name: str, tensor: Tensor) -> None:
+        if name != self.name or tensor is not self.tensor:
+            raise ValueError(f"source K/V cache {self.name} tensor identity mismatch")
+        if self.version is not None:
+            if int(tensor._version) != self.version:
+                raise ValueError(f"source K/V cache {self.name} tensor was mutated")
+        if self.snapshot is None or not torch.equal(self.snapshot, tensor.detach()):
+            raise ValueError(f"source K/V cache {self.name} tensor was mutated")
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,8 +371,11 @@ class ResidualEDMSourceKVCache:
     owner_id: int
     variant: EDMVariant
     lead_indices: Tensor
+    sample_ids: tuple[str, ...]
     condition_signatures: tuple[str, ...]
     e_cond_key: Tensor
+    source_bindings: tuple[_TensorCacheBinding, ...]
+    model_bindings: tuple[_TensorCacheBinding, ...]
     context_l3: _AttentionSourceKV
     era_l3: _AttentionSourceKV
     context_l4: _AttentionSourceKV
@@ -306,6 +388,8 @@ class ResidualEDMSourceKVCache:
             raise AssertionError("source K/V cache must not contain sigma")
         if self.lead_indices.dtype is not torch.int64 or self.lead_indices.ndim != 1:
             raise TypeError("cached lead_indices must be int64 [B]")
+        if len(self.sample_ids) != self.lead_indices.shape[0]:
+            raise ValueError("cached sample identity count must match the batch")
         if (
             self.e_cond_key.dtype is not torch.float32
             or self.e_cond_key.ndim != 2
@@ -649,6 +733,39 @@ class ResidualEDM(nn.Module):
             widths[4], ERA_OUTPUT_CHANNELS, "diffusion_era_l4"
         )
 
+    def _source_cache_model_tensors(self) -> tuple[tuple[str, Tensor], ...]:
+        """Return model state that determines cached source K/V or bias.
+
+        Query normalization/projection, output projection, and the gate are
+        deliberately excluded: they are evaluated after cache validation on
+        every denoising call.  All source normalization, K/V projection, and
+        physical-bias state is bound for every independent source/level arm.
+        """
+
+        selected: list[tuple[str, Tensor]] = []
+        cached_parameter_prefixes = (
+            "source_norm.",
+            "key_projection.",
+            "value_projection.",
+            "geometry_bias.",
+        )
+        for attention_name in (
+            "context_attention_l3",
+            "era_attention_l3",
+            "context_attention_l4",
+            "era_attention_l4",
+        ):
+            core = getattr(self, attention_name).core
+            for state_name, parameter in core.named_parameters():
+                if state_name.startswith(cached_parameter_prefixes):
+                    selected.append(
+                        (f"model_{attention_name}.{state_name}", parameter)
+                    )
+            for state_name, buffer in core.named_buffers():
+                if state_name == "geometry_frequencies":
+                    selected.append((f"model_{attention_name}.{state_name}", buffer))
+        return tuple(selected)
+
     def _validate_conditions(self, conditions: ResidualEDMConditions) -> None:
         if not isinstance(conditions, ResidualEDMConditions):
             raise TypeError("ResidualEDM expects ResidualEDMConditions")
@@ -771,8 +888,17 @@ class ResidualEDM(nn.Module):
             owner_id=id(self),
             variant=self.config.variant,
             lead_indices=conditions.lead_indices.detach().clone(),
+            sample_ids=tuple(conditions.sample_ids),
             condition_signatures=tuple(conditions.condition_signatures),
             e_cond_key=e_cond.clone(),
+            source_bindings=tuple(
+                _TensorCacheBinding.capture(name, tensor)
+                for name, tensor in _source_cache_tensors(conditions)
+            ),
+            model_bindings=tuple(
+                _TensorCacheBinding.capture(name, tensor)
+                for name, tensor in self._source_cache_model_tensors()
+            ),
             context_l3=context_l3,
             era_l3=era_l3,
             context_l4=context_l4,
@@ -788,12 +914,28 @@ class ResidualEDM(nn.Module):
             raise TypeError("source_cache must be a ResidualEDMSourceKVCache")
         if cache.owner_id != id(self) or cache.variant != self.config.variant:
             raise ValueError("source K/V cache belongs to another residual EDM")
+        if cache.sample_ids != conditions.sample_ids:
+            raise ValueError("source K/V cache sample identity mismatch")
         if cache.condition_signatures != conditions.condition_signatures:
             raise ValueError("source K/V cache condition signature mismatch")
         if not torch.equal(cache.lead_indices, conditions.lead_indices):
             raise ValueError("source K/V cache lead mismatch")
         if not torch.equal(cache.e_cond_key, conditions.e_cond.detach()):
             raise ValueError("source K/V cache e_cond/input mismatch")
+        current = _source_cache_tensors(conditions)
+        if len(cache.source_bindings) != len(current):
+            raise ValueError("source K/V cache tensor binding schema mismatch")
+        for binding, (name, tensor) in zip(
+            cache.source_bindings, current, strict=True
+        ):
+            binding.validate(name, tensor)
+        current_model = self._source_cache_model_tensors()
+        if len(cache.model_bindings) != len(current_model):
+            raise ValueError("source K/V cache model binding schema mismatch")
+        for binding, (name, tensor) in zip(
+            cache.model_bindings, current_model, strict=True
+        ):
+            binding.validate(name, tensor)
 
     def _conditioned_level(
         self,
@@ -805,11 +947,10 @@ class ResidualEDM(nn.Module):
         if self.deployment_adapters is not None:
             deployment = conditions.condition_bank.target.features.levels[level].detach()
             hidden = hidden + self.deployment_adapters[level](deployment)
-        resized = F.interpolate(
+        resized = sample_repeated_stride2_lattice(
             conditions.advection_features.detach(),
-            size=hidden.shape[-2:],
-            mode="bilinear",
-            align_corners=True,
+            downsampling_levels=level,
+            expected_shape=tuple(hidden.shape[-2:]),
         )
         confidence = resized[:, 6:7].clamp(0.0, 1.0)
         return self.advection_adapters[level](hidden, resized, e_diff, confidence)

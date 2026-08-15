@@ -33,7 +33,7 @@ data:
     - null_provider:era=0:tp=0:no_era_access
   oof_dtype: float32
   oof_fields: [occurrence_probability, mu_z]
-  target_builder_version: kcorrdiff.accumulation.v1.1.3b-trapezoid
+  target_builder_version: v1.1.3b.trapezoid-7-scan.cprecnet-normalized-to-linear
   mmap_lazy_per_worker: true
   pin_memory: true
   persistent_workers: true
@@ -153,6 +153,7 @@ calibration:
   p_thresholds_mm: [0.1]
   q_thresholds_mm: [0.1, 1.0, 5.0]
   pooling_order:
+    - full_cell
     - lead_provider_era_present
     - lead_provider
     - lead_only

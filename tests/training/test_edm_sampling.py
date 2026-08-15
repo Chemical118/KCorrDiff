@@ -261,6 +261,23 @@ def test_memberwise_censor_lower_median_and_raw_q_thresholds() -> None:
     assert torch.equal(forecast.wet_fraction, forecast.q_fractions[:, 0])
 
 
+def test_finalization_rejects_finite_latent_that_would_overflow_expm1() -> None:
+    signature = _smoke_signature()
+    normalized = torch.full((1, 4, 1, 1, 1), 100.0, dtype=torch.float32)
+    with pytest.raises(OverflowError, match="representable float32 physical range"):
+        finalize_lead_forecast(
+            normalized_residual_members=normalized,
+            mu_z_full=torch.zeros(1, 1, 1, 1, dtype=torch.float32),
+            oof_residual_scale=1.0,
+            location_b=0.0,
+            total_scale_c=1.0,
+            sampler_bias_d=0.0,
+            spread_gamma=1.0,
+            lead_hours=1.0,
+            ensemble_signature=signature,
+        )
+
+
 def test_sampling_api_has_no_future_label_or_mask_argument() -> None:
     parameters = inspect.signature(sample_normalized_residual_ensemble).parameters
     assert not any("target" in name or "mask" in name or "label" in name for name in parameters)

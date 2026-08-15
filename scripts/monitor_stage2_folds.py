@@ -12,8 +12,8 @@ from typing import Mapping, Sequence
 
 
 NAMESPACE = "ws-md93se6gk3270"
-TRAINING_JOB = "kcorrdiff-stage2-folds-porsche-v2"
-INSTANCE = "stage2-folds-porsche-v2"
+TRAINING_JOB = "kcorrdiff-stage2-folds-porsche-v3"
+INSTANCE = "stage2-folds-porsche-v3"
 
 
 def _kubectl_json(*arguments: str) -> Mapping[str, object]:

@@ -57,6 +57,11 @@ def test_checkpoint_records_bind_content_blocks_and_manifests(tmp_path: Path) ->
     )
     assert len(record.sha256) == 64
     assert len(checkpoint_set_hash([record])) == 64
+    relocated = replace(record, path="/another/pvc/release/fold.pt")
+    assert checkpoint_set_hash([relocated]) == checkpoint_set_hash([record])
+    assert checkpoint_set_hash([replace(record, sha256="e" * 64)]) != checkpoint_set_hash(
+        [record]
+    )
     with pytest.raises(ValueError, match="role/fold"):
         checkpoint_record(
             checkpoint,
