@@ -254,7 +254,8 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   `599 passed, 7 skipped`이고 skip은 CUDA/pin-memory 전용 7개뿐이다.
 - 수정 전 `/workspace/code/stage2-folds-porsche-v2`는 config/source identity와 모델
   입력 의미가 모두 달라 새 importer가 거부한다. training과 collector Job은
-  `spec.suspend=true`로 중단했고 PVC의 fold0 final 및 fold1 latest artifact는 보존했다.
+  먼저 `spec.suspend=true`로 중단한 뒤 Kubernetes에서 삭제했다. PVC의 fold0 final,
+  fold1 latest artifact와 로그는 삭제하지 않고 보존했다.
 - 수정본은 별도 read-only `/workspace/code/stage2-folds-porsche-v3` snapshot으로
   게시했다. 기존 v2 source/run 경로는 덮어쓰거나 삭제하지 않았다.
 - porsche A100-SXM4-40GB에서 CUDA 전용 7개를 재실행해 `7 passed`를 확인했다.
