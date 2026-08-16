@@ -726,6 +726,146 @@ class RegressionModelBatch:
     def batch_size(self) -> int:
         return int(self.embedding.lead_hours.shape[0])
 
+    def select_rows(self, indices: Sequence[int]) -> "RegressionModelBatch":
+        """Select model-only rows, retaining storage views for one-row cells."""
+
+        rows = tuple(indices)
+        if not rows:
+            raise ValueError("row selection cannot be empty")
+        if any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= self.batch_size
+            for index in rows
+        ):
+            raise IndexError("row selection contains an invalid batch index")
+        index = torch.tensor(rows, dtype=torch.int64, device=self.device)
+
+        def selected(value: Tensor) -> Tensor:
+            if len(rows) == 1:
+                return value[rows[0] : rows[0] + 1]
+            return value.index_select(0, index)
+
+        def geometry_rows(value: PhysicalTokenGeometry) -> PhysicalTokenGeometry:
+            def field_rows(field: Tensor) -> Tensor:
+                return selected(field) if field.ndim == 3 else field
+
+            return PhysicalTokenGeometry(
+                x_shared=field_rows(value.x_shared),
+                y_shared=field_rows(value.y_shared),
+                footprint_width=field_rows(value.footprint_width),
+                footprint_height=field_rows(value.footprint_height),
+            )
+
+        target = self.condition_bank.target
+        context = self.condition_bank.context
+        context_dynamic = selected(context.dynamic_fields)
+        bank = ConditionBankInputs(
+            target=TargetEncoderInputs(
+                radar_history=selected(target.radar_history),
+                history_validity=selected(target.history_validity),
+                static_fields=selected(target.static_fields),
+                static_coverage=selected(target.static_coverage),
+                static_channel_names=target.static_channel_names,
+            ),
+            context=ContextEncoderInputs(
+                dynamic_fields=context_dynamic,
+                detail_validity=selected(context.detail_validity),
+                static_fields=selected(context.static_fields),
+                dynamic_channel_names=context.dynamic_channel_names,
+                static_channel_names=context.static_channel_names,
+            ),
+        )
+        era = self.era
+        era_rows = EraModelInputs(
+            values=selected(era.values),
+            delta_hours=selected(era.delta_hours),
+            tp_interval_center_delta_hours=selected(
+                era.tp_interval_center_delta_hours
+            ),
+            data_valid_inst=selected(era.data_valid_inst),
+            tp_valid=selected(era.tp_valid),
+            trajectory_window_mask=selected(era.trajectory_window_mask),
+            temporal_access_mask=selected(era.temporal_access_mask),
+            era_present=selected(era.era_present),
+            tp_present=selected(era.tp_present),
+            valid_times_utc=tuple(era.valid_times_utc[row] for row in rows),
+            tp_intervals_utc=tuple(era.tp_intervals_utc[row] for row in rows),
+            condition_signatures=tuple(
+                era.condition_signatures[row] for row in rows
+            ),
+            provenance=tuple(era.provenance[row] for row in rows),
+            channel_names=era.channel_names,
+            value_space=era.value_space,
+            normalization_artifact_id=era.normalization_artifact_id,
+        )
+        causal = self.advection.causal
+        if self.advection.context_channels_alias_condition_bank:
+            context_rate = context_dynamic[:, :, 0]
+            context_valid = context_dynamic[:, :, 3]
+            context_confidence = context_dynamic[:, :, 4]
+        else:
+            context_rate = selected(causal.context_rate_mm_per_hour)
+            context_valid = selected(causal.context_valid_fraction)
+            context_confidence = selected(causal.context_interpolation_confidence)
+        selected_t0 = tuple(causal.t0_utc[row] for row in rows)
+        selected_history = tuple(causal.history_times_utc[row] for row in rows)
+        selected_signatures = tuple(
+            self.provenance.condition_signatures[row] for row in rows
+        )
+        groups: dict[tuple[datetime, str], list[int]] = {}
+        for new_index, key in enumerate(zip(selected_t0, selected_signatures, strict=True)):
+            groups.setdefault(key, []).append(new_index)
+        duplicate_groups = tuple(
+            tuple(group) for group in groups.values() if len(group) > 1
+        )
+        return RegressionModelBatch(
+            condition_bank=bank,
+            embedding=ConditionEmbeddingInputs(
+                lead_hours=selected(self.embedding.lead_hours),
+                verification_cyclic=selected(self.embedding.verification_cyclic),
+            ),
+            era=era_rows,
+            advection=AdvectionModelInputs(
+                causal=CausalAdvectionInput(
+                    t0_utc=selected_t0,
+                    history_times_utc=selected_history,
+                    target_rate_mm_per_hour=selected(
+                        causal.target_rate_mm_per_hour
+                    ),
+                    target_valid=selected(causal.target_valid),
+                    context_rate_mm_per_hour=context_rate,
+                    context_valid_fraction=context_valid,
+                    context_interpolation_confidence=context_confidence,
+                ),
+                geometry=self.advection.geometry,
+                lead_indices=selected(self.advection.lead_indices),
+                context_channels_alias_condition_bank=(
+                    self.advection.context_channels_alias_condition_bank
+                ),
+            ),
+            geometry=RegressionGeometry(
+                target_l3=geometry_rows(self.geometry.target_l3),
+                target_l4=geometry_rows(self.geometry.target_l4),
+                context_l3=geometry_rows(self.geometry.context_l3),
+                context_l4=geometry_rows(self.geometry.context_l4),
+                era_native=geometry_rows(self.geometry.era_native),
+            ),
+            provenance=BatchProvenance(
+                sample_ids=tuple(self.provenance.sample_ids[row] for row in rows),
+                block_ids=tuple(self.provenance.block_ids[row] for row in rows),
+                fold_ids=tuple(self.provenance.fold_ids[row] for row in rows),
+                t0_utc=tuple(self.provenance.t0_utc[row] for row in rows),
+                history_times_utc=tuple(
+                    self.provenance.history_times_utc[row] for row in rows
+                ),
+                condition_signatures=selected_signatures,
+                duplicate_condition_groups=duplicate_groups,
+                explicit_history_copies=self.provenance.explicit_history_copies,
+            ),
+        )
+
     def to(
         self, device: torch.device | str, *, non_blocking: bool = False
     ) -> "RegressionModelBatch":

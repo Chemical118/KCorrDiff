@@ -5,7 +5,9 @@ import gc
 import pytest
 import torch
 
+import kcorrdiff.models.regression_system as regression_system_module
 from kcorrdiff.data.advection import DenseFlow, build_causal_advection
+from kcorrdiff.data.time_features import OFFICIAL_LEAD_HOURS
 from kcorrdiff.models.common import configure_strict_fp32_runtime
 from kcorrdiff.models.regression_system import (
     DirectPhysicalRegressionSystem,
@@ -162,6 +164,154 @@ def test_one_central_condition_embedding_one_era_frame_cache_and_requested_lead(
     )
 
 
+def test_issue_time_cache_reuses_shared_work_for_all_twelve_leads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(411)
+    batches = tuple(make_batch(leads=(lead,)) for lead in OFFICIAL_LEAD_HOURS)
+    model = RegressionSystem(small_config()).eval()
+
+    with torch.inference_mode():
+        expected = tuple(
+            model(batch.model, flow_override=zero_flow(batch, model.config))
+            for batch in batches
+        )
+
+    calls = {
+        "target": 0,
+        "context": 0,
+        "era_frames": 0,
+        "advection": 0,
+        "embedding": 0,
+        "regression": 0,
+    }
+
+    def increment(name: str):
+        def hook(*_args: object) -> None:
+            calls[name] += 1
+
+        return hook
+
+    handles = (
+        model.condition_bank.target_encoder.register_forward_hook(increment("target")),
+        model.condition_bank.context_encoder.register_forward_hook(increment("context")),
+        model.era_encoder.instantaneous_projection.register_forward_hook(
+            increment("era_frames")
+        ),
+        model.condition_bank.condition_embedding.register_forward_hook(
+            increment("embedding")
+        ),
+        model.regression.register_forward_hook(increment("regression")),
+    )
+    original_advection = regression_system_module.build_causal_advection
+
+    def counted_advection(*args, **kwargs):
+        calls["advection"] += 1
+        return original_advection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        regression_system_module, "build_causal_advection", counted_advection
+    )
+    with torch.inference_mode():
+        cache = model._prepare_issue_time_cache(
+            batches[0].model,
+            flow_override=zero_flow(batches[0], model.config),
+        )
+        actual = tuple(
+            model._forward_from_issue_time_cache(batch.model, cache)
+            for batch in batches
+        )
+    for handle in handles:
+        handle.remove()
+
+    assert calls == {
+        "target": 1,
+        "context": 1,
+        "era_frames": 1,
+        "advection": 1,
+        "embedding": 12,
+        "regression": 12,
+    }
+    assert cache.advection_features_all_leads.shape == (1, 12, 8, 16, 16)
+    assert cache.advection_provenance.full_trajectory_cached is False
+    for cached, uncached in zip(actual, expected, strict=True):
+        assert cached.condition_cache is cache.condition_bank
+        assert cached.era_frame_cache is cache.era_frames
+        torch.testing.assert_close(cached.e_cond, uncached.e_cond, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            cached.advection.features,
+            uncached.advection.features,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            cached.era_query.features,
+            uncached.era_query.features,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(cached.mu_z, uncached.mu_z, rtol=0.0, atol=0.0)
+
+
+def test_issue_time_cache_is_inference_only_and_bound_to_exact_inputs() -> None:
+    reference = make_batch(leads=(0.5,))
+    later = make_batch(leads=(1.0,))
+    model = RegressionSystem(small_config()).eval()
+
+    with pytest.raises(ValueError, match="torch.inference_mode"):
+        model._prepare_issue_time_cache(reference.model)
+    with torch.inference_mode():
+        cache = model._prepare_issue_time_cache(
+            reference.model,
+            flow_override=zero_flow(reference, model.config),
+        )
+        mutable_cache = model._prepare_issue_time_cache(
+            reference.model,
+            flow_override=zero_flow(reference, model.config),
+        )
+        other = RegressionSystem(small_config()).eval()
+        with pytest.raises(ValueError, match="another regression model"):
+            other._forward_from_issue_time_cache(later.model, cache)
+
+    mutable_cache.advection_features_all_leads[:, 1].fill_(123.0)
+    with torch.inference_mode(), pytest.raises(
+        RuntimeError, match="advection.all_leads.*changed after preparation"
+    ):
+        model._forward_from_issue_time_cache(reference.model, mutable_cache)
+
+    later.model.condition_bank.target.radar_history[0, 0, 0, 0, 0] = 0.4
+    with torch.inference_mode(), pytest.raises(
+        ValueError, match="target.radar_history.*changed across leads"
+    ):
+        model._forward_from_issue_time_cache(later.model, cache)
+
+    model.train()
+    with torch.inference_mode(), pytest.raises(ValueError, match="eval"):
+        model._prepare_issue_time_cache(reference.model)
+
+    model.eval()
+    with torch.inference_mode():
+        inference_tensor_batch = make_batch(leads=(0.5,))
+        with pytest.raises(ValueError, match="must track mutations"):
+            model._prepare_issue_time_cache(inference_tensor_batch.model)
+
+    mutation_batch = make_batch(leads=(0.5,))
+    mutated_model = RegressionSystem(small_config()).eval()
+    with torch.inference_mode():
+        model_cache = mutated_model._prepare_issue_time_cache(
+            mutation_batch.model,
+            flow_override=zero_flow(mutation_batch, mutated_model.config),
+        )
+    with torch.no_grad():
+        next(mutated_model.regression.parameters()).add_(1.0)
+    with torch.inference_mode(), pytest.raises(
+        RuntimeError, match="parameter.*changed after preparation"
+    ):
+        mutated_model._forward_from_issue_time_cache(
+            mutation_batch.model, model_cache
+        )
+
+
 def test_system_never_accepts_training_batch_or_loss_fields() -> None:
     batch = make_batch(leads=(0.5,))
     assert isinstance(batch, TrainingBatch)
@@ -276,10 +426,17 @@ def test_activation_checkpoint_and_query_chunk_propagate_to_every_regression_arm
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_training_batch_to_cuda_and_full_forward_device_contract() -> None:
     batch = make_batch(leads=(0.5,)).to("cuda")
+    later = make_batch(leads=(1.0,)).to("cuda")
     model = RegressionSystem(small_config()).cuda().eval()
     flow = zero_flow(batch, model.config)
     with torch.no_grad():
         output = model(batch.model, flow_override=flow)
+    with torch.inference_mode():
+        cache = model._prepare_issue_time_cache(batch.model, flow_override=flow)
+        cached = model._forward_from_issue_time_cache(later.model, cache)
     assert output.mu_z.device.type == "cuda"
     assert output.e_cond.dtype is torch.float32
     assert output.advection.features.device.type == "cuda"
+    assert cached.mu_z.device.type == "cuda"
+    assert cache.advection_features_all_leads.device.type == "cuda"
+    assert all(value.device.type == "cuda" for value in cache.physical_bias.tensors)

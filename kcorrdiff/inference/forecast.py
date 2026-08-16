@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Real
-from typing import Literal, TypeAlias
+from types import MappingProxyType
+from typing import Literal, Mapping, TypeAlias
 
 import torch
 from torch import Tensor
@@ -33,7 +34,7 @@ from kcorrdiff.inference.identity import (
     DevelopmentScaleAudit,
     VerifiedForecastIdentity,
 )
-from kcorrdiff.models.regression_system import RegressionSystemOutput
+from kcorrdiff.models.regression_system import RegressionSystem, RegressionSystemOutput
 from kcorrdiff.models.residual_edm import ResidualEDM, ResidualEDMConditions
 from kcorrdiff.training.batch import RegressionModelBatch
 from kcorrdiff.training.calibration import (
@@ -50,6 +51,96 @@ from kcorrdiff.training.stage3_data import ResidualScaleRecord
 
 ForecastIdentity: TypeAlias = VerifiedForecastIdentity | DevelopmentForecastIdentity
 ResidualScaleAudit: TypeAlias = ResidualScaleRecord | DevelopmentScaleAudit
+
+
+@dataclass(frozen=True, slots=True)
+class TwelveLeadForecastRequest:
+    """Canonical artifact-bound identities and batches for one issue time."""
+
+    identities: tuple[ForecastIdentity, ...]
+    batches: tuple[RegressionModelBatch, ...]
+
+    @classmethod
+    def from_mixed_batch(
+        cls,
+        *,
+        identities: tuple[ForecastIdentity, ...],
+        batch: RegressionModelBatch,
+    ) -> "TwelveLeadForecastRequest":
+        """Split one canonical shared-t0 batch into storage-sharing lead views."""
+
+        if not isinstance(batch, RegressionModelBatch):
+            raise TypeError("batch must be a RegressionModelBatch")
+        if batch.batch_size != len(OFFICIAL_LEAD_HOURS):
+            raise ValueError("mixed twelve-lead batch must contain exactly 12 rows")
+        observed = tuple(float(value) for value in batch.embedding.lead_hours.tolist())
+        if observed != OFFICIAL_LEAD_HOURS:
+            raise ValueError("mixed batch rows must use canonical lead order")
+        return cls(
+            identities=tuple(identities),
+            batches=tuple(
+                batch.select_rows((index,))
+                for index in range(len(OFFICIAL_LEAD_HOURS))
+            ),
+        )
+
+    def __post_init__(self) -> None:
+        identities = tuple(self.identities)
+        batches = tuple(self.batches)
+        object.__setattr__(self, "identities", identities)
+        object.__setattr__(self, "batches", batches)
+        if len(identities) != len(OFFICIAL_LEAD_HOURS) or len(batches) != len(
+            OFFICIAL_LEAD_HOURS
+        ):
+            raise ValueError("a twelve-lead request requires exactly 12 cells")
+        if any(
+            not isinstance(
+                identity, (VerifiedForecastIdentity, DevelopmentForecastIdentity)
+            )
+            for identity in identities
+        ):
+            raise TypeError("every cell requires a verified or development identity")
+        if any(not isinstance(batch, RegressionModelBatch) for batch in batches):
+            raise TypeError("every twelve-lead cell requires a RegressionModelBatch")
+        if any(batch.batch_size != 1 for batch in batches):
+            raise ValueError("one twelve-lead request represents exactly one issue time")
+        if tuple(identity.lead_hours for identity in identities) != OFFICIAL_LEAD_HOURS:
+            raise ValueError("twelve-lead identities must use canonical lead order")
+
+        first = identities[0]
+        for identity in identities[1:]:
+            if type(identity) is not type(first) or identity.mode != first.mode:
+                raise ValueError("production and development identities cannot be mixed")
+            if identity.condition_signature != first.condition_signature:
+                raise ValueError("twelve-lead identities must share one condition signature")
+            if identity.regression_binding is not first.regression_binding:
+                raise ValueError("twelve-lead identities must share one regression binding")
+            if identity.residual_binding is not first.residual_binding:
+                raise ValueError("twelve-lead identities must share one residual binding")
+            if identity.calibration is not first.calibration:
+                raise ValueError("twelve-lead identities must share one calibration resolver")
+            if identity.ensemble_signature != first.ensemble_signature:
+                raise ValueError("twelve-lead identities must share one ensemble signature")
+            if identity.fold_checkpoint_sha256s != first.fold_checkpoint_sha256s:
+                raise ValueError("twelve-lead identities must share regression fold lineage")
+        if isinstance(first, VerifiedForecastIdentity):
+            for identity in identities[1:]:
+                assert isinstance(identity, VerifiedForecastIdentity)
+                if (
+                    identity.stage3_data_semantic_sha256
+                    != first.stage3_data_semantic_sha256
+                    or identity.calibration_semantic_sha256
+                    != first.calibration_semantic_sha256
+                    or identity.model_selection is not first.model_selection
+                ):
+                    raise ValueError(
+                        "production twelve-lead identities must share one release"
+                    )
+
+    def validate(self) -> None:
+        """Revalidate a frozen request after possible low-level mutation."""
+
+        self.__post_init__()
 
 
 def _probability_tensor(value: Tensor, *, name: str, shape: tuple[int, ...]) -> None:
@@ -260,6 +351,57 @@ class RegressionOnlyLeadForecastResult:
 ForecastResult: TypeAlias = (
     EnsembleLeadForecastResult | RegressionOnlyLeadForecastResult
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TwelveLeadForecastResult:
+    """Canonical marginal results from one shared issue-time cache."""
+
+    results: tuple[ForecastResult, ...]
+    condition_signature: str
+    identity_mode: Literal["production", "development"]
+
+    def __post_init__(self) -> None:
+        results = tuple(self.results)
+        object.__setattr__(self, "results", results)
+        if len(results) != len(OFFICIAL_LEAD_HOURS):
+            raise ValueError("twelve-lead result requires exactly 12 forecasts")
+        if any(
+            not isinstance(
+                result,
+                (EnsembleLeadForecastResult, RegressionOnlyLeadForecastResult),
+            )
+            for result in results
+        ):
+            raise TypeError("twelve-lead result contains an invalid forecast type")
+        observed = tuple(
+            result.marginal.lead_hours
+            if isinstance(result, EnsembleLeadForecastResult)
+            else result.lead_hours
+            for result in results
+        )
+        if observed != OFFICIAL_LEAD_HOURS:
+            raise ValueError("twelve-lead results must use canonical lead order")
+        if not self.condition_signature:
+            raise ValueError("twelve-lead result condition signature cannot be empty")
+        if self.identity_mode not in {"production", "development"}:
+            raise ValueError("twelve-lead result identity mode is invalid")
+        for result in results:
+            if (
+                result.residual_scale_audit.condition_signature
+                != self.condition_signature
+            ):
+                raise ValueError("twelve-lead result condition signature changed")
+            if result.identity_mode != self.identity_mode:
+                raise ValueError("twelve-lead result identity modes differ")
+
+    @property
+    def by_lead(self) -> Mapping[float, ForecastResult]:
+        return MappingProxyType(dict(zip(OFFICIAL_LEAD_HOURS, self.results, strict=True)))
+
+    @property
+    def fully_calibrated(self) -> bool:
+        return all(result.fully_calibrated for result in self.results)
 
 
 def _validate_identity_batch(
@@ -491,17 +633,13 @@ def _sample_identity_lead(
     )
 
 
-def _forecast_no_context(
-    identity: ForecastIdentity, batch: RegressionModelBatch
+def _forecast_from_deployment(
+    *,
+    identity: ForecastIdentity,
+    batch: RegressionModelBatch,
+    deployment: RegressionSystemOutput,
+    residual: ResidualEDM,
 ) -> ForecastResult:
-    regression, residual = identity.validate_model_bindings()
-    _validate_identity_batch(identity, batch)
-    if next(regression.parameters()).device != batch.device:
-        raise ValueError("regression model and batch must share a device")
-    if next(residual.parameters()).device != batch.device:
-        raise ValueError("residual model and batch must share a device")
-
-    deployment = regression(batch)
     signatures = tuple(deployment.condition_signatures)
     if signatures != (identity.condition_signature,) * batch.batch_size:
         raise RuntimeError("regression output condition signature changed")
@@ -546,6 +684,25 @@ def _forecast_no_context(
     )
 
 
+def _forecast_no_context(
+    identity: ForecastIdentity, batch: RegressionModelBatch
+) -> ForecastResult:
+    regression, residual = identity.validate_model_bindings()
+    _validate_identity_batch(identity, batch)
+    if next(regression.parameters()).device != batch.device:
+        raise ValueError("regression model and batch must share a device")
+    if next(residual.parameters()).device != batch.device:
+        raise ValueError("residual model and batch must share a device")
+
+    deployment = regression(batch)
+    return _forecast_from_deployment(
+        identity=identity,
+        batch=batch,
+        deployment=deployment,
+        residual=residual,
+    )
+
+
 def forecast_regression_diffusion_lead(
     *,
     identity: ForecastIdentity,
@@ -574,10 +731,82 @@ def forecast_regression_diffusion_lead(
         return _forecast_no_context(identity, batch)
 
 
+def forecast_regression_diffusion_12_leads(
+    *, request: TwelveLeadForecastRequest
+) -> TwelveLeadForecastResult:
+    """Forecast all official leads from one internally bound issue-time cache."""
+
+    if not isinstance(request, TwelveLeadForecastRequest):
+        raise TypeError("request must be a TwelveLeadForecastRequest")
+    request.validate()
+    device = request.batches[0].device
+    with torch.inference_mode(), torch.autocast(
+        device_type=device.type, enabled=False
+    ):
+        regression: RegressionSystem | None = None
+        residual: ResidualEDM | None = None
+        for identity, batch in zip(
+            request.identities, request.batches, strict=True
+        ):
+            batch.validate()
+            _validate_identity_batch(identity, batch)
+            selected_regression, selected_residual = identity.validate_model_bindings()
+            if next(selected_regression.parameters()).device != batch.device:
+                raise ValueError("regression model and batch must share a device")
+            if next(selected_residual.parameters()).device != batch.device:
+                raise ValueError("residual model and batch must share a device")
+            if batch.device != device:
+                raise ValueError("all twelve lead batches must share one device")
+            if regression is None:
+                regression = selected_regression
+                residual = selected_residual
+            elif selected_regression is not regression or selected_residual is not residual:
+                raise RuntimeError("twelve-lead model bindings changed during validation")
+
+        if regression is None or residual is None:  # pragma: no cover - fixed length.
+            raise AssertionError("twelve-lead request unexpectedly contained no cells")
+        validated_batches = regression._validate_issue_time_batches(request.batches)
+        cache = regression._prepare_issue_time_cache(validated_batches[0])
+        results: list[ForecastResult] = []
+        for identity, batch in zip(
+            request.identities, validated_batches, strict=True
+        ):
+            current_regression, current_residual = identity.validate_model_bindings()
+            if current_regression is not regression or current_residual is not residual:
+                raise RuntimeError("twelve-lead model binding changed before regression")
+            batch.validate()
+            _validate_identity_batch(identity, batch)
+            deployment = regression._forward_from_issue_time_cache(batch, cache)
+            batch.validate()
+            _validate_identity_batch(identity, batch)
+            current_regression, current_residual = identity.validate_model_bindings()
+            if current_regression is not regression or current_residual is not residual:
+                raise RuntimeError("twelve-lead model binding changed before sampling")
+            results.append(
+                _forecast_from_deployment(
+                    identity=identity,
+                    batch=batch,
+                    deployment=deployment,
+                    residual=residual,
+                )
+            )
+            final_regression, final_residual = identity.validate_model_bindings()
+            if final_regression is not regression or final_residual is not residual:
+                raise RuntimeError("twelve-lead model binding changed during sampling")
+        return TwelveLeadForecastResult(
+            results=tuple(results),
+            condition_signature=request.identities[0].condition_signature,
+            identity_mode=request.identities[0].mode,
+        )
+
+
 __all__ = [
     "EnsembleLeadForecastResult",
     "ForecastIdentity",
     "ForecastResult",
     "RegressionOnlyLeadForecastResult",
+    "TwelveLeadForecastRequest",
+    "TwelveLeadForecastResult",
+    "forecast_regression_diffusion_12_leads",
     "forecast_regression_diffusion_lead",
 ]

@@ -17,6 +17,9 @@ from kcorrdiff.inference.calibration_audit import (
 from kcorrdiff.inference.forecast import (
     EnsembleLeadForecastResult,
     RegressionOnlyLeadForecastResult,
+    TwelveLeadForecastRequest,
+    TwelveLeadForecastResult,
+    forecast_regression_diffusion_12_leads,
     forecast_regression_diffusion_lead,
 )
 from kcorrdiff.inference.identity import (
@@ -30,6 +33,7 @@ from kcorrdiff.inference.model_binding import (
 from kcorrdiff.models.common import configure_strict_fp32_runtime
 from kcorrdiff.models.regression_system import RegressionSystem, RegressionSystemConfig
 from kcorrdiff.models.residual_edm import ResidualEDM, ResidualEDMConfig
+from kcorrdiff.data.time_features import OFFICIAL_LEAD_HOURS
 from kcorrdiff.training.calibration_artifact import (
     CalibrationResolver,
     EnsembleProbabilityKey,
@@ -207,6 +211,159 @@ def test_identity_only_forecast_runs_without_autograd_or_autocast(
     assert identity.ensemble_signature.sampler_core.checkpoint_id == (
         development_case.residual_binding.checkpoint_sha256
     )
+
+
+def test_twelve_lead_forecast_reuses_one_issue_time_cache_and_matches_single_lead(
+    development_case: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identities = tuple(
+        development_case.identity(lead_hours=lead) for lead in OFFICIAL_LEAD_HOURS
+    )
+    mixed_batch = make_batch(leads=OFFICIAL_LEAD_HOURS).model
+    request = TwelveLeadForecastRequest.from_mixed_batch(
+        identities=identities, batch=mixed_batch
+    )
+    batches = request.batches
+    calls = {"target": 0, "context": 0, "era": 0, "embedding": 0, "regression": 0}
+
+    def increment(name: str):
+        def hook(*_args: object) -> None:
+            calls[name] += 1
+
+        return hook
+
+    handles = (
+        development_case.regression.condition_bank.target_encoder.register_forward_hook(
+            increment("target")
+        ),
+        development_case.regression.condition_bank.context_encoder.register_forward_hook(
+            increment("context")
+        ),
+        development_case.regression.era_encoder.instantaneous_projection.register_forward_hook(
+            increment("era")
+        ),
+        development_case.regression.condition_bank.condition_embedding.register_forward_hook(
+            increment("embedding")
+        ),
+        development_case.regression.regression.register_forward_hook(
+            increment("regression")
+        ),
+    )
+
+    def zero_sampler(**kwargs):
+        signature = kwargs["ensemble_signature"]
+        height, width = kwargs["spatial_shape"]
+        return torch.zeros(
+            len(kwargs["sample_ids"]),
+            signature.member_count,
+            1,
+            height,
+            width,
+            dtype=torch.float32,
+            device=kwargs["device"],
+        )
+
+    monkeypatch.setattr(
+        forecast_module, "sample_normalized_residual_ensemble", zero_sampler
+    )
+    result = forecast_regression_diffusion_12_leads(request=request)
+    for handle in handles:
+        handle.remove()
+
+    assert isinstance(result, TwelveLeadForecastResult)
+    assert tuple(result.by_lead) == OFFICIAL_LEAD_HOURS
+    assert result.identity_mode == "development"
+    assert result.fully_calibrated is False
+    assert all(isinstance(item, EnsembleLeadForecastResult) for item in result.results)
+    assert calls == {
+        "target": 1,
+        "context": 1,
+        "era": 1,
+        "embedding": 12,
+        "regression": 12,
+    }
+    reference_storage = mixed_batch.condition_bank.target.radar_history.untyped_storage()
+    assert all(
+        batch.condition_bank.target.radar_history.untyped_storage().data_ptr()
+        == reference_storage.data_ptr()
+        for batch in batches
+    )
+
+    selected = 5
+    single = forecast_regression_diffusion_lead(
+        identity=identities[selected], batch=batches[selected]
+    )
+    shared = result.results[selected]
+    assert isinstance(single, EnsembleLeadForecastResult)
+    assert isinstance(shared, EnsembleLeadForecastResult)
+    torch.testing.assert_close(
+        shared.raw_regression_probability_wet,
+        single.raw_regression_probability_wet,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        shared.marginal.physical_members_mm,
+        single.marginal.physical_members_mm,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_twelve_lead_request_rejects_incomplete_or_mixed_identity_sets(
+    development_case: SimpleNamespace,
+) -> None:
+    identities = tuple(
+        development_case.identity(lead_hours=lead) for lead in OFFICIAL_LEAD_HOURS
+    )
+    batches = tuple(make_batch(leads=(lead,)).model for lead in OFFICIAL_LEAD_HOURS)
+    with pytest.raises(ValueError, match="exactly 12"):
+        TwelveLeadForecastRequest(identities=identities[:-1], batches=batches[:-1])
+    with pytest.raises(ValueError, match="canonical lead order"):
+        TwelveLeadForecastRequest(
+            identities=(identities[1], identities[0], *identities[2:]),
+            batches=batches,
+        )
+    alternate = development_case.identity(
+        lead_hours=OFFICIAL_LEAD_HOURS[-1],
+        condition_signature=ALTERNATE_CONDITION,
+    )
+    with pytest.raises(ValueError, match="one condition signature"):
+        TwelveLeadForecastRequest(
+            identities=(*identities[:-1], alternate), batches=batches
+        )
+
+    assert tuple(
+        inspect.signature(forecast_regression_diffusion_12_leads).parameters
+    ) == ("request",)
+    assert not hasattr(inference_api, "RegressionIssueTimeCache")
+
+
+def test_twelve_lead_forecast_rejects_changed_issue_before_cache_work(
+    development_case: SimpleNamespace,
+) -> None:
+    identities = tuple(
+        development_case.identity(lead_hours=lead) for lead in OFFICIAL_LEAD_HOURS
+    )
+    mixed = make_batch(leads=OFFICIAL_LEAD_HOURS).model
+    request = TwelveLeadForecastRequest.from_mixed_batch(
+        identities=identities, batch=mixed
+    )
+    request.batches[-1].condition_bank.target.radar_history[0, 0, 0, 0, 0] = 0.4
+    calls = 0
+
+    def counted(*_args: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    handle = development_case.regression.condition_bank.target_encoder.register_forward_hook(
+        counted
+    )
+    with pytest.raises(ValueError, match="target.radar_history.*changed across leads"):
+        forecast_regression_diffusion_12_leads(request=request)
+    handle.remove()
+    assert calls == 0
 
 
 def test_public_boundary_rejects_lead_and_condition_mismatches(

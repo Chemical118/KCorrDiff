@@ -18,6 +18,9 @@ from .forecast import (
     ForecastIdentity,
     ForecastResult,
     RegressionOnlyLeadForecastResult,
+    TwelveLeadForecastRequest,
+    TwelveLeadForecastResult,
+    forecast_regression_diffusion_12_leads,
     forecast_regression_diffusion_lead,
 )
 from .identity import (
@@ -49,6 +52,8 @@ __all__ = [
     "ResidualEDMSamplingCache",
     "ResidualCalibrationApplicationAudit",
     "ThresholdCalibrationApplicationAudit",
+    "TwelveLeadForecastRequest",
+    "TwelveLeadForecastResult",
     "VerifiedForecastIdentity",
     "VerifiedRegressionModel",
     "VerifiedResidualEDMModel",
@@ -56,6 +61,7 @@ __all__ = [
     "bind_development_residual_edm_model",
     "build_development_forecast_identity",
     "build_verified_forecast_identity",
+    "forecast_regression_diffusion_12_leads",
     "forecast_regression_diffusion_lead",
     "load_verified_regression_model",
     "load_verified_residual_edm_model",

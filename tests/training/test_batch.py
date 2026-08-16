@@ -320,6 +320,30 @@ def test_context_encoder_and_advection_share_channels_across_device_boundary() -
     assert standalone.context_channels_alias_condition_bank is True
 
 
+def test_model_batch_row_selection_preserves_single_row_views_and_aliases() -> None:
+    batch = make_batch(leads=(0.5, 1.0)).model
+    selected = batch.select_rows((1,))
+
+    selected.validate()
+    assert selected.batch_size == 1
+    assert selected.embedding.lead_hours.tolist() == [1.0]
+    assert selected.provenance.sample_ids == (batch.provenance.sample_ids[1],)
+    assert selected.provenance.duplicate_condition_groups == ()
+    assert (
+        selected.condition_bank.target.radar_history.untyped_storage().data_ptr()
+        == batch.condition_bank.target.radar_history.untyped_storage().data_ptr()
+    )
+    dynamic = selected.condition_bank.context.dynamic_fields
+    causal = selected.advection.causal
+    for actual, channel in (
+        (causal.context_rate_mm_per_hour, 0),
+        (causal.context_valid_fraction, 3),
+        (causal.context_interpolation_confidence, 4),
+    ):
+        assert actual.untyped_storage().data_ptr() == dynamic.untyped_storage().data_ptr()
+        torch.testing.assert_close(actual, dynamic[:, :, channel])
+
+
 def test_multiprocess_dataloader_retains_context_channel_views() -> None:
     loader = DataLoader(
         _WorkerBuiltTrainingSampleDataset(),

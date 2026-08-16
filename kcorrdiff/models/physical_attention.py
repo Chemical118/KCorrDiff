@@ -392,20 +392,6 @@ class PhysicalCrossAttention(nn.Module):
         if source_present.dtype is not torch.bool or source_present.device != target.device:
             raise TypeError("source_present must be bool on the feature device")
 
-        query_position, query_footprint = self._geometry_tokens(
-            query_geometry,
-            batch=batch,
-            shape=(query_height, query_width),
-            device=target.device,
-            name="query",
-        )
-        key_position, key_footprint = self._geometry_tokens(
-            source_geometry,
-            batch=batch,
-            shape=(source_height, source_width),
-            device=target.device,
-            name="source",
-        )
         total_queries = query_tokens.shape[1]
         total_keys = source_tokens.shape[1]
         if precomputed_physical_bias is not None:
@@ -420,6 +406,23 @@ class PhysicalCrossAttention(nn.Module):
                 or not torch.isfinite(precomputed_physical_bias).all()
             ):
                 raise ValueError("precomputed physical bias must be finite float32")
+            query_position = query_footprint = None
+            key_position = key_footprint = None
+        else:
+            query_position, query_footprint = self._geometry_tokens(
+                query_geometry,
+                batch=batch,
+                shape=(query_height, query_width),
+                device=target.device,
+                name="query",
+            )
+            key_position, key_footprint = self._geometry_tokens(
+                source_geometry,
+                batch=batch,
+                shape=(source_height, source_width),
+                device=target.device,
+                name="source",
+            )
         valid = source_validity.flatten(1) & source_present[:, None]
         any_valid = valid.any(dim=1)
         if not bool(any_valid.any().item()):
@@ -462,6 +465,8 @@ class PhysicalCrossAttention(nn.Module):
         for start, end in self._chunks(total_queries, chunk_size):
             query_chunk = query[:, start:end].permute(0, 2, 1, 3)
             if precomputed_physical_bias is None:
+                assert query_position is not None and query_footprint is not None
+                assert key_position is not None and key_footprint is not None
                 attended = self._run_attention_chunk(
                     self._dynamic_attention_chunk,
                     query_chunk,

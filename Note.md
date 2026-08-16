@@ -251,7 +251,7 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
 - spatial geometry/advection, ERA condition/time identity, EDM source cache,
   calibration·residual-scale, B12 fold importer, inference identity 및 portable
   release 경계에서 재현된 correctness 결함을 수정했다. 최신 CPU suite는
-  `599 passed, 7 skipped`이고 skip은 CUDA/pin-memory 전용 7개뿐이다.
+  `605 passed, 7 skipped`이고 skip은 CUDA/pin-memory 전용 7개뿐이다.
 - 수정 전 `/workspace/code/stage2-folds-porsche-v2`는 config/source identity와 모델
   입력 의미가 모두 달라 새 importer가 거부한다. training과 collector Job은
   먼저 `spec.suspend=true`로 중단한 뒤 Kubernetes에서 삭제했다. PVC의 fold0 final,
@@ -278,3 +278,16 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   줄이는 것이 목적이다.
 - 이 결정은 독립 평가에서 EDM-A의 성능 우위가 확정됐다는 의미가 아니다. EDM-B의 코드,
   checkpoint schema와 평가 계약은 유지하며, EDM-A 결과 검토 후 별도 승인으로 재개한다.
+
+### 2026-08-16 12-lead 공통 캐시 추론
+
+- 기존 단일-lead artifact-bound API는 유지하고, 12개 공식 lead를 한 요청으로 검증하는
+  `forecast_regression_diffusion_12_leads()`를 추가했다.
+- 이 경로는 target/context radar pyramid, ERA native-frame encoding, streaming
+  advection의 12개 lead product와 regression physical-position bias를 issue time마다
+  한 번만 계산한다. Lead별 condition embedding, ERA temporal query, regression과
+  residual EDM/calibration은 각 lead의 frozen identity로 계속 분리한다.
+- Opaque 캐시는 public forecast 호출 내부의 `eval()` 및 `torch.inference_mode()` 경계에서만
+  생존한다. 다른 모델, 다른 issue time, source/signature/geometry가 다른 batch와
+  version-tracked tensor/model mutation을 fail-closed로 거부한다. 입력 batch 생성과
+  device 이동은 호출 전에 완료한다.

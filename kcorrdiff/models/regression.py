@@ -28,6 +28,7 @@ from .condition_bank import ConditionBankCache
 from .era_encoder import ERA_OUTPUT_CHANNELS, EraQueryResult
 from .advection import AdvAdapter
 from .physical_attention import (
+    ATTENTION_HEADS,
     PhysicalAttentionDiagnostics,
     PhysicalCrossAttention,
     PhysicalTokenGeometry,
@@ -104,6 +105,20 @@ class RegressionGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class RegressionPhysicalBiasCache:
+    """Lead-independent physical-attention biases for one issue-time batch."""
+
+    context_l3: Tensor
+    era_l3: Tensor
+    context_l4: Tensor
+    era_l4: Tensor
+
+    @property
+    def tensors(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        return self.context_l3, self.era_l3, self.context_l4, self.era_l4
+
+
+@dataclass(frozen=True, slots=True)
 class RegressionInputs:
     condition_bank: ConditionBankCache
     era: EraQueryResult
@@ -111,6 +126,7 @@ class RegressionInputs:
     e_cond: Tensor
     geometry: RegressionGeometry
     condition_signatures: tuple[str, ...]
+    physical_bias: RegressionPhysicalBiasCache | None = None
 
     def __post_init__(self) -> None:
         batch = self.condition_bank.batch_size
@@ -134,6 +150,46 @@ class RegressionInputs:
             not value for value in self.condition_signatures
         ):
             raise ValueError("one non-empty condition signature is required per item")
+        if self.physical_bias is not None:
+            if not isinstance(self.physical_bias, RegressionPhysicalBiasCache):
+                raise TypeError("physical_bias must be a RegressionPhysicalBiasCache")
+            target_l3 = self.condition_bank.target.l3.shape[-2:]
+            target_l4 = self.condition_bank.target.l4.shape[-2:]
+            context_l3 = self.condition_bank.context.l3.shape[-2:]
+            context_l4 = self.condition_bank.context.l4.shape[-2:]
+            expected = (
+                (
+                    "context_l3",
+                    self.physical_bias.context_l3,
+                    (batch, ATTENTION_HEADS, math.prod(target_l3), math.prod(context_l3)),
+                ),
+                (
+                    "era_l3",
+                    self.physical_bias.era_l3,
+                    (batch, ATTENTION_HEADS, math.prod(target_l3), 33 * 33),
+                ),
+                (
+                    "context_l4",
+                    self.physical_bias.context_l4,
+                    (batch, ATTENTION_HEADS, math.prod(target_l4), math.prod(context_l4)),
+                ),
+                (
+                    "era_l4",
+                    self.physical_bias.era_l4,
+                    (batch, ATTENTION_HEADS, math.prod(target_l4), 33 * 33),
+                ),
+            )
+            for name, value, shape in expected:
+                if tuple(value.shape) != shape:
+                    raise ValueError(f"physical bias {name} must have shape {shape}")
+                if (
+                    value.dtype is not torch.float32
+                    or value.device != self.condition_bank.device
+                    or not bool(torch.isfinite(value).all().item())
+                ):
+                    raise ValueError(
+                        f"physical bias {name} must be finite float32 on the condition device"
+                    )
         devices = (
             self.condition_bank.device,
             self.era.features.device,
@@ -268,11 +324,19 @@ class RegressionUNet(nn.Module):
             era_attention = self.era_attention_l3
             target_geometry = inputs.geometry.target_l3
             context_geometry = inputs.geometry.context_l3
+            context_bias = (
+                None if inputs.physical_bias is None else inputs.physical_bias.context_l3
+            )
+            era_bias = None if inputs.physical_bias is None else inputs.physical_bias.era_l3
         elif level == 4:
             context_attention = self.context_attention_l4
             era_attention = self.era_attention_l4
             target_geometry = inputs.geometry.target_l4
             context_geometry = inputs.geometry.context_l4
+            context_bias = (
+                None if inputs.physical_bias is None else inputs.physical_bias.context_l4
+            )
+            era_bias = None if inputs.physical_bias is None else inputs.physical_bias.era_l4
         else:
             raise ValueError("physical attention is defined only at L3/L4")
         context_result = context_attention(
@@ -283,6 +347,7 @@ class RegressionUNet(nn.Module):
             source_validity=context_validity,
             source_present=context_present,
             e_cond=inputs.e_cond,
+            precomputed_physical_bias=context_bias,
             return_diagnostics=True,
         )
         hidden, context_contribution = self._diagnostic(context_result)
@@ -294,6 +359,7 @@ class RegressionUNet(nn.Module):
             source_validity=era_validity,
             source_present=era_present,
             e_cond=inputs.e_cond,
+            precomputed_physical_bias=era_bias,
             return_diagnostics=True,
         )
         hidden, era_contribution = self._diagnostic(era_result)
@@ -432,5 +498,6 @@ __all__ = [
     "RegressionGeometry",
     "RegressionInputs",
     "RegressionOutput",
+    "RegressionPhysicalBiasCache",
     "RegressionUNet",
 ]

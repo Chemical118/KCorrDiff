@@ -1628,7 +1628,7 @@ target radar history pyramid
 context radar history pyramid
 target DEM/static pyramid
 causal optical flow and its confidence
-5-minute advection trajectory through t0+6h
+5-minute streaming으로 한 번 생성한 12개 lead별 advection product
 ERA native-hour instant/tp stem outputs EF_inst and EF_tp[h0:h0+7h]
 continuous ERA token offsets delta_k
 ERA data-valid and trajectory-window masks
@@ -1636,6 +1636,19 @@ ERA provider/source/tp state
 physical relative-position bias at each fusion scale
 fixed source coordinates, causal history-validity and static coverage masks
 ```
+
+구현 경계에서는 73개 5-minute trajectory frame 전체를 materialize하지 않는다. 한 번의
+streaming advection으로 계산한 `[B,12,8,H,W]` lead product와 flow/provenance를
+12-lead public forecast 호출 내부의 opaque issue-time cache에 보존한다. 이 내부 경로는
+radar/context pyramid, ERA frame과 physical bias까지 한 번 계산하고 lead별 `e_cond`,
+ERA query와 regression만 다시 실행한다. Raw cache 객체는 public inference API로
+노출하지 않는다.
+이 캐시는 동결된 `eval()` 모델의 `torch.inference_mode()`에서만 사용할 수 있으며
+학습 optimizer step 사이에는 재사용하지 않는다. Mutation version을 fail-closed로
+검사하기 위해 입력 batch의 tensor 생성과 device 이동, mixed-batch row view 구성은
+public forecast 호출 전에 끝내야 한다. Public forecast 함수가 inference mode 진입과
+opaque cache 수명을 내부에서 관리하며, inference mode 안에서 새로 만든 versionless
+입력 tensor는 cache source로 받지 않는다.
 
 ### 16.2 Lead마다 계산하고 해당 lead에서 캐시
 
