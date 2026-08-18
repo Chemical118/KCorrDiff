@@ -234,8 +234,8 @@ class Stage2OptimizationConfig:
 
 @dataclass(frozen=True, slots=True)
 class Stage2OOFRemoteSpillConfig:
-    endpoint: str
-    remote_prefix: str
+    ssh_host: str
+    remote_root: str
     local_reserve_bytes: int
     timeout_seconds: float
 
@@ -538,20 +538,20 @@ def load_stage2_config(path: Path) -> Stage2Config:
     _exact_keys(
         remote_spill,
         required={
-            "endpoint",
-            "remote_prefix",
+            "ssh_host",
+            "remote_root",
             "local_reserve_bytes",
             "timeout_seconds",
         },
         name="crossfit oof_remote_spill",
     )
-    endpoint = _strict_string(remote_spill["endpoint"], "OOF remote endpoint")
-    remote_prefix = _strict_string(
-        remote_spill["remote_prefix"], "OOF remote prefix"
+    ssh_host = _strict_string(remote_spill["ssh_host"], "OOF remote SSH host")
+    remote_root = _strict_string(
+        remote_spill["remote_root"], "OOF remote root"
     )
     remote_spill_config = Stage2OOFRemoteSpillConfig(
-        endpoint=endpoint,
-        remote_prefix=remote_prefix,
+        ssh_host=ssh_host,
+        remote_root=remote_root,
         local_reserve_bytes=_positive_int(
             remote_spill["local_reserve_bytes"], "OOF local reserve bytes"
         ),

@@ -4,9 +4,12 @@ import hashlib
 import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import numpy as np
 import pytest
+
+import kcorrdiff.training.oof as oof_module
 
 from kcorrdiff.training.oof import (
     OOF_COMPRESSED_ENCODING,
@@ -272,6 +275,81 @@ def test_compressed_oof_crash_resume_repairs_torn_tail_and_binds_launch(
         initialize=True,
     )
     assert reopened.output_dir == build.output_dir
+
+
+def test_compressed_oof_resume_can_skip_and_read_sealed_prefix(
+    tmp_path: Path,
+) -> None:
+    identities, partitions = _compressed_universe(4, world_size=1)
+    build = _compressed_build(tmp_path, identities, partitions, shard_items=2)
+    initial = build.partition(partitions[0].partition_id, commit_items=1)
+    for index in (0, 1):
+        initial.append(index, identities[index], *_fields(index))
+    initial.abort()
+
+    resumed = build.partition(partitions[0].partition_id, commit_items=1)
+    assert resumed.sealed_items == 2
+    for index in (0, 1):
+        probability, mean = resumed.sealed_fields(index)
+        expected_probability, expected_mean = _fields(index)
+        assert np.array_equal(probability, expected_probability)
+        assert np.array_equal(mean, expected_mean)
+        resumed.skip_sealed(index, identities[index])
+    for index in (2, 3):
+        resumed.append(index, identities[index], *_fields(index))
+    resumed.finish()
+    build.seal()
+    assert len(list(OOFArtifact(build.output_dir, verify_hashes=True))) == 4
+
+
+def test_compressed_oof_resume_does_not_decode_sealed_shards_during_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identities, partitions = _compressed_universe(4, world_size=1)
+    build = _compressed_build(tmp_path, identities, partitions, shard_items=2)
+    initial = build.partition(partitions[0].partition_id, commit_items=1)
+    for index in (0, 1):
+        initial.append(index, identities[index], *_fields(index))
+    initial.abort()
+
+    def reject_decode(path: Path) -> np.ndarray:
+        raise AssertionError(f"resume discovery decoded sealed shard: {path}")
+
+    monkeypatch.setattr(oof_module, "_load_npz_fields", reject_decode)
+    resumed = build.partition(partitions[0].partition_id, commit_items=1)
+    assert resumed.sealed_items == 2
+    resumed.abort()
+
+
+def test_compressed_oof_postprocessing_runs_behind_a_bounded_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identities, partitions = _compressed_universe(4, world_size=1)
+    build = _compressed_build(tmp_path, identities, partitions, shard_items=2)
+    original = oof_module._write_deterministic_npz
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_write(path: Path, values: np.ndarray) -> None:
+        started.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release queued OOF compression")
+        original(path, values)
+
+    monkeypatch.setattr(oof_module, "_write_deterministic_npz", delayed_write)
+    writer = build.partition(partitions[0].partition_id, commit_items=1)
+    for index in (0, 1):
+        writer.append(index, identities[index], *_fields(index))
+    assert started.wait(timeout=2)
+    assert writer.sealed_items == 0
+
+    # The producer can fill the next raw shard while compression is blocked.
+    writer.append(2, identities[2], *_fields(2))
+    release.set()
+    writer.append(3, identities[3], *_fields(3))
+    writer.finish()
+    build.seal()
+    assert len(list(OOFArtifact(build.output_dir, verify_hashes=True))) == 4
 
 
 def test_compressed_oof_rejects_missing_duplicate_and_corrupt_partition_rows(

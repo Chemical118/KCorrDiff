@@ -20,17 +20,15 @@ from kcorrdiff.training.oof_remote import (
     PVCRemoteSpillController,
     RemoteShardReceipt,
     RemoteStoreIdentity,
-    _load_credentials,
+    RsyncSSHShardStore,
 )
 
 
 class FakeStore:
     def __init__(self) -> None:
         self.identity = RemoteStoreIdentity(
-            endpoint="https://files.example.test:1047",
-            remote_prefix="/kcorrdiff/oof",
-            username="kcorrdiff",
-            ca_certificate_sha256="a" * 64,
+            ssh_host="hyunwoo-home",
+            remote_root="/hyunwoo/kcorrdiff/oof",
         )
         self.objects: dict[str, bytes] = {}
         self.fail_upload = False
@@ -198,38 +196,48 @@ def test_no_spill_when_reserve_and_next_write_are_already_safe(tmp_path: Path) -
     assert not store.objects
 
 
-def test_identity_and_credentials_fail_closed(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="HTTPS origin"):
+def test_eager_mirror_copies_sealed_shards_and_retains_hot_tier(tmp_path: Path) -> None:
+    intent = "6" * 64
+    first = _sealed_shard(tmp_path, index=0, start=0, payload=b"first", intent=intent)
+    second = _sealed_shard(tmp_path, index=1, start=1, payload=b"second", intent=intent)
+    store = FakeStore()
+    controller = PVCRemoteSpillController(
+        tmp_path,
+        build_intent_sha256=intent,
+        store=store,
+        free_bytes=lambda _: 10 * DEFAULT_PVC_RESERVE_BYTES,
+    )
+
+    receipts = controller.mirror_all()
+
+    assert [receipt.relative_path for receipt in receipts] == [
+        f"{intent}/fields-00000.npz",
+        f"{intent}/fields-00001.npz",
+    ]
+    assert first.is_file() and second.is_file()
+    assert len(store.objects) == 2
+
+
+def test_rsync_identity_and_command_configuration(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="SSH host alias"):
         RemoteStoreIdentity(
-            endpoint="http://files.example.test:1047",
-            remote_prefix="/oof",
-            username="u",
-            ca_certificate_sha256="a" * 64,
+            ssh_host="bad host",
+            remote_root="/hyunwoo/oof",
         )
 
-    credentials = tmp_path / "credentials.env"
-    credentials.write_text(
-        "FILESERVER_USERNAME=kcorrdiff\n"
-        "FILESERVER_PASSWORD=0123456789abcdef01234567\n",
-        encoding="utf-8",
+    identity = RemoteStoreIdentity(
+        ssh_host="hyunwoo-home",
+        remote_root="/hyunwoo/kcorrdiff/oof",
     )
-    credentials.chmod(0o640)
-    assert _load_credentials(credentials) == (
-        "kcorrdiff",
-        "0123456789abcdef01234567",
+    assert identity.transport == "rsync+ssh"
+    assert identity.remote_root == "/hyunwoo/kcorrdiff/oof"
+    store = RsyncSSHShardStore(
+        ssh_host=identity.ssh_host,
+        remote_root=identity.remote_root,
+        ssh_config=tmp_path / "config",
+        timeout_seconds=600,
     )
-    credentials.chmod(0o644)
-    assert _load_credentials(credentials)[0] == "kcorrdiff"
-    credentials.write_text(
-        "FILESERVER_USERNAME=u\nFILESERVER_PASSWORD=p\n", encoding="utf-8"
-    )
-    assert _load_credentials(credentials) == ("u", "p")
-    assert RemoteStoreIdentity(
-        endpoint="https://files.example.test:1047",
-        remote_prefix="/../oof",
-        username="u",
-        ca_certificate_sha256="a" * 64,
-    ).remote_prefix == "/../oof"
+    assert "ControlPersist=600" in store._rsync_shell()
 
 
 def test_compressed_build_spills_each_shard_and_reads_v3_bitwise(
@@ -302,7 +310,7 @@ def test_compressed_build_spills_each_shard_and_reads_v3_bitwise(
         build.output_dir, verify_hashes=True, remote_store=store
     )
     assert artifact.format_version == OOF_REMOTE_FORMAT_VERSION
-    assert all(shard["storage"] == "remote_https" for shard in artifact.manifest["shards"])
+    assert all(shard["storage"] == "remote_rsync" for shard in artifact.manifest["shards"])
     for entry, (probability, mean) in zip(artifact, expected, strict=True):
         assert np.array_equal(entry.occurrence_probability, probability)
         assert np.array_equal(entry.mu_z, mean)

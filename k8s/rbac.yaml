@@ -4,3 +4,5 @@ metadata:
   name: kcorrdiff-porsche-trainer
   namespace: ws-md93se6gk3270
 automountServiceAccountToken: false
+imagePullSecrets:
+  - name: kcorrdiff-registry

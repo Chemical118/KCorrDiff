@@ -42,7 +42,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: benchmark
-          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          image: sgs-registry.snucse.org/ws-md93se6gk3270/kcorrdiff-runtime:pytorch-2.13-transfer-v1
           imagePullPolicy: IfNotPresent
           workingDir: /workspace/KCorrDiff
           command: ["/bin/bash", "-ceu"]

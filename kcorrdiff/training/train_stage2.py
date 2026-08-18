@@ -96,8 +96,8 @@ from kcorrdiff.training.oof import (
     compressed_oof_storage_plan,
 )
 from kcorrdiff.training.oof_remote import (
-    AuthenticatedHTTPSShardStore,
     RemoteShardStore,
+    RsyncSSHShardStore,
 )
 from kcorrdiff.training.plan import DrawSlot, unique_oof_rows
 from kcorrdiff.training.residual_scales import (
@@ -2006,6 +2006,7 @@ def infer_oof_rank_partials(
         accumulator = ResidualScaleAccumulator(
             epsilon_scale=config.crossfit.epsilon_residual_scale
         )
+        sealed_items = writer.sealed_items
         selected_offset = 0
         try:
             with torch.no_grad():
@@ -2014,10 +2015,12 @@ def infer_oof_rank_partials(
                         raise AssertionError("OOF loaders never contain padding")
                     if not isinstance(rank_batch.training, TrainingBatch):
                         raise TypeError("OOF loader returned a non-TrainingBatch")
-                    batch = rank_batch.training.to(runtime.device, non_blocking=True)
-                    output = model(batch.model)
-                    assert isinstance(output, object)
-                    sample_ids = batch.model.provenance.sample_ids
+                    training = rank_batch.training
+                    sample_ids = training.model.provenance.sample_ids
+                    output = None
+                    if selected_offset + len(sample_ids) > sealed_items:
+                        batch = training.to(runtime.device, non_blocking=True)
+                        output = model(batch.model)
                     for batch_index, sample_id in enumerate(sample_ids):
                         if selected_offset >= len(compressed_selected):
                             raise ValueError("OOF loader produced an extra sample")
@@ -2047,39 +2050,50 @@ def infer_oof_rank_partials(
                             row.lead_hours,
                             row.condition_signature,
                         )
-                        writer.append(
-                            artifact_index,
-                            layout.identities[artifact_index],
-                            output.probability_wet[batch_index, 0]
-                            .detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32, copy=False),
-                            output.mu_z[batch_index, 0]
-                            .detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32, copy=False),
-                        )
+                        if selected_offset < sealed_items:
+                            _, mu_z_oof = writer.sealed_fields(artifact_index)
+                            writer.skip_sealed(
+                                artifact_index, layout.identities[artifact_index]
+                            )
+                        else:
+                            if output is None:
+                                raise AssertionError(
+                                    "OOF model output is missing for an unsealed row"
+                                )
+                            probability = (
+                                output.probability_wet[batch_index, 0]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype(np.float32, copy=False)
+                            )
+                            mu_z_oof = (
+                                output.mu_z[batch_index, 0]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .astype(np.float32, copy=False)
+                            )
+                            writer.append(
+                                artifact_index,
+                                layout.identities[artifact_index],
+                                probability,
+                                mu_z_oof,
+                            )
                         accumulator.update(
                             lead_hours=row.lead_hours,
                             condition_signature=row.condition_signature,
                             block_id=row.block_id,
-                            target_z=batch.labels.target_z[batch_index, 0]
+                            target_z=training.labels.target_z[batch_index, 0]
                             .detach()
-                            .cpu()
                             .numpy(),
-                            mu_z_oof=output.mu_z[batch_index, 0]
-                            .detach()
-                            .cpu()
-                            .numpy(),
-                            target_validity=batch.labels.target_validity[
+                            mu_z_oof=mu_z_oof,
+                            target_validity=training.labels.target_validity[
                                 batch_index, 0
                             ]
                             .detach()
-                            .cpu()
                             .numpy(),
-                            omega=float(batch.labels.omega[batch_index].item()),
+                            omega=float(training.labels.omega[batch_index].item()),
                             multiplicity=multiplicities[key],
                         )
                         selected_offset += 1
@@ -2429,6 +2443,7 @@ def _initialize_tracking_distributed(
     config_sha256: str,
     launch_identity_sha256: str,
     mode: str,
+    backend_run_id: str | None = None,
 ) -> tuple[TrackingRun, int]:
     tracking: TrackingRun | None = None
     failure: str | None = None
@@ -2445,6 +2460,7 @@ def _initialize_tracking_distributed(
             launch_identity_sha256=launch_identity_sha256,
             mode=mode,
             resume="allow",
+            backend_run_id=backend_run_id,
         )
     except BaseException as error:
         failure = f"rank={runtime.rank},type={type(error).__name__}"
@@ -2477,6 +2493,7 @@ def run_stage2(
     prefetch_factor: int,
     wandb_mode: str,
     run_id: str,
+    wandb_backend_run_id: str | None = None,
     remote_store: RemoteShardStore | None = None,
     imported_fold_set: VerifiedStage2FoldSet | None = None,
     expected_fold_producer_source_tree_sha256: str | None = None,
@@ -2558,6 +2575,7 @@ def run_stage2(
         config_sha256=config.sha256,
         launch_identity_sha256=launch_identity.artifact_sha256,
         mode=effective_mode,
+        backend_run_id=wandb_backend_run_id,
     )
     role_results: list[RoleTrainingResult] = []
     fold_results: dict[int, RoleTrainingResult] = {}
@@ -2913,6 +2931,7 @@ def run_stage2(
             ),
             "wandb_mode": effective_mode,
             "wandb_run_id": run_id,
+            "wandb_backend_run_id": wandb_backend_run_id or run_id,
             "tracking_audit_path": (
                 str((output_dir / "tracking" / "metrics.jsonl").resolve())
                 if enabled
@@ -2989,8 +3008,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fold-set-manifest", type=Path)
     parser.add_argument("--fold-set-manifest-sha256")
     parser.add_argument("--fold-set-producer-source-tree-sha256")
-    parser.add_argument("--oof-remote-credentials", type=Path)
-    parser.add_argument("--oof-remote-ca-certificate", type=Path)
+    parser.add_argument("--oof-remote-ssh-config", type=Path)
     parser.add_argument("--require-world-size", type=int)
     parser.add_argument("--precision", required=True)
     parser.add_argument("--disable-tf32", action="store_true")
@@ -3019,6 +3037,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--run-id",
         default=os.environ.get("WANDB_RUN_ID") or os.environ.get("RUN_ID") or "stage2",
+    )
+    parser.add_argument(
+        "--wandb-backend-run-id",
+        default=os.environ.get("WANDB_BACKEND_RUN_ID"),
     )
     parser.add_argument("--storage-reserve-gib", type=float, default=2.0)
     return parser.parse_args(argv)
@@ -3187,18 +3209,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         else development_identity(arguments.source_root)
     )
     try:
-        credentials = arguments.oof_remote_credentials
-        ca_certificate = arguments.oof_remote_ca_certificate
-        if (credentials is None) != (ca_certificate is None):
-            raise ValueError("remote OOF credentials and CA must be supplied together")
+        ssh_config = arguments.oof_remote_ssh_config
         remote_store = (
             None
-            if credentials is None
-            else AuthenticatedHTTPSShardStore(
-                endpoint=config.crossfit.remote_spill.endpoint,
-                remote_prefix=config.crossfit.remote_spill.remote_prefix,
-                credential_file=credentials,
-                ca_certificate=ca_certificate,
+            if ssh_config is None
+            else RsyncSSHShardStore(
+                ssh_host=config.crossfit.remote_spill.ssh_host,
+                remote_root=config.crossfit.remote_spill.remote_root,
+                ssh_config=ssh_config,
                 timeout_seconds=config.crossfit.remote_spill.timeout_seconds,
             )
         )
@@ -3317,6 +3335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prefetch_factor=arguments.prefetch_factor,
             wandb_mode=arguments.wandb_mode,
             run_id=arguments.run_id,
+            wandb_backend_run_id=arguments.wandb_backend_run_id,
             remote_store=remote_store,
             imported_fold_set=imported_fold_set,
             expected_fold_producer_source_tree_sha256=(

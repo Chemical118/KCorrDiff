@@ -165,14 +165,13 @@ manifest에 저장하지 않고 Kubernetes Secret에서 주입한다.
   `839071…03c`, `c09ed5…b2de`다. Train-only normalization은 전체 cache payload
   hash를 다시 검증한 artifact만 production factory가 수용한다.
 - 431,400개의 두 FP32 OOF field 논리 크기는 226,177,843,200 byte다. Shard는
-  bitwise-lossless byte-shuffle+DEFLATE로 기록하고 총 compressed cap/ratio를
-  계속 강제한다. PVC는 hot tier로 쓰되 OOF 뒤 checkpoint까지 고려해 14 GiB를
-  남긴다. 임계점에서는 oldest sealed shard 하나를 인증된 1047 HTTPS 서버로
-  전송하고, 전체 GET SHA-256이 일치한 durable receipt 뒤에만 로컬 파일을 지운다.
+  bitwise-lossless byte-shuffle+DEFLATE로 기록하고 압축 크기와 비율을 관찰한다.
+  PVC는 active construction tier로 쓰되 OOF 뒤 checkpoint까지 고려해 14 GiB를
+  남긴다. 각 sealed shard는 압축 직후 `hyunwoo-home:/hyunwoo/kcorrdiff/oof`로
+  rsync한다. PVC 사본은 Stage 3 hot-read용으로 유지하고 headroom이 부족할 때만
+  원격 byte count와 durable receipt가 있는 oldest shard부터 지운다.
   Stage 3는 원격 shard 하나만 bounded cache에 받아 검증·복원 후 즉시 지운다.
-- 실제 porsche→1047 smoke에서 OOF v3 upload/read-back/local-delete/re-download와
-  uint32 bit-pattern equality를 확인했다. 비밀번호는 git/YAML에 넣지 않고
-  `.env`와 CA를 `kcorrdiff-oof-remote` Kubernetes Secret으로 0440 mount한다.
+- SSH config와 개인키는 이미지에 넣지 않고 PVC의 `/workspace/.ssh`에서 읽는다.
 
 ### 현재 검증과 실행 상태
 

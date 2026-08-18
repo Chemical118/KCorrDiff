@@ -114,6 +114,45 @@ def test_resume_appends_same_run_and_restores_monotonic_step(
     assert calls[0]["resume"] == calls[1]["resume"] == "allow"
 
 
+def test_distinct_backend_runs_share_one_logical_audit_and_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def initialize(**kwargs: object) -> Backend:
+        calls.append(dict(kwargs))
+        return Backend()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        SimpleNamespace(init=initialize, Settings=lambda **kwargs: dict(kwargs)),
+    )
+    kwargs = {
+        "enabled": True,
+        "rank": 0,
+        "run_dir": tmp_path,
+        "run_id": "logical-run",
+        "project": "project",
+        "job_type": "job",
+        "config": {},
+        "config_sha256": "a" * 64,
+        "mode": "offline",
+        "resume": "allow",
+    }
+    first = initialize_tracking(**kwargs, backend_run_id="pod-a")
+    first.log({"loss": 2.0}, step=0)
+    first.finish()
+    second = initialize_tracking(**kwargs, backend_run_id="pod-b")
+    assert second.last_step == 0
+    second.log({"loss": 1.0}, step=1)
+    second.finish()
+
+    assert [call["id"] for call in calls] == ["pod-a", "pod-b"]
+    assert [call["group"] for call in calls] == ["logical-run", "logical-run"]
+    assert [call["resume"] for call in calls] == ["never", "never"]
+
+
 def test_resume_rejects_foreign_run_but_tolerates_identity_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,15 +1,13 @@
-# Suspended Stage 2 full-width continuation workload.  It imports the completed
-# porsche B12 fold set for model-only OOF inference, then trains the
-# deployment/direct arms with whatever positive GPU topology is visible.
+# Suspended Stage 2 OOF-only workload using the completed porsche B12 fold set.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: kcorrdiff-train-stage2-fullwidth
+  name: kcorrdiff-stage2-oof-rsync-v1
   namespace: ws-md93se6gk3270
   labels:
     app.kubernetes.io/name: kcorrdiff
     app.kubernetes.io/component: stage2-regression-training
-    app.kubernetes.io/instance: fullwidth-v2-import-b12
+    app.kubernetes.io/instance: fullwidth-oof-rsync-v1
 spec:
   # Drafts are inert even if accidentally applied. Remove this only after the
   # CLI/config/data preconditions in README.md have been verified.
@@ -22,7 +20,7 @@ spec:
       labels:
         app.kubernetes.io/name: kcorrdiff
         app.kubernetes.io/component: stage2-regression-training
-        app.kubernetes.io/instance: fullwidth-v2-import-b12
+        app.kubernetes.io/instance: fullwidth-oof-rsync-v1
     spec:
       serviceAccountName: kcorrdiff-porsche-trainer
       automountServiceAccountToken: false
@@ -32,24 +30,30 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: porsche
       securityContext:
-        runAsUser: 1035
-        runAsGroup: 1035
-        runAsNonRoot: true
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
         fsGroup: 1035
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: trainer
-          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace/code/stage2-research-flex-v4
+          workingDir: /workspace/code/kcorrdiff-rsync-oof-resume-async-wandb-v6
           command: ["/bin/bash", "-ceu"]
           args:
             - |
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends openssh-client rsync
+              rm -rf /var/lib/apt/lists/*
+              umask 0007
+
               # New code lives in a separate snapshot; the active v3 producer
               # snapshot remains untouched and is consumed read-only below.
-              source_root=/workspace/code/stage2-research-flex-v4
+              source_root=/workspace/code/kcorrdiff-rsync-oof-resume-async-wandb-v6
               config_path=${source_root}/configs/stage2-full-width.yaml
               radar_cache_root=/workspace/data/cache/radar-v1
               era5_cache_root=/workspace/data/cache/era5-v1
@@ -63,13 +67,11 @@ spec:
               log_file=${run_root}/train.log
               provenance_dir=${run_root}/provenance
               runtime_report=/workspace/envs/stage2-python-v1/pip-report.json
-              container_image_digest=sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
-              oof_remote_credentials=/run/secrets/kcorrdiff-oof/credentials.env
-              oof_remote_ca=/run/secrets/kcorrdiff-oof/server.crt
+              oof_remote_ssh_config=/workspace/.ssh/config
               fold_set_root=/workspace/runs/stage2-folds-porsche-v3/assembled/fold-set-v1
               fold_set_manifest=${fold_set_root}/fold-set-manifest.json
 
-              install -d -m 0770 \
+              install -d -o 0 -g 1035 -m 2770 \
                 "${run_root}/checkpoints" "${oof_output_dir}" \
                 "${run_root}/logs" "${run_root}/wandb" "${provenance_dir}"
               exec > >(tee -a "${log_file}") 2>&1
@@ -84,8 +86,7 @@ spec:
               test -f "${bundle_metadata}"
               test -f "${data_contract}"
               test -f "${static_path}"
-              test -r "${oof_remote_credentials}"
-              test -r "${oof_remote_ca}"
+              test -r "${oof_remote_ssh_config}"
               test -f "${fold_set_manifest}"
               python -c 'import numpy, scipy, torch, yaml, wandb'
               nvidia-smi -L
@@ -95,6 +96,7 @@ spec:
               export WANDB_DIR="${run_root}/wandb"
               export WANDB_NAME="${RUN_ID}"
               export WANDB_RUN_ID="${RUN_ID}"
+              export WANDB_BACKEND_RUN_ID="${POD_NAME}"
               export WANDB_RESUME=allow
 
               exec torchrun \
@@ -104,7 +106,6 @@ spec:
                 -m kcorrdiff.training.train_stage2 \
                 --source-root "${source_root}" \
                 --config "${config_path}" \
-                --container-image-digest "${container_image_digest}" \
                 --runtime-report "${runtime_report}" \
                 --radar-cache-root "${radar_cache_root}" \
                 --era5-cache-root "${era5_cache_root}" \
@@ -116,27 +117,33 @@ spec:
                 --output-dir "${run_root}" \
                 --oof-output-dir "${oof_output_dir}" \
                 --fold-set-manifest "${fold_set_manifest}" \
-                --oof-remote-credentials "${oof_remote_credentials}" \
-                --oof-remote-ca-certificate "${oof_remote_ca}" \
+                --oof-remote-ssh-config "${oof_remote_ssh_config}" \
+                --phases oof \
+                --roles fold:0,fold:1,fold:2 \
                 --precision float32 \
                 --disable-tf32 \
                 --target-widths 64,128,256,384,512 \
                 --context-widths 32,64,128,256,384 \
                 --era-latent-channels 128 \
                 --era-grid-size 33 \
-                --per-rank-microbatch-size 8 \
+                --per-rank-microbatch-size 64 \
                 --gradient-accumulation-steps 1 \
-                --num-workers 12 \
+                --num-workers 8 \
                 --prefetch-factor 2 \
                 --fail-on-fallback \
                 --wandb-mode online \
                 --run-id "${RUN_ID}" \
+                --wandb-backend-run-id "${WANDB_BACKEND_RUN_ID}" \
                 --storage-reserve-gib 10
           env:
             - name: RUN_ID
-              value: stage2-fullwidth-research-v4
+              value: stage2-fullwidth-oof-rsync-v1
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-research-flex-v4
+              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-resume-async-wandb-v6
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -201,9 +208,7 @@ spec:
               nvidia.com/gpu: 1
           securityContext:
             allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            readOnlyRootFilesystem: true
+            readOnlyRootFilesystem: false
             seccompProfile:
               type: RuntimeDefault
           volumeMounts:
@@ -213,9 +218,6 @@ spec:
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
-            - name: oof-remote
-              mountPath: /run/secrets/kcorrdiff-oof
-              readOnly: true
       volumes:
         - name: workspace
           persistentVolumeClaim:
@@ -227,7 +229,3 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 8Gi
-        - name: oof-remote
-          secret:
-            secretName: kcorrdiff-oof-remote
-            defaultMode: 0440

@@ -1,32 +1,28 @@
-"""Authenticated HTTPS overflow storage for lossless OOF shards.
+"""Rsync-over-SSH overflow storage for lossless OOF shards.
 
-The PVC remains the primary, fastest store.  Sealed shards are only spilled
-when the filesystem cannot preserve both a fixed free-space reserve and the
-worst-case bytes required for the next shard.  A local shard is removed only
-after a full HTTPS read-back has reproduced its SHA-256 digest and a durable
-receipt has been published.
+The PVC is the active construction and hot-read tier.  Each sealed compressed
+shard is copied immediately so transfer time is interleaved with OOF inference.
+Rsync keeps partial transfers resumable; the local copy remains available to
+Stage 3 and is removed only when PVC headroom requires eviction.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import base64
 import fcntl
 import hashlib
-import http.client
 import json
 import logging
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
-import ssl
-import stat
+import shlex
+import subprocess
 import tempfile
 from typing import Callable, Mapping, Protocol
-from urllib.parse import quote, urlsplit
 
 
-REMOTE_STORE_FORMAT_VERSION = "kcorrdiff.oof-remote-store.v1"
+REMOTE_STORE_FORMAT_VERSION = "kcorrdiff.oof-remote-store.v2"
 REMOTE_RECEIPT_FORMAT_VERSION = "kcorrdiff.oof-remote-receipt.v1"
 DEFAULT_PVC_RESERVE_BYTES = 10 * 1024**3
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -37,14 +33,6 @@ def _canonical_json_bytes(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _valid_sha256(value: str, *, name: str) -> str:
@@ -95,31 +83,14 @@ def _canonical_prefix(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RemoteStoreIdentity:
-    endpoint: str
-    remote_prefix: str
-    username: str
-    ca_certificate_sha256: str
+    ssh_host: str
+    remote_root: str
+    transport: str = "rsync+ssh"
 
     def __post_init__(self) -> None:
-        parsed = urlsplit(self.endpoint)
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("remote endpoint must be an HTTPS origin without credentials")
-        if parsed.port is None:
-            raise ValueError("remote endpoint must declare its HTTPS port")
-        if not self.username or any(character.isspace() for character in self.username):
-            raise ValueError("remote username must be non-empty and contain no whitespace")
-        object.__setattr__(self, "remote_prefix", _canonical_prefix(self.remote_prefix))
-        _valid_sha256(
-            self.ca_certificate_sha256, name="remote CA certificate SHA-256"
-        )
+        if not self.ssh_host or any(character.isspace() for character in self.ssh_host):
+            raise ValueError("SSH host alias must be non-empty and contain no whitespace")
+        object.__setattr__(self, "remote_root", _canonical_prefix(self.remote_root))
 
     def record(self) -> dict[str, object]:
         return {
@@ -138,7 +109,7 @@ class RemoteShardReceipt:
     relative_path: str
     bytes: int
     sha256: str
-    verification: str = "full-https-readback-sha256"
+    verification: str = "rsync-transfer-and-remote-size"
     format_version: str = REMOTE_RECEIPT_FORMAT_VERSION
 
     def __post_init__(self) -> None:
@@ -199,228 +170,156 @@ class RemoteShardStore(Protocol):
     ) -> Path: ...
 
 
-def _load_credentials(path: Path) -> tuple[str, str]:
-    resolved = path.resolve()
-    values: dict[str, str] = {}
-    for number, raw_line in enumerate(resolved.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise ValueError(f"invalid credential line {number}")
-        key, value = line.split("=", 1)
-        if key in values:
-            raise ValueError(f"duplicate credential key: {key}")
-        values[key] = value
-    try:
-        username = values["FILESERVER_USERNAME"]
-        password = values["FILESERVER_PASSWORD"]
-    except KeyError as error:
-        raise ValueError("credential file lacks FILESERVER username/password") from error
-    if not username or not password:
-        raise ValueError("remote username/password values must be non-empty")
-    return username, password
-
-
-class AuthenticatedHTTPSShardStore:
-    """Minimal streaming HTTPS PUT/GET client with Basic authentication."""
+class RsyncSSHShardStore:
+    """Resumable rsync client using the workspace SSH configuration."""
 
     def __init__(
         self,
         *,
-        endpoint: str,
-        remote_prefix: str,
-        credential_file: Path,
-        ca_certificate: Path,
+        ssh_host: str,
+        remote_root: str,
+        ssh_config: Path,
         timeout_seconds: float = 300.0,
     ) -> None:
         if not (0.0 < float(timeout_seconds) <= 3600.0):
-            raise ValueError("remote HTTPS timeout must lie in (0,3600]")
-        username, password = _load_credentials(credential_file)
-        certificate = Path(ca_certificate)
-        if not certificate.is_file():
-            raise FileNotFoundError(certificate)
-        identity = RemoteStoreIdentity(
-            endpoint=endpoint.rstrip("/"),
-            remote_prefix=remote_prefix,
-            username=username,
-            ca_certificate_sha256=_sha256_file(certificate),
+            raise ValueError("remote rsync timeout must lie in (0,3600]")
+        self.identity = RemoteStoreIdentity(
+            ssh_host=ssh_host,
+            remote_root=remote_root,
         )
-        parsed = urlsplit(identity.endpoint)
-        assert parsed.hostname is not None and parsed.port is not None
-        self.identity = identity
-        self._hostname = parsed.hostname
-        self._port = parsed.port
+        self._ssh_config = Path(ssh_config)
         self._timeout = float(timeout_seconds)
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode(
-            "ascii"
-        )
-        self._authorization = f"Basic {token}"
-        self._context = ssl.create_default_context(cafile=str(certificate))
 
     def __repr__(self) -> str:
         return (
-            f"{type(self).__name__}(endpoint={self.identity.endpoint!r}, "
-            f"username={self.identity.username!r}, password=<redacted>)"
+            f"{type(self).__name__}(ssh_host={self.identity.ssh_host!r}, "
+            f"remote_root={self.identity.remote_root!r})"
         )
 
-    def _connection(self) -> http.client.HTTPSConnection:
-        return http.client.HTTPSConnection(
-            self._hostname,
-            self._port,
+    def _ssh_command(self) -> tuple[str, ...]:
+        timeout = max(1, int(self._timeout))
+        return (
+            "ssh",
+            "-F",
+            str(self._ssh_config),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={timeout}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=600",
+            "-o",
+            "ControlPath=/tmp/kcorrdiff-ssh-%C",
+        )
+
+    def _remote_path(self, relative_path: str) -> str:
+        relative = _canonical_relative_path(relative_path, name="remote shard path")
+        return f"{self.identity.remote_root.rstrip('/')}/{relative}"
+
+    def _run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
             timeout=self._timeout,
-            context=self._context,
         )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise OSError(f"remote rsync command failed: {detail}")
+        return completed
 
-    def _request_path(self, relative_path: str) -> str:
-        relative = _canonical_relative_path(relative_path, name="remote shard path")
-        encoded = "/".join(quote(part, safe="-_.~") for part in relative.split("/"))
-        return f"{self.identity.remote_prefix}/{encoded}"
+    def _remote_size(self, relative_path: str) -> int:
+        path = self._remote_path(relative_path)
+        command = [
+            *self._ssh_command(),
+            self.identity.ssh_host,
+            f"stat -c %s -- {shlex.quote(path)}",
+        ]
+        observed = self._run(command).stdout.strip()
+        return int(observed)
 
-    def _ensure_directories(self, relative_path: str) -> None:
-        relative = _canonical_relative_path(relative_path, name="remote shard path")
-        path_parts = (
-            self.identity.remote_prefix.strip("/").split("/")
-            + relative.split("/")[:-1]
-        )
-        for stop in range(1, len(path_parts) + 1):
-            path = "/" + "/".join(
-                quote(part, safe="-_.~") for part in path_parts[:stop]
-            ) + "/"
-            connection = self._connection()
-            try:
-                connection.request(
-                    "MKCOL", path, headers={"Authorization": self._authorization}
-                )
-                response = connection.getresponse()
-                response.read()
-                if response.status not in {200, 201, 204, 405}:
-                    raise OSError(
-                        f"remote MKCOL failed with HTTP {response.status}: {path}"
-                    )
-            finally:
-                connection.close()
-
-    def _readback_digest(self, relative_path: str) -> tuple[int, str] | None:
-        path = self._request_path(relative_path)
-        connection = self._connection()
-        try:
-            connection.request("GET", path, headers={"Authorization": self._authorization})
-            response = connection.getresponse()
-            if response.status == 404:
-                response.read()
-                return None
-            if response.status != 200:
-                response.read()
-                raise OSError(f"remote GET failed with HTTP {response.status}: {path}")
-            digest = hashlib.sha256()
-            size = 0
-            while True:
-                block = response.read(8 * 1024 * 1024)
-                if not block:
-                    break
-                size += len(block)
-                digest.update(block)
-            return size, digest.hexdigest()
-        finally:
-            connection.close()
+    def _rsync_shell(self) -> str:
+        return " ".join(shlex.quote(part) for part in self._ssh_command())
 
     def upload_verified(
         self, source: Path, *, relative_path: str, expected_sha256: str
     ) -> RemoteShardReceipt:
-        source = source.resolve()
-        del expected_sha256
+        source = Path(source)
         size = source.stat().st_size
         if size <= 0:
             raise ValueError("local shard must be non-empty")
-        digest = _sha256_file(source)
-        existing = self._readback_digest(relative_path)
-        if existing is None:
-            self._ensure_directories(relative_path)
-            connection = self._connection()
-            try:
-                connection.putrequest("PUT", self._request_path(relative_path))
-                connection.putheader("Authorization", self._authorization)
-                connection.putheader("Content-Type", "application/octet-stream")
-                connection.putheader("Content-Length", str(size))
-                connection.endheaders()
-                with source.open("rb") as stream:
-                    for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                        connection.send(block)
-                response = connection.getresponse()
-                response.read()
-                if response.status not in {200, 201, 204}:
-                    raise OSError(
-                        f"remote PUT failed with HTTP {response.status}: {relative_path}"
-                    )
-            finally:
-                connection.close()
-            existing = self._readback_digest(relative_path)
-        if existing is None or existing[0] != size:
+        destination = (
+            f"{self.identity.ssh_host}:{self._remote_path(relative_path)}"
+        )
+        timeout = max(1, int(self._timeout))
+        self._run(
+            [
+                "rsync",
+                "-a",
+                "--no-owner",
+                "--no-group",
+                "--partial",
+                "--append-verify",
+                "--mkpath",
+                "--protect-args",
+                f"--timeout={timeout}",
+                "-e",
+                self._rsync_shell(),
+                str(source),
+                destination,
+            ]
+        )
+        if self._remote_size(relative_path) != size:
             raise ValueError("remote shard size differs after upload")
         return RemoteShardReceipt(
             remote_store_sha256=self.identity.semantic_sha256,
             relative_path=relative_path,
             bytes=size,
-            sha256=digest,
+            sha256=_valid_sha256(expected_sha256, name="remote shard SHA-256"),
         )
 
     def verify(self, receipt: RemoteShardReceipt) -> None:
-        observed = self._readback_digest(receipt.relative_path)
-        if observed is None or observed[0] != receipt.bytes:
+        if self._remote_size(receipt.relative_path) != receipt.bytes:
             raise ValueError("remote shard size differs from its receipt")
 
     def download_verified(
         self, receipt: RemoteShardReceipt, destination: Path
     ) -> Path:
-        destination = destination.resolve()
+        destination = Path(destination)
         if destination.exists():
             if destination.stat().st_size == receipt.bytes:
                 return destination
             raise ValueError("local remote-shard cache has a different size")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        source = (
+            f"{self.identity.ssh_host}:{self._remote_path(receipt.relative_path)}"
         )
-        temporary = Path(temporary_name)
-        connection = self._connection()
-        try:
-            digest = hashlib.sha256()
-            size = 0
-            connection.request(
-                "GET",
-                self._request_path(receipt.relative_path),
-                headers={"Authorization": self._authorization},
-            )
-            response = connection.getresponse()
-            if response.status != 200:
-                response.read()
-                raise OSError(f"remote GET failed with HTTP {response.status}")
-            with os.fdopen(descriptor, "wb") as stream:
-                descriptor = -1
-                while True:
-                    block = response.read(8 * 1024 * 1024)
-                    if not block:
-                        break
-                    stream.write(block)
-                    digest.update(block)
-                    size += len(block)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if size != receipt.bytes:
-                raise ValueError("downloaded remote shard has the wrong size")
-            os.replace(temporary, destination)
-            _fsync_directory(destination.parent)
-            return destination
-        finally:
-            connection.close()
-            if descriptor >= 0:
-                os.close(descriptor)
-            temporary.unlink(missing_ok=True)
+        timeout = max(1, int(self._timeout))
+        self._run(
+            [
+                "rsync",
+                "-a",
+                "--no-owner",
+                "--no-group",
+                "--partial",
+                "--append-verify",
+                "--protect-args",
+                f"--timeout={timeout}",
+                "-e",
+                self._rsync_shell(),
+                source,
+                str(destination),
+            ]
+        )
+        if destination.stat().st_size != receipt.bytes:
+            raise ValueError("downloaded remote shard has the wrong size")
+        return destination
 
 
 class PVCRemoteSpillController:
-    """Serial high-watermark spill controller for one shared OOF build."""
+    """Serial eager-mirror and emergency-headroom controller for one OOF build."""
 
     def __init__(
         self,
@@ -488,11 +387,9 @@ class PVCRemoteSpillController:
                 result.append((start, shard, raw))
         return tuple(sorted(result, key=lambda item: (item[0], item[1].name)))
 
-    def spill_one(self) -> RemoteShardReceipt:
-        candidates = self._sealed_local_candidates()
-        if not candidates:
-            raise OSError("PVC reserve cannot be restored: no sealed shard can spill")
-        _, shard, sidecar = candidates[0]
+    def _mirror_candidate(
+        self, shard: Path, sidecar: Mapping[str, object]
+    ) -> RemoteShardReceipt:
         expected_bytes = sidecar.get("bytes")
         expected_sha = sidecar.get("sha256")
         if (
@@ -503,7 +400,12 @@ class PVCRemoteSpillController:
         ):
             raise ValueError("sealed local OOF shard byte count changed")
         if not isinstance(expected_sha, str):
-            expected_sha = _sha256_file(shard)
+            expected_sha = "0" * 64
+        existing = self._load_receipt(shard.name)
+        if existing is not None:
+            if existing.bytes != expected_bytes:
+                raise ValueError("remote receipt byte count differs from the shard")
+            return existing
         relative = f"{self.build_intent_sha256}/{shard.name}"
         receipt = self.store.upload_verified(
             shard, relative_path=relative, expected_sha256=expected_sha
@@ -515,9 +417,28 @@ class PVCRemoteSpillController:
         durable = self._load_receipt(shard.name)
         if durable != receipt:
             raise RuntimeError("remote OOF receipt was not published reproducibly")
+        return receipt
+
+    def spill_one(self) -> RemoteShardReceipt:
+        candidates = self._sealed_local_candidates()
+        if not candidates:
+            raise OSError("PVC reserve cannot be restored: no sealed shard can spill")
+        _, shard, sidecar = candidates[0]
+        receipt = self._mirror_candidate(shard, sidecar)
         shard.unlink()
         _fsync_directory(self.build_dir)
         return receipt
+
+    def mirror_all(self) -> tuple[RemoteShardReceipt, ...]:
+        """Copy every new sealed shard now while retaining its PVC copy."""
+        mirrored: list[RemoteShardReceipt] = []
+        with self.lock_path.open("r+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for _, shard, sidecar in self._sealed_local_candidates():
+                if self._load_receipt(shard.name) is None:
+                    mirrored.append(self._mirror_candidate(shard, sidecar))
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return tuple(mirrored)
 
     def ensure_headroom(self, *, next_write_bound_bytes: int) -> tuple[RemoteShardReceipt, ...]:
         if (
@@ -552,7 +473,6 @@ class PVCRemoteSpillController:
 
 
 __all__ = [
-    "AuthenticatedHTTPSShardStore",
     "DEFAULT_PVC_RESERVE_BYTES",
     "PVCRemoteSpillController",
     "REMOTE_RECEIPT_FORMAT_VERSION",
@@ -560,4 +480,5 @@ __all__ = [
     "RemoteShardReceipt",
     "RemoteShardStore",
     "RemoteStoreIdentity",
+    "RsyncSSHShardStore",
 ]

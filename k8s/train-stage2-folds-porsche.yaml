@@ -40,9 +40,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: trainer
-          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          image: sgs-registry.snucse.org/ws-md93se6gk3270/kcorrdiff-runtime:pytorch-2.13-transfer-v1
           imagePullPolicy: IfNotPresent
-          command: ["/bin/bash", "-ceu", "/workspace/code/stage2-folds-porsche-v3/scripts/run_stage2_fold.sh"]
+          command: ["/bin/bash", "-ceu", "/workspace/code/kcorrdiff-rsync-oof-eager-v3/scripts/run_stage2_fold.sh"]
           env:
             - name: RUN_ID
               value: stage2-folds-porsche-v3
@@ -57,7 +57,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-folds-porsche-v3
+              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-eager-v3
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -143,9 +143,6 @@ spec:
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
-            - name: oof-remote
-              mountPath: /run/secrets/kcorrdiff-oof
-              readOnly: true
       volumes:
         - name: workspace
           persistentVolumeClaim:
@@ -157,10 +154,6 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 8Gi
-        - name: oof-remote
-          secret:
-            secretName: kcorrdiff-oof-remote
-            defaultMode: 0440
 ---
 # CPU-only verifier/notifier on the same porsche PVC.
 apiVersion: batch/v1
@@ -204,7 +197,7 @@ spec:
         - name: collector
           image: python:3.12-slim-bookworm@sha256:356b0d18f9385f4bdcc673af60e1e64c9d1504952e4ec36ee32044c722a6bc4e
           imagePullPolicy: Always
-          workingDir: /workspace/code/stage2-folds-porsche-v3
+          workingDir: /workspace/code/kcorrdiff-rsync-oof-eager-v3
           command: ["/bin/bash", "-ceu"]
           args:
             - |

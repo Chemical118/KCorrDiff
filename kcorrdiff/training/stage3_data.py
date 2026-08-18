@@ -278,7 +278,7 @@ _OOF_COMPRESSED_SHARD_KEYS = frozenset(
 _OOF_REMOTE_LOCAL_SHARD_KEYS = _OOF_COMPRESSED_SHARD_KEYS | frozenset(
     {"storage"}
 )
-_OOF_REMOTE_HTTPS_SHARD_KEYS = _OOF_REMOTE_LOCAL_SHARD_KEYS | frozenset(
+_OOF_REMOTE_SPILLED_SHARD_KEYS = _OOF_REMOTE_LOCAL_SHARD_KEYS | frozenset(
     {"remote"}
 )
 _SCALE_ROOT_KEYS = frozenset(
@@ -692,7 +692,7 @@ class LazyOOFFieldReader:
         downloaded = False
         if shard.remote_receipt is not None:
             if self.remote_store is None or self.remote_cache_root is None:
-                raise ValueError("remote OOF shard has no authenticated bounded cache")
+                raise ValueError("remote OOF shard has no bounded local cache")
             worker_cache = self.remote_cache_root / f"worker-{pid}"
             worker_cache.mkdir(parents=True, exist_ok=True)
             path = worker_cache / shard.path.name
@@ -1199,7 +1199,7 @@ def _validate_oof_artifact(
         if remote:
             if inputs.remote_store is None or inputs.remote_cache_root is None:
                 raise ValueError(
-                    "remote OOF artifact requires authenticated store and cache root"
+                    "remote OOF artifact requires a remote store and cache root"
                 )
 
     index_record = _mapping(manifest.get("index"), name="OOF index record")
@@ -1268,12 +1268,12 @@ def _validate_oof_artifact(
         if remote:
             storage = record.get("storage")
             expected_keys = (
-                _OOF_REMOTE_HTTPS_SHARD_KEYS
-                if storage == "remote_https"
+                _OOF_REMOTE_SPILLED_SHARD_KEYS
+                if storage in {"remote_rsync", "remote_https"}
                 else _OOF_REMOTE_LOCAL_SHARD_KEYS
             )
             _exact_keys(record, expected_keys, name=f"OOF shard record {index}")
-            if storage not in {"local", "remote_https"}:
+            if storage not in {"local", "remote_rsync", "remote_https"}:
                 raise ValueError("OOF remote shard storage location is invalid")
         else:
             _exact_keys(
@@ -1291,7 +1291,7 @@ def _validate_oof_artifact(
             raise ValueError("OOF shard shape or contiguous coverage mismatch")
         path = root / filename
         remote_receipt: RemoteShardReceipt | None = None
-        if remote and record.get("storage") == "remote_https":
+        if remote and record.get("storage") in {"remote_rsync", "remote_https"}:
             raw_receipt = _mapping(
                 record.get("remote"), name=f"remote OOF receipt {filename}"
             )

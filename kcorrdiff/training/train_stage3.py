@@ -92,7 +92,7 @@ from kcorrdiff.training.stage3_data import (
     build_stage3_distributed_plan,
     load_stage3_artifacts,
 )
-from kcorrdiff.training.oof_remote import AuthenticatedHTTPSShardStore
+from kcorrdiff.training.oof_remote import RsyncSSHShardStore
 from kcorrdiff.training.runtime import assert_float32_tree
 from kcorrdiff.training.release_index import (
     Stage2ReleaseIndex,
@@ -3309,8 +3309,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage2-release-index", type=Path, required=True)
     parser.add_argument("--stage2-release-index-sha256")
     parser.add_argument("--stage2-release-root", type=Path, required=True)
-    parser.add_argument("--oof-remote-credentials", type=Path)
-    parser.add_argument("--oof-remote-ca-certificate", type=Path)
+    parser.add_argument("--oof-remote-ssh-config", type=Path)
     parser.add_argument("--oof-remote-cache-root", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--screening-evaluation", type=Path)
@@ -3486,18 +3485,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         factory = build_data_factory(
             stage2_config, _factory_inputs_from_arguments(arguments, stage2_config)
         )
-        credentials = arguments.oof_remote_credentials
-        ca_certificate = arguments.oof_remote_ca_certificate
-        if (credentials is None) != (ca_certificate is None):
-            raise ValueError("remote OOF credentials and CA must be supplied together")
+        ssh_config = arguments.oof_remote_ssh_config
         remote_store = (
             None
-            if credentials is None
-            else AuthenticatedHTTPSShardStore(
-                endpoint=stage2_config.crossfit.remote_spill.endpoint,
-                remote_prefix=stage2_config.crossfit.remote_spill.remote_prefix,
-                credential_file=credentials,
-                ca_certificate=ca_certificate,
+            if ssh_config is None
+            else RsyncSSHShardStore(
+                ssh_host=stage2_config.crossfit.remote_spill.ssh_host,
+                remote_root=stage2_config.crossfit.remote_spill.remote_root,
+                ssh_config=ssh_config,
                 timeout_seconds=stage2_config.crossfit.remote_spill.timeout_seconds,
             )
         )

@@ -183,6 +183,7 @@ def initialize_tracking(
     launch_identity_sha256: str | None = None,
     mode: str = "online",
     resume: Literal["never", "allow"] = "never",
+    backend_run_id: str | None = None,
 ) -> TrackingRun:
     """Initialize W&B only on rank zero and never expose its API key."""
 
@@ -194,6 +195,8 @@ def initialize_tracking(
         raise ValueError("unsupported W&B mode")
     if resume not in {"never", "allow"}:
         raise ValueError("tracking resume must be 'never' or 'allow'")
+    if backend_run_id is not None and not backend_run_id:
+        raise ValueError("W&B backend run ID must be non-empty when provided")
     if mode == "online" and not os.environ.get("WANDB_API_KEY"):
         raise RuntimeError("WANDB_API_KEY is required for online tracking")
     try:
@@ -211,6 +214,9 @@ def initialize_tracking(
     )
     public_config = dict(config)
     public_config["config_sha256"] = config_sha256
+    effective_backend_run_id = backend_run_id or run_id
+    public_config["logical_run_id"] = run_id
+    public_config["wandb_backend_run_id"] = effective_backend_run_id
     if launch_identity_sha256 is not None:
         public_config["launch_identity_sha256"] = launch_identity_sha256
     if any("api_key" in str(key).lower() or "secret" in str(key).lower() for key in public_config):
@@ -218,13 +224,14 @@ def initialize_tracking(
     try:
         backend = wandb.init(
             project=project,
-            id=run_id,
-            name=run_id,
+            id=effective_backend_run_id,
+            name=effective_backend_run_id,
+            group=(run_id if effective_backend_run_id != run_id else None),
             job_type=job_type,
             dir=str(run_dir),
             config=public_config,
             mode=mode,
-            resume=resume,
+            resume=(resume if effective_backend_run_id == run_id else "never"),
             settings=wandb.Settings(start_method="thread"),
         )
         if backend is None:

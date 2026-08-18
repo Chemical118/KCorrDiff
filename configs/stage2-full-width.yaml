@@ -109,12 +109,12 @@ crossfit:
   maximum_oof_compressed_bytes: 150323855360
   maximum_oof_compression_ratio: 0.70
   oof_compression_probe_bytes: 8589934592
-  # Keep the PVC hot tier full while reserving 10 GiB final free space plus a
-  # conservative 4 GiB for the deployment/direct checkpoints written after
-  # OOF publication. The spill store is an optional overflow tier.
+  # Each sealed compressed shard is rsynced immediately and retained locally
+  # while space permits. Keep 10 GiB final free space plus a conservative
+  # 4 GiB for deployment/direct checkpoints and compression temporaries.
   oof_remote_spill:
-    endpoint: https://168.188.119.187:1047
-    remote_prefix: /kcorrdiff/oof
+    ssh_host: hyunwoo-home
+    remote_root: /hyunwoo/kcorrdiff/oof
     local_reserve_bytes: 15032385536
     timeout_seconds: 600.0
   epsilon_residual_scale: 0.001

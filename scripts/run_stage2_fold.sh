@@ -3,7 +3,7 @@ set -euo pipefail
 
 fold_id="${JOB_COMPLETION_INDEX:?missing indexed Job completion index}"
 node_name="${NODE_NAME:?missing scheduled node name}"
-source_root=/workspace/code/stage2-folds-porsche-v3
+source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 run_root=/workspace/runs/stage2-folds-porsche-v3
 output_dir="${run_root}/workers/fold-${fold_id}"
 runtime_report=/workspace/envs/stage2-python-v1/pip-report.json
@@ -36,8 +36,7 @@ test -f /workspace/data/manifests/event-pretrain-production-v1/training-draw-man
 test -f /workspace/data/manifests/event-pretrain-production-v1/candidate-manifest.json
 test -f /workspace/data/manifests/event-pretrain-production-v1/bundle-metadata.json
 test -f /workspace/data/static/target_static.npz
-test -r /run/secrets/kcorrdiff-oof/credentials.env
-test -r /run/secrets/kcorrdiff-oof/server.crt
+test -r /workspace/.ssh/config
 
 actual_policy_sha256="$(python3 -c 'from kcorrdiff.training.train_stage2 import SINGLE_NODE_FOLD_POLICY_SHA256; print(SINGLE_NODE_FOLD_POLICY_SHA256)')"
 nvidia-smi -L
@@ -69,8 +68,7 @@ torchrun \
   --static-path /workspace/data/static/target_static.npz \
   --output-dir "${output_dir}" \
   --oof-output-dir "${output_dir}/oof" \
-  --oof-remote-credentials /run/secrets/kcorrdiff-oof/credentials.env \
-  --oof-remote-ca-certificate /run/secrets/kcorrdiff-oof/server.crt \
+  --oof-remote-ssh-config /workspace/.ssh/config \
   --precision float32 \
   --disable-tf32 \
   --target-widths 64,128,256,384,512 \

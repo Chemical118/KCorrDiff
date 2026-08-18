@@ -39,18 +39,17 @@ spec:
           type: RuntimeDefault
       containers:
         - name: trainer
-          image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+          image: sgs-registry.snucse.org/ws-md93se6gk3270/kcorrdiff-runtime:pytorch-2.13-transfer-v1
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace/code/stage2-2020-b12-1gpu-v1
+          workingDir: /workspace/code/kcorrdiff-rsync-oof-eager-v3
           command: ["/bin/bash", "-ceu"]
           args:
             - |
-              source_root=/workspace/code/stage2-2020-b12-1gpu-v1
+              source_root=/workspace/code/kcorrdiff-rsync-oof-eager-v3
               run_root=/workspace/runs/stage2-bounded/stage2-regression-2020-b12-1gpu-v2
               log_file=${run_root}/logs/train.log
 
-              test -r /run/secrets/kcorrdiff-oof/credentials.env
-              test -r /run/secrets/kcorrdiff-oof/server.crt
+              test -r /workspace/.ssh/config
               install -d -m 0770 "${run_root}/logs" "${run_root}/wandb" \
                 "${run_root}/oof"
               exec > >(tee -a "${log_file}") 2>&1
@@ -81,8 +80,7 @@ spec:
                 --static-path /workspace/data/static/target_static.npz \
                 --output-dir "${run_root}" \
                 --oof-output-dir "${run_root}/oof" \
-                --oof-remote-credentials /run/secrets/kcorrdiff-oof/credentials.env \
-                --oof-remote-ca-certificate /run/secrets/kcorrdiff-oof/server.crt \
+                --oof-remote-ssh-config /workspace/.ssh/config \
                 --precision float32 \
                 --disable-tf32 \
                 --target-widths 64,128,256,384,512 \
@@ -104,7 +102,7 @@ spec:
             - name: RUN_ID
               value: stage2-regression-2020-b12-1gpu-v2
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-2020-b12-1gpu-v1
+              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-eager-v3
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -181,9 +179,6 @@ spec:
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
-            - name: oof-remote
-              mountPath: /run/secrets/kcorrdiff-oof
-              readOnly: true
       volumes:
         - name: workspace
           persistentVolumeClaim:
@@ -195,7 +190,3 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 8Gi
-        - name: oof-remote
-          secret:
-            secretName: kcorrdiff-oof-remote
-            defaultMode: 0440

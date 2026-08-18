@@ -23,12 +23,11 @@ items:
         set -euo pipefail
         umask 0007
 
-        source_root=/workspace/code/stage3-production-v2
+        source_root=/workspace/code/kcorrdiff-rsync-oof-eager-v3
         stage3_config=${source_root}/configs/stage3-full-width.yaml
         stage2_release=/workspace/releases/stage2/selected
         stage2_release_index=${stage2_release}/release-index.json
-        oof_remote_credentials=/run/secrets/kcorrdiff-oof/credentials.env
-        oof_remote_ca=/run/secrets/kcorrdiff-oof/server.crt
+        oof_remote_ssh_config=/workspace/.ssh/config
         oof_remote_cache=/tmp/oof-remote-cache
 
         run_root=/workspace/runs/stage3/${STAGE3_RUN_ID}
@@ -53,8 +52,7 @@ items:
         test -f "${source_root}/kcorrdiff/training/stage3_data.py"
         test -f "${stage3_config}"
         test -f "${stage2_release_index}"
-        test -r "${oof_remote_credentials}"
-        test -r "${oof_remote_ca}"
+        test -r "${oof_remote_ssh_config}"
         install -d -m 0700 "${oof_remote_cache}"
 
         case "${STAGE3_PHASE}" in
@@ -110,8 +108,7 @@ items:
           --config "${stage3_config}" \
           --stage2-release-index "${stage2_release_index}" \
           --stage2-release-root "${stage2_release}" \
-          --oof-remote-credentials "${oof_remote_credentials}" \
-          --oof-remote-ca-certificate "${oof_remote_ca}" \
+          --oof-remote-ssh-config "${oof_remote_ssh_config}" \
           --oof-remote-cache-root "${oof_remote_cache}" \
           --output-dir "${run_root}" \
           --precision float32 \
@@ -168,9 +165,9 @@ items:
               type: RuntimeDefault
           containers:
             - name: trainer
-              image: &stage3_image pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
+              image: &stage3_image sgs-registry.snucse.org/ws-md93se6gk3270/kcorrdiff-runtime:pytorch-2.13-transfer-v1
               imagePullPolicy: IfNotPresent
-              workingDir: /workspace/code/stage3-production-v2
+              workingDir: /workspace/code/kcorrdiff-rsync-oof-eager-v3
               command: ["/bin/bash", "/opt/kcorrdiff/stage3-entrypoint.sh"]
               env:
                 - name: STAGE3_PHASE
@@ -182,7 +179,7 @@ items:
                 - name: KCORRDIFF_CONTAINER_IMAGE
                   value: *stage3_image
                 - name: PYTHONPATH
-                  value: /workspace/envs/stage2-python-v1:/workspace/code/stage3-production-v2
+                  value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-eager-v3
                 - name: PYTHONUNBUFFERED
                   value: "1"
                 - name: PYTHONDONTWRITEBYTECODE
@@ -262,9 +259,6 @@ items:
                 - name: stage3-runner
                   mountPath: /opt/kcorrdiff
                   readOnly: true
-                - name: oof-remote
-                  mountPath: /run/secrets/kcorrdiff-oof
-                  readOnly: true
           volumes:
             - name: workspace
               persistentVolumeClaim:
@@ -280,10 +274,6 @@ items:
               configMap:
                 name: kcorrdiff-stage3-runner-v1-1-3b-v2
                 defaultMode: 0555
-            - name: oof-remote
-              secret:
-                secretName: kcorrdiff-oof-remote
-                defaultMode: 0440
 
   - apiVersion: batch/v1
     kind: Job

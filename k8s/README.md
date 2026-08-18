@@ -1,4 +1,4 @@
-pi# SNU Kubernetes 실행 매니페스트
+# SNU Kubernetes 실행 매니페스트
 
 `saycorn-volume`은 250 GiB OpenEBS local RWO PVC다. 2026-08-13 사용자의 명시적
 허가로 비어 있던 기존 `ferrari` claim을 삭제하고 `porsche`의 첫 소비 Pod를 통해
@@ -22,10 +22,19 @@ kubectl auth whoami
 Telegram의 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`도 `.env`에만 두고
 `scripts/apply_telegram_secret.py`가 두 값만 `kcorrdiff-telegram` Secret의
 `bot-token`/`chat-id` key로 전달한다. 값은 명령 인자나 출력에 노출하지 않는다.
-OOF overflow용 1047 HTTPS 계정과 self-signed CA는 `kcorrdiff-oof-remote` Secret의
-`credentials.env`/`server.crt`로 주입하며, Pod에는 fsGroup-read-only(0440)로 mount한다.
+OOF overflow는 PVC의 `/workspace/.ssh/config`와 개인키를 사용해
+`hyunwoo-home:/hyunwoo/kcorrdiff/oof`로 rsync한다. SSH 파일은 UID 1035 소유,
+config와 개인키는 0600으로 유지한다.
 모든 Job은 기존 `saycorn-volume`만 참조하며 PVC를 생성·삭제하지
 않는다. 특히 PVC 삭제는 이 workflow에 포함하지 않는다.
+
+로컬 KCorrDiff 소스만 기존 `/workspace/KCorrDiff`에 반영할 때는 데이터 전체를
+다시 스테이징하지 않고 다음 명령을 사용한다. `.git`, 캐시, `.env`는 복사하지 않으며
+data, runs, logs, checkpoint 경로는 변경하지 않는다.
+
+```bash
+scripts/update_pvc_source.sh
+```
 
 현재 파일:
 
@@ -223,20 +232,19 @@ Benchmark에서 특정 batch의 OOM을 관측값으로 기록하는 것은 허�
 Radar/ERA payload의 SHA-256은 cache key와 provenance로만 쓴다. 학습 Job에서 live
 payload를 재해시하거나 expected hash와 비교하지 않는다.
 
-## OOF PVC hot tier와 1047 overflow
+## OOF PVC hot tier와 rsync overflow
 
-Stage 2 OOF는 float32 두 field를 lossless byte-shuffle+DEFLATE shard로 기록한다. PVC는
-primary hot tier이며, 다음 shard의 최악 크기와 후속 checkpoint 용량까지 고려해
-최종 10 GiB free-space가 보존되도록 OOF 중에는 14 GiB를 예약한다. 임계점에 닿으면
-가장 오래된 sealed shard 하나만 `https://168.188.119.187:1047/kcorrdiff/oof`로 PUT한다.
-서버에서 파일을 다시 GET해 전송 크기를 확인하고 durable receipt가 게시된 뒤에만 PVC
-사본을 지운다. 전송 실패 때는 로컬 shard를 유지하고 오류를 보고한다.
+Stage 2 OOF는 float32 두 field를 lossless byte-shuffle+DEFLATE shard로 기록한다.
+각 sealed shard는 생성 즉시 `hyunwoo-home:/hyunwoo/kcorrdiff/oof`로 rsync하므로
+전송 시간이 OOF inference 사이에 분산된다. 중단된 전송은 partial 파일에서 이어가며,
+원격 파일 크기와 durable receipt를 확인한다. PVC 사본은 EDM-A의 hot-read tier로
+유지하고, 14 GiB headroom을 지키기 위해 필요할 때만 이미 mirror된 오래된 shard부터
+지운다. 전송 실패 때는 로컬 shard를 유지하고 오류를 보고한다.
 
-최종 OOF manifest는 각 shard를 `local` 또는 `remote_https`로 명시한다. Stage 3는
+최종 OOF manifest는 각 shard를 `local` 또는 `remote_rsync`로 명시한다. Stage 3는
 원격 shard가 필요할 때 worker별 `/tmp/oof-remote-cache`에 하나만 받아 크기와 FP32
 shape/dtype을 확인한 뒤 압축 파일을 즉시 지운다. 따라서 전체 OOF를 PVC에
-재복제하지 않는다. 실제 porsche→1047 smoke에서 v3 shard upload, full HTTPS read-back,
-로컬 삭제, 재다운로드 및 uint32 bit-pattern roundtrip을 모두 확인했다.
+재복제하지 않는다. 기존 `remote_https` manifest는 읽기 호환성을 유지한다.
 
 `benchmark-loader.yaml`은 host-to-device와 GPU utilization을 함께 측정하는 데 필요한
 최소 1 GPU만 요청한다. Stage 2 학습과 Stage 3의 세 phase Job도 기본 1 GPU를 요청하며

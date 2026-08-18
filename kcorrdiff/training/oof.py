@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
 import io
@@ -1369,7 +1370,7 @@ class OOFCompressedBuild:
                 raise ValueError(f"remote OOF shard byte count mismatch: {filename}")
         return {
             **record,
-            "storage": "remote_https" if receipt is not None else "local",
+            "storage": "remote_rsync" if receipt is not None else "local",
             **({"remote": receipt.record()} if receipt is not None else {}),
         }
 
@@ -1525,13 +1526,26 @@ class OOFCompressedPartitionWriter:
         self._active_receipts: list[tuple[int, str]] = []
         self._pending: list[tuple[int, str]] = []
         self._sealed_row_hashes: dict[int, str] = {}
+        self._sealed_cache_file: str | None = None
+        self._sealed_cache_values: NDArray[np.float32] | None = None
+        self._postprocess_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="oof-shard-postprocess",
+        )
+        self._postprocess_futures: list[Future[None]] = []
+        self._maximum_pending_postprocess = 8
+        self._postprocess_closed = False
         self._load_sealed_prefix()
+        self._recover_ready_shards()
 
     def _sidecar_path(self, layout: Mapping[str, object]) -> Path:
         return self.partition_dir / f"{layout['file']}.json"
 
     def _stage_path(self, layout: Mapping[str, object]) -> Path:
         return self.partition_dir / f"{layout['file']}.active.npy"
+
+    def _ready_path(self, layout: Mapping[str, object]) -> Path:
+        return self.partition_dir / f"{layout['file']}.ready.npy"
 
     def _journal_path(self, layout: Mapping[str, object]) -> Path:
         return self.partition_dir / f"{layout['file']}.receipts.jsonl"
@@ -1545,16 +1559,119 @@ class OOFCompressedPartitionWriter:
                 continue
             if saw_gap:
                 raise ValueError("compressed OOF partition has a non-prefix sealed shard")
-            record = self.build._verified_shard_record(layout)
-            del record
+            record = self.build._shard_sidecar_record(layout)
+            filename = str(layout["file"])
+            archive = self.build.build_dir / filename
+            expected_bytes = record.get("bytes")
+            if (
+                isinstance(expected_bytes, bool)
+                or not isinstance(expected_bytes, int)
+                or expected_bytes <= 0
+            ):
+                raise ValueError("compressed OOF shard byte metadata is invalid")
+            if archive.is_file():
+                if archive.stat().st_size != expected_bytes:
+                    raise ValueError("compressed OOF shard byte count changed")
+            else:
+                receipt = (
+                    self.build.remote_spill.receipt_for(
+                        filename, verify_remote=False
+                    )
+                    if self.build.remote_spill is not None
+                    else None
+                )
+                if receipt is None or receipt.bytes != expected_bytes:
+                    raise FileNotFoundError(
+                        f"compressed OOF shard has no local or remote copy: {filename}"
+                    )
             for offset in range(int(layout["items"])):
                 self._sealed_row_hashes[int(layout["start"]) + offset] = ""
             self._stage_path(layout).unlink(missing_ok=True)
+            self._ready_path(layout).unlink(missing_ok=True)
             self._journal_path(layout).unlink(missing_ok=True)
+
+    def _recover_ready_shards(self) -> None:
+        """Finish durable raw shards left by an interrupted queue worker."""
+
+        for layout in self.layout:
+            if self._sidecar_path(layout).is_file():
+                continue
+            ready = self._ready_path(layout)
+            if not ready.is_file():
+                continue
+            receipts = self._read_receipts_for(layout)
+            if len(receipts) != int(layout["items"]):
+                raise ValueError("queued compressed OOF shard has incomplete receipts")
+            self._seal_ready_shard(
+                layout,
+                ready,
+                tuple(digest for _, digest in receipts),
+            )
 
     @property
     def complete(self) -> bool:
         return len(self._sealed_row_hashes) == len(self.spec.row_indices)
+
+    @property
+    def sealed_items(self) -> int:
+        """Number of leading partition rows already stored in sealed shards."""
+
+        return len(self._sealed_row_hashes)
+
+    def sealed_fields(
+        self, artifact_index: int
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Read a previously sealed row without recomputing model inference."""
+
+        if artifact_index not in self._sealed_row_hashes:
+            raise KeyError(f"row {artifact_index} is not sealed")
+        layout = self._layout_for_row(artifact_index)
+        filename = str(layout["file"])
+        if self._sealed_cache_file != filename:
+            archive = self.build.build_dir / filename
+            temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+            try:
+                if not archive.is_file():
+                    if self.build.remote_spill is None or self.build.remote_store is None:
+                        raise FileNotFoundError(f"compressed OOF shard is missing: {filename}")
+                    receipt = self.build.remote_spill.receipt_for(
+                        filename, verify_remote=False
+                    )
+                    if receipt is None:
+                        raise FileNotFoundError(
+                            f"compressed OOF shard has no local or remote copy: {filename}"
+                        )
+                    temporary_directory = tempfile.TemporaryDirectory(
+                        prefix="kcorrdiff-oof-resume-"
+                    )
+                    archive = self.build.remote_store.download_verified(
+                        receipt, Path(temporary_directory.name) / filename
+                    )
+                self._sealed_cache_values = _load_npz_fields(archive)
+                self._sealed_cache_file = filename
+            finally:
+                if temporary_directory is not None:
+                    temporary_directory.cleanup()
+        assert self._sealed_cache_values is not None
+        local = artifact_index - int(layout["start"])
+        values = self._sealed_cache_values[local]
+        return np.asarray(values[0]), np.asarray(values[1])
+
+    def skip_sealed(self, artifact_index: int, identity: OOFIdentity) -> None:
+        """Advance over an existing sealed row after its statistics are reused."""
+
+        if self._seen >= len(self.spec.row_indices):
+            raise ValueError("compressed OOF partition received extra rows")
+        expected = self.spec.row_indices[self._seen]
+        if artifact_index != expected:
+            raise ValueError("compressed OOF partition row order mismatch")
+        if artifact_index not in self._sealed_row_hashes:
+            raise ValueError("cannot skip an unsealed compressed OOF row")
+        if _scientific_identity(identity) != _scientific_identity(
+            self.build.identities[artifact_index]
+        ):
+            raise ValueError("compressed OOF partition scientific identity mismatch")
+        self._seen += 1
 
     def _layout_for_row(self, index: int) -> Mapping[str, object]:
         for layout in self.layout:
@@ -1594,6 +1711,11 @@ class OOFCompressedPartitionWriter:
     def _read_active_receipts(
         self, layout: Mapping[str, object]
     ) -> list[tuple[int, str]]:
+        return self._read_receipts_for(layout)
+
+    def _read_receipts_for(
+        self, layout: Mapping[str, object]
+    ) -> list[tuple[int, str]]:
         path = self._journal_path(layout)
         if not path.exists():
             return []
@@ -1608,7 +1730,6 @@ class OOFCompressedPartitionWriter:
         result: list[tuple[int, str]] = []
         start = int(layout["start"])
         items = int(layout["items"])
-        assert self._active_values is not None
         for offset, line in enumerate(payload.splitlines(keepends=True)):
             if offset >= items:
                 raise ValueError("compressed OOF active journal has duplicate/extra row")
@@ -1729,7 +1850,48 @@ class OOFCompressedPartitionWriter:
         layout = self._active_layout
         if len(self._active_receipts) != int(layout["items"]):
             raise ValueError("cannot seal an incomplete compressed OOF shard")
-        values = np.asarray(self._active_values)
+        stage = self._stage_path(layout)
+        ready = self._ready_path(layout)
+        if ready.exists():
+            raise FileExistsError(ready)
+        row_hashes = tuple(digest for _, digest in self._active_receipts)
+        self._close_active()
+        os.replace(stage, ready)
+        _fsync_directory(self.partition_dir)
+        self._postprocess_futures.append(
+            self._postprocess_executor.submit(
+                self._seal_ready_shard,
+                layout,
+                ready,
+                row_hashes,
+            )
+        )
+        self._drain_postprocess_queue(wait_for_all=False)
+
+    def _drain_postprocess_queue(self, *, wait_for_all: bool) -> None:
+        keep = 0 if wait_for_all else self._maximum_pending_postprocess
+        while len(self._postprocess_futures) > keep:
+            future = self._postprocess_futures.pop(0)
+            future.result()
+
+    def _shutdown_postprocessing(self) -> None:
+        if self._postprocess_closed:
+            return
+        try:
+            self._drain_postprocess_queue(wait_for_all=True)
+        finally:
+            self._postprocess_executor.shutdown(wait=True)
+            self._postprocess_closed = True
+
+    def _seal_ready_shard(
+        self,
+        layout: Mapping[str, object],
+        ready: Path,
+        row_hashes: tuple[str, ...],
+    ) -> None:
+        values = np.load(ready, mmap_mode="r", allow_pickle=False)
+        if values.dtype != np.float32 or tuple(values.shape) != tuple(layout["shape"]):
+            raise ValueError("queued compressed OOF shard schema mismatch")
         array_sha = hashlib.sha256(
             np.ascontiguousarray(values).tobytes(order="C")
         ).hexdigest()
@@ -1816,7 +1978,7 @@ class OOFCompressedPartitionWriter:
                     "bytes": destination.stat().st_size,
                     "sha256": _sha256(destination),
                     "array_sha256": array_sha,
-                    "row_sha256": [digest for _, digest in self._active_receipts],
+                    "row_sha256": list(row_hashes),
                     "encoding": OOF_COMPRESSED_ENCODING,
                 }
                 # Archive and accounting sidecar become visible under the same
@@ -1830,13 +1992,15 @@ class OOFCompressedPartitionWriter:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             for offset, digest in enumerate(record["row_sha256"]):
                 self._sealed_row_hashes[int(layout["start"]) + offset] = str(digest)
-            stage = self._stage_path(layout)
             journal = self._journal_path(layout)
-            self._close_active()
-            stage.unlink(missing_ok=True)
+            mmap = getattr(values, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+            ready.unlink(missing_ok=True)
             journal.unlink(missing_ok=True)
             _fsync_directory(self.partition_dir)
             if self.build.remote_spill is not None:
+                self.build.remote_spill.mirror_all()
                 sealed_files = {
                     path.name.removesuffix(".json")
                     for path in self.partition_dir.glob("fields-*.npz.json")
@@ -1861,6 +2025,7 @@ class OOFCompressedPartitionWriter:
             raise ValueError("compressed OOF partition inference is incomplete")
         if self._active_layout is not None:
             self._seal_active_shard()
+        self._shutdown_postprocessing()
         if not self.complete:
             raise ValueError("compressed OOF partition shard coverage is incomplete")
         shards = []
@@ -1892,6 +2057,7 @@ class OOFCompressedPartitionWriter:
 
     def abort(self) -> None:
         self._close_active()
+        self._shutdown_postprocessing()
 
     def __enter__(self) -> "OOFCompressedPartitionWriter":
         return self
@@ -2089,7 +2255,7 @@ class OOFShardWriter:
 
 
 class OOFArtifact:
-    """Read a verified local or HTTPS-spilled OOF artifact shard by shard."""
+    """Read a verified local or remotely spilled OOF artifact shard by shard."""
 
     def __init__(
         self,
@@ -2122,7 +2288,7 @@ class OOFArtifact:
             raise ValueError("compressed OOF encoding mismatch")
         if self.format_version == OOF_REMOTE_FORMAT_VERSION:
             if remote_store is None:
-                raise ValueError("remote OOF artifact requires its authenticated store")
+                raise ValueError("remote OOF artifact requires its remote store")
         self.identities = tuple(
             OOFIdentity(**{key: value for key, value in json.loads(line).items() if key != "row"})
             for line in (self.root / str(self.manifest["index"]["file"])).read_text().splitlines()  # type: ignore[index]
