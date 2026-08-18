@@ -128,7 +128,7 @@ spec:
                 --era-grid-size 33 \
                 --per-rank-microbatch-size 64 \
                 --gradient-accumulation-steps 1 \
-                --num-workers 16 \
+                --num-workers 12 \
                 --prefetch-factor 2 \
                 --fail-on-fallback \
                 --wandb-mode online \
