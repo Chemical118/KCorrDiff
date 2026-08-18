@@ -1533,7 +1533,7 @@ class OOFCompressedPartitionWriter:
             thread_name_prefix="oof-shard-postprocess",
         )
         self._postprocess_futures: list[Future[None]] = []
-        self._maximum_pending_postprocess = 8
+        self._maximum_pending_postprocess = 50
         self._postprocess_closed = False
         self._load_sealed_prefix()
         self._recover_ready_shards()
