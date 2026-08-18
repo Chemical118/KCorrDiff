@@ -34,8 +34,10 @@ def test_production_stage2_config_is_strict_and_topology_bound() -> None:
     )
     assert len(config.sha256) == 64
     config.validate_topology(world_size=2)
-    with pytest.raises(ValueError, match="global effective batch"):
-        config.validate_topology(world_size=1)
+    # Research code: a differing world size only warns; any positive value runs.
+    config.validate_topology(world_size=1)
+    with pytest.raises(ValueError, match="world_size"):
+        config.validate_topology(world_size=0)
 
 
 def test_stage2_raw_config_is_deeply_immutable_detached_and_hash_bound() -> None:
@@ -77,7 +79,7 @@ def test_stage2_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
         load_stage2_config(path)
 
 
-def test_config_rejects_fallback_unknown_keys_and_weight_clipping(
+def test_config_accepts_tuning_changes_and_unknown_keys(
     tmp_path: Path,
 ) -> None:
     raw = yaml.safe_load(CONFIG.read_text())
@@ -85,20 +87,35 @@ def test_config_rejects_fallback_unknown_keys_and_weight_clipping(
     changed["runtime"]["target_widths"][0] = 32
     path = tmp_path / "fallback.yaml"
     path.write_text(yaml.safe_dump(changed))
-    with pytest.raises(ValueError, match="target widths"):
-        load_stage2_config(path)
+    loaded = load_stage2_config(path)
+    assert loaded.runtime.target_widths[0] == 32
 
     changed = deepcopy(raw)
     changed["loss"]["importance_weight_clipping"] = 10.0
     path.write_text(yaml.safe_dump(changed))
-    with pytest.raises(ValueError, match="clipping"):
-        load_stage2_config(path)
+    loaded = load_stage2_config(path)
+    assert loaded.loss.importance_weight_clipping == 10.0
 
+    changed["loss"].pop("importance_weight_clipping")
+    path.write_text(yaml.safe_dump(changed))
+    loaded = load_stage2_config(path)
+    assert loaded.loss.importance_weight_clipping is None
+
+    changed = deepcopy(raw)
+    changed["optimization"]["optimizer"] = "Adam"
+    changed["optimization"]["scheduler"] = "constant"
+    changed["optimization"]["epochs"] = 3
+    path.write_text(yaml.safe_dump(changed))
+    loaded = load_stage2_config(path)
+    assert loaded.optimization.optimizer == "Adam"
+    assert loaded.optimization.scheduler == "constant"
+    assert loaded.optimization.epochs == 3
+
+    # Unknown keys are tolerated; only missing consumed keys fail.
     changed = deepcopy(raw)
     changed["mystery"] = True
     path.write_text(yaml.safe_dump(changed))
-    with pytest.raises(ValueError, match="schema mismatch"):
-        load_stage2_config(path)
+    load_stage2_config(path)
 
 
 @pytest.mark.parametrize("invalid", [256.9, "256", True])
@@ -124,35 +141,6 @@ def test_stage2_numeric_contract_rejects_string_and_boolean_aliases(
         path.write_text(yaml.safe_dump(changed), encoding="utf-8")
         with pytest.raises(TypeError, match="JSON number"):
             load_stage2_config(path)
-
-
-@pytest.mark.parametrize(
-    "section", ["model", "loader_tuning", "tracking", "publication"]
-)
-def test_stage2_rejects_hidden_keys_in_every_execution_section(
-    tmp_path: Path, section: str
-) -> None:
-    raw = yaml.safe_load(CONFIG.read_text())
-    raw[section]["adversarial_extra"] = 123
-    path = tmp_path / f"extra-{section}.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="schema mismatch"):
-        load_stage2_config(path)
-
-
-def test_stage2_rejects_hidden_nested_model_and_loader_keys(tmp_path: Path) -> None:
-    raw = yaml.safe_load(CONFIG.read_text())
-    raw["model"]["advection"]["adversarial_extra"] = True
-    path = tmp_path / "nested-extra.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="model.advection schema mismatch"):
-        load_stage2_config(path)
-
-    raw = yaml.safe_load(CONFIG.read_text())
-    raw["loader_tuning"]["candidates"]["adversarial_extra"] = [1]
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="loader_tuning.candidates schema mismatch"):
-        load_stage2_config(path)
 
 
 def test_config_accepts_only_explicit_hashed_condition_augmentation(

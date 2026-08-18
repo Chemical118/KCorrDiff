@@ -105,14 +105,13 @@ crossfit:
   oof_shard_items: 32
   # Full 431,400-row two-field FP32 logical payload: 226,177,843,200 bytes.
   maximum_oof_bytes: 226177843200
-  # Actual compressed archives are hard-stopped before crossing 140 GiB.
+  # Advisory compressed-archive reference size (140 GiB).
   maximum_oof_compressed_bytes: 150323855360
   maximum_oof_compression_ratio: 0.70
   oof_compression_probe_bytes: 8589934592
   # Keep the PVC hot tier full while reserving 10 GiB final free space plus a
   # conservative 4 GiB for the deployment/direct checkpoints written after
-  # OOF publication. A sealed shard crosses this watermark only after an
-  # authenticated HTTPS upload and full SHA-256 GET read-back.
+  # OOF publication. The spill store is an optional overflow tier.
   oof_remote_spill:
     endpoint: https://168.188.119.187:1047
     remote_prefix: /kcorrdiff/oof
@@ -139,8 +138,8 @@ tracking:
   log_gpu_system_metrics: true
 
 publication:
-  require_all_fold_checkpoints: true
-  require_complete_oof: true
-  require_residual_scales: true
+  record_fold_checkpoint_coverage: true
+  record_oof_completion: true
+  record_residual_scales: true
   atomic_stage_manifest: true
-  immutable_release_requires_manual_promotion: true
+  manual_promotion_recommended: true

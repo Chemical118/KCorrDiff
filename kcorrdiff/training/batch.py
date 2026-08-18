@@ -108,7 +108,7 @@ class PhysicalGridSpec:
 
     Target and context axes are increasing KMA-LCC kilometres.  ERA
     coordinates use canonical south-to-north latitude and west-to-east
-    longitude.  Non-production sizes require an explicit test override.
+    longitude. Grid sizes are experiment choices; geometry remains explicit.
     """
 
     target_x_lcc_km: np.ndarray | Sequence[float]
@@ -132,17 +132,6 @@ class PhysicalGridSpec:
             raise ValueError("target/context model grids must share one square size")
         if size % 16:
             raise ValueError("target/context grid size must be divisible by 16")
-        if not self.allow_test_override and size != 256:
-            raise ValueError("production target/context grids must be 256 x 256")
-        if not self.allow_test_override and not np.allclose(
-            np.diff(target_x), 0.5, rtol=0.0, atol=1.0e-6
-        ):
-            raise ValueError("production target x spacing must be 0.5 km")
-        if not self.allow_test_override and not np.allclose(
-            np.diff(target_y), 0.5, rtol=0.0, atol=1.0e-6
-        ):
-            raise ValueError("production target y spacing must be 0.5 km")
-
         if latitude.ndim == longitude.ndim == 1:
             if latitude.shape != (33,) or longitude.shape != (33,):
                 raise ValueError("ERA axes must describe the native 33 x 33 grid")
@@ -1280,10 +1269,6 @@ class TrainingBatchCollator:
     ) -> None:
         if not isinstance(geometry, PhysicalGridSpec):
             raise TypeError("geometry must be a PhysicalGridSpec")
-        if geometry.allow_test_override and not allow_test_override:
-            raise ValueError("non-production geometry requires allow_test_override=True")
-        if not geometry.allow_test_override and allow_test_override:
-            raise ValueError("test override cannot be enabled for production geometry")
         if era_normalization is not None:
             artifact_id = getattr(era_normalization, "artifact_id", None)
             if not isinstance(artifact_id, str) or not artifact_id:

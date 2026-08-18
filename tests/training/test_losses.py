@@ -49,6 +49,33 @@ def test_hurdle_loss_matches_manual_weighting_and_warmup() -> None:
     assert values["wet_amount"].grad is not None
 
 
+def test_importance_weight_clipping_is_applied_consistently() -> None:
+    values = tensors()
+    config = RegressionLossConfig(
+        lambda_mean=0.0,
+        importance_weight_clipping=1.0,
+    )
+    result = hurdle_regression_loss(**values, global_step=0, config=config)
+    assert result.valid_weight.item() == 7.0
+
+    labels = SimpleNamespace(
+        target_validity=values["target_validity"],
+        target_wet=values["target_wet"],
+        omega=values["omega"],
+    )
+    denominators = accumulation_window_denominators(
+        [labels], device="cpu", maximum_importance_weight=1.0
+    )
+    assert denominators.valid_weight.item() == 7.0
+    distributed = distributed_hurdle_loss_contribution(
+        **values,
+        global_step=0,
+        denominators=denominators,
+        config=config,
+    )
+    torch.testing.assert_close(distributed.occurrence, result.occurrence)
+
+
 def test_empty_wet_microbatch_has_connected_zero_positive_loss() -> None:
     values = tensors()
     values["target_wet"].zero_()

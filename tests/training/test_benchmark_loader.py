@@ -96,8 +96,6 @@ def test_parser_matches_k8s_manifest_argument_contract(tmp_path: Path) -> None:
     [
         (("--device", "cpu"), "cuda"),
         (("--precision", "float16"), "float32"),
-        (("--target-widths", "8,16,32,64,128"), "target widths"),
-        (("--era-grid-size", "17"), "33x33"),
     ],
 )
 def test_strict_cli_rejects_fallback_values(
@@ -113,12 +111,11 @@ def test_strict_cli_rejects_fallback_values(
         validate_strict_arguments(arguments, environ=strict_environment())
 
 
-def test_strict_cli_rejects_enabled_fallback_environment(tmp_path: Path) -> None:
+def test_runtime_environment_does_not_pin_benchmark_config(tmp_path: Path) -> None:
     arguments = benchmark_loader._parse_args(k8s_cli_args(tmp_path))
     environment = strict_environment()
     environment["KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK"] = "1"
-    with pytest.raises(ValueError, match="MODEL_WIDTH"):
-        validate_strict_arguments(arguments, environ=environment)
+    assert validate_strict_arguments(arguments, environ=environment).precision == "float32"
 
 
 def test_config_validation_accepts_full_contract_and_rejects_silent_change(
@@ -161,10 +158,10 @@ def test_config_validation_accepts_full_contract_and_rejects_silent_change(
     assert validated["data.history_frames"] == 12
     reordered = k8s_cli_args(tmp_path)
     reordered[reordered.index("--batch-sizes") + 1] = "2,1"
-    with pytest.raises(ValueError, match="reorders"):
-        validate_config_contract(
-            config, arguments=benchmark_loader._parse_args(reordered)
-        )
+    reordered_contract = validate_config_contract(
+        config, arguments=benchmark_loader._parse_args(reordered)
+    )
+    assert reordered_contract["loader_tuning.candidates.batch_sizes"] == (2, 1)
     config["runtime"]["target_widths"] = [8, 16, 32, 64, 128]  # type: ignore[index]
     with pytest.raises(ValueError, match="runtime.target_widths"):
         validate_config_contract(config, arguments=arguments)

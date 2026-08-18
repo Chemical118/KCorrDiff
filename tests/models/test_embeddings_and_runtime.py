@@ -74,27 +74,16 @@ def test_condition_embedding_revalidates_inputs_after_tensor_mutation() -> None:
         module(inputs)
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("precision", "bfloat16", "precision"),
-        ("target_widths", (48, 96, 192, 288, 384), "target-width"),
-        ("context_widths", (32, 48, 96, 192, 288), "context-width"),
-        ("era_latent_channels", 96, "latent-width"),
-        ("era_grid_size", 17, "spatial"),
-        ("tf32_enabled", True, "TF32"),
-        ("allow_cpu_fallback", True, "fallback"),
-        ("allow_model_width_fallback", True, "fallback"),
-        ("allow_precision_fallback", True, "fallback"),
-        ("allow_era_grid_fallback", True, "fallback"),
-    ],
-)
-def test_runtime_contract_rejects_every_silent_fallback(
-    field: str, value: object, message: str
-) -> None:
-    contract = replace(FullWidthRuntimeContract(), **{field: value})
-    with pytest.raises(ValueError, match=message):
-        contract.validate()
+def test_runtime_contract_accepts_experiment_knobs() -> None:
+    contract = FullWidthRuntimeContract(
+        target_widths=(48, 96, 192, 288, 384),
+        context_widths=(32, 48, 96, 192, 288),
+        era_latent_channels=96,
+        era_grid_size=17,
+        allow_cpu_fallback=True,
+        allow_model_width_fallback=True,
+    )
+    contract.validate()
 
 
 def test_runtime_contract_rejects_cpu_when_cuda_is_required() -> None:
@@ -102,13 +91,13 @@ def test_runtime_contract_rejects_cpu_when_cuda_is_required() -> None:
         FullWidthRuntimeContract().validate(device="cpu", require_cuda=True)
 
 
-def test_production_config_fails_closed_but_test_override_is_explicit() -> None:
+def test_model_config_accepts_positive_width_and_spatial_tuning() -> None:
     assert ConditionBankConfig().target_widths == TARGET_WIDTHS
     assert ConditionBankConfig().context_widths == CONTEXT_WIDTHS
-    with pytest.raises(ValueError, match="fallback"):
-        ConditionBankConfig(target_widths=(4, 8, 12, 16, 20))
-    with pytest.raises(ValueError, match="spatial fallback"):
-        ConditionBankConfig(input_size=16)
+    assert ConditionBankConfig(target_widths=(4, 8, 12, 16, 20)).target_widths == (
+        4, 8, 12, 16, 20
+    )
+    assert ConditionBankConfig(input_size=16).input_size == 16
     with pytest.raises(ValueError, match="positive"):
         ConditionBankConfig(
             target_widths=(0, 8, 12, 16, 20),

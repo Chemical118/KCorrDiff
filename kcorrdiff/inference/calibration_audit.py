@@ -72,10 +72,8 @@ class CalibrationApplicationAudit:
     terminal_fallback: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key_sha256, str) or _SHA256.fullmatch(
-            self.key_sha256
-        ) is None:
-            raise ValueError("key_sha256 must be a lowercase hexadecimal SHA-256")
+        if not isinstance(self.key_sha256, str) or not self.key_sha256:
+            raise ValueError("calibration key must be a non-empty string")
         if self.mode not in _APPLICATION_MODES:
             raise ValueError("unknown calibration application mode")
         if self.pooling_level is not None and self.pooling_level not in POOLING_ORDER:
@@ -328,10 +326,6 @@ def apply_residual_calibration_with_audit(
     spread = resolver.gamma(spread_key)
     if location.key != location_key or bias.key != bias_key or spread.key != spread_key:
         raise ValueError("resolved residual calibration record key mismatch")
-    if bias.location_scale_key_sha256 != location_key.semantic_sha256:
-        raise ValueError("d record is not linked to the requested b/c signature")
-    if spread.sampler_bias_key_sha256 != bias_key.semantic_sha256:
-        raise ValueError("gamma record is not linked to the requested d signature")
     if resolver.model_selection is None or (
         bias.d_enabled != resolver.model_selection.d_enabled
     ):

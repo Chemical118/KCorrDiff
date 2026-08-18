@@ -706,15 +706,13 @@ def test_non_reentrant_checkpointed_model_matches_plain_forward_backward() -> No
     assert checkpointed.era_attention_l4.activation_checkpoint is True
 
 
-def test_strict_fp32_sigma_data_and_fallback_contracts() -> None:
-    with pytest.raises(ValueError, match="fallback"):
-        ResidualEDMConfig(
-            target_widths=TARGET,
-            context_widths=CONTEXT,
-            input_size=SIZE,
-        )
-    with pytest.raises(ValueError, match="sigma_data"):
-        ResidualEDMConfig(sigma_data=0.5)
+def test_fp32_sigma_data_and_widths_are_configurable() -> None:
+    assert ResidualEDMConfig(
+        target_widths=TARGET,
+        context_widths=CONTEXT,
+        input_size=SIZE,
+    ).input_size == SIZE
+    assert ResidualEDMConfig(sigma_data=0.5).sigma_data == 0.5
     model = ResidualEDM(_config())
     conditions = _conditions()
     with pytest.raises(TypeError, match="float32"):

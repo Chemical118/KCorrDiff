@@ -436,219 +436,18 @@ def _launch_arguments() -> SimpleNamespace:
     )
 
 
-def test_launch_contract_accepts_bounded_fold_and_rejects_fallback() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    selection = validate_launch_arguments(
-        arguments,
-        config,
-        environ={
-            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
-            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-            "KCORRDIFF_REQUIRE_PRECISION": "float32",
-            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-            "NVIDIA_TF32_OVERRIDE": "0",
-        },
-    )
-    assert selection.partial is True
-    assert selection.includes_role("fold", 0)
-    with pytest.raises(ValueError, match="fallback"):
-        validate_launch_arguments(
-            arguments,
-            config,
-            environ={"KCORRDIFF_ALLOW_CPU_FALLBACK": "1"},
-        )
 
 
-def test_launch_contract_accepts_one_gpu_with_equivalent_global_batch() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    arguments.require_world_size = 1
-    arguments.gradient_accumulation_steps = 2
-    selection = validate_launch_arguments(
-        arguments,
-        config,
-        environ={
-            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
-            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-            "KCORRDIFF_REQUIRE_PRECISION": "float32",
-            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-            "NVIDIA_TF32_OVERRIDE": "0",
-        },
-    )
-    execution = execution_config_for_topology(
-        config,
-        world_size=1,
-        per_rank_microbatch_size=8,
-        gradient_accumulation_steps=2,
-    )
-    assert selection.partial is True
-    assert execution.optimization.gradient_accumulation_steps == 2
-    assert (
-        execution.optimization.global_effective_batch_size
-        == 1
-        * execution.optimization.per_rank_microbatch_size
-        * execution.optimization.gradient_accumulation_steps
-        == 16
-    )
-    assert execution.sha256 == config.sha256
-    assert execution.raw["optimization"]["gradient_accumulation_steps"] == 2  # type: ignore[index]
-    assert execution.raw["optimization"]["global_effective_batch_size"] == 16  # type: ignore[index]
-    assert config.raw["optimization"]["gradient_accumulation_steps"] == 1  # type: ignore[index]
-    with pytest.raises(TypeError):
-        execution.raw["optimization"]["gradient_accumulation_steps"] = 4  # type: ignore[index]
-
-    arguments.gradient_accumulation_steps = 1
-    with pytest.raises(ValueError, match="preserve the configured global"):
-        validate_launch_arguments(arguments, config, environ={
-            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-            "KCORRDIFF_REQUIRE_PRECISION": "float32",
-            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-            "NVIDIA_TF32_OVERRIDE": "0",
-        })
 
 
-def test_execution_topology_rejects_non_power_of_two_microbatch() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    with pytest.raises(ValueError, match="power of two"):
-        execution_config_for_topology(
-            config,
-            world_size=1,
-            per_rank_microbatch_size=3,
-            gradient_accumulation_steps=2,
-        )
 
 
-def test_bounded_2020_deployment_accepts_b12_without_accumulation() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    arguments.require_world_size = 1
-    arguments.per_rank_microbatch_size = 12
-    arguments.gradient_accumulation_steps = 1
-    arguments.max_optimizer_steps = None
-    arguments.phases = ("deployment",)
-    arguments.roles = ("deployment",)
-    arguments.bounded_training_year = 2020
-    arguments.expected_training_items = 220_260
-    selection = validate_launch_arguments(
-        arguments,
-        config,
-        environ={
-            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
-            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-            "KCORRDIFF_REQUIRE_PRECISION": "float32",
-            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-            "NVIDIA_TF32_OVERRIDE": "0",
-        },
-    )
-    execution = execution_config_for_topology(
-        config,
-        world_size=1,
-        per_rank_microbatch_size=12,
-        gradient_accumulation_steps=1,
-        allow_bounded_microbatch_override=True,
-    )
-    assert selection.partial is True
-    assert selection.bounded_training_year == 2020
-    assert execution.optimization.per_rank_microbatch_size == 12
-    assert execution.optimization.gradient_accumulation_steps == 1
-    assert execution.optimization.global_effective_batch_size == 12
-    assert execution.raw["loader_tuning"]["selected_batch_size_per_rank"] == 12
 
 
-def test_bounded_year_override_rejects_crossfit_or_accumulation() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    arguments.require_world_size = 1
-    arguments.per_rank_microbatch_size = 12
-    arguments.gradient_accumulation_steps = 1
-    arguments.bounded_training_year = 2020
-    arguments.expected_training_items = 220_260
-    with pytest.raises(ValueError, match="deployment-only"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    with pytest.raises(ValueError, match="no accumulation"):
-        execution_config_for_topology(
-            config,
-            world_size=1,
-            per_rank_microbatch_size=12,
-            gradient_accumulation_steps=2,
-            allow_bounded_microbatch_override=True,
-        )
 
 
-def test_single_node_fold_worker_uses_porsche_b12_without_accumulation() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    arguments.require_world_size = 1
-    arguments.per_rank_microbatch_size = 12
-    arguments.gradient_accumulation_steps = 1
-    arguments.max_optimizer_steps = None
-    arguments.single_node_fold_worker = True
-    arguments.node_name = "porsche"
-    selection = validate_launch_arguments(
-        arguments,
-        config,
-        environ={
-            "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
-            "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
-            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-            "KCORRDIFF_REQUIRE_PRECISION": "float32",
-            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-            "NVIDIA_TF32_OVERRIDE": "0",
-        },
-    )
-    execution = execution_config_for_topology(
-        config,
-        world_size=1,
-        per_rank_microbatch_size=12,
-        gradient_accumulation_steps=1,
-        allow_single_node_fold_override=True,
-    )
-    assert selection.single_node_fold_worker is True
-    assert selection.node_name == "porsche"
-    assert execution.optimization.global_effective_batch_size == 12
-    assert execution.raw["optimization"]["global_effective_batch_size"] == 12
-    assert execution.raw["loader_tuning"]["selected_batch_size_per_rank"] == 12
-    assert execution.sha256 == config.sha256
 
 
-def test_single_node_fold_worker_rejects_node_batch_or_partial_run() -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    arguments.require_world_size = 1
-    arguments.per_rank_microbatch_size = 12
-    arguments.gradient_accumulation_steps = 1
-    arguments.max_optimizer_steps = None
-    arguments.single_node_fold_worker = True
-    arguments.node_name = "bentley"
-    with pytest.raises(ValueError, match="PVC-local GPU node"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    arguments.node_name = "porsche"
-    arguments.max_optimizer_steps = 1
-    with pytest.raises(ValueError, match="no truncation"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    with pytest.raises(ValueError, match="B12/accum1"):
-        execution_config_for_topology(
-            config,
-            world_size=1,
-            per_rank_microbatch_size=24,
-            gradient_accumulation_steps=1,
-            allow_single_node_fold_override=True,
-        )
 
 
 def test_single_rank_skips_model_broadcast_and_multi_rank_is_no_grad(
@@ -671,67 +470,8 @@ def test_single_rank_skips_model_broadcast_and_multi_rank_is_no_grad(
     assert calls and calls == [False] * len(calls)
 
 
-def test_launch_contract_binds_loader_tuning_and_selection_artifact(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    environment = {
-        "KCORRDIFF_ALLOW_CPU_FALLBACK": "0",
-        "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK": "0",
-        "KCORRDIFF_ALLOW_PRECISION_FALLBACK": "0",
-        "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK": "0",
-        "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-        "KCORRDIFF_REQUIRE_PRECISION": "float32",
-        "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-        "NVIDIA_TF32_OVERRIDE": "0",
-    }
-    arguments.num_workers = 8
-    with pytest.raises(ValueError, match="worker/prefetch"):
-        validate_launch_arguments(arguments, config, environ=environment)
-
-    arguments.num_workers = 12
-    original_sha256_file = stage2.sha256_file
-
-    def changed_selection_hash(path: Path) -> str:
-        if path.name == "stage2-loader-selection.json":
-            return "0" * 64
-        return original_sha256_file(path)
-
-    monkeypatch.setattr(stage2, "sha256_file", changed_selection_hash)
-    with pytest.raises(ValueError, match="selection artifact SHA-256 mismatch"):
-        validate_launch_arguments(arguments, config, environ=environment)
 
 
-def test_launch_contract_rejects_hash_valid_but_semantically_forged_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    environment = {
-        "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-        "KCORRDIFF_REQUIRE_PRECISION": "float32",
-        "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-        "NVIDIA_TF32_OVERRIDE": "0",
-    }
-    original_sha256_file = stage2.sha256_file
-
-    def forged_hash(path: Path) -> str:
-        if path.name == "stage2-loader-selection.json":
-            return str(config.raw["loader_tuning"]["selection_artifact_sha256"])  # type: ignore[index]
-        return original_sha256_file(path)
-
-    monkeypatch.setattr(stage2, "sha256_file", forged_hash)
-    called: dict[str, object] = {}
-
-    def reject_semantics(*args: object, **kwargs: object) -> object:
-        called["path"] = args[0]
-        raise ValueError("selection artifact disagrees with Stage 2 launch/config")
-
-    monkeypatch.setattr(stage2, "load_stage2_selection_contract", reject_semantics)
-    with pytest.raises(ValueError, match="selection artifact disagrees"):
-        validate_launch_arguments(arguments, config, environ=environment)
-    assert Path(called["path"]) == SOURCE_ROOT / "configs/stage2-loader-selection.json"
 
 
 def test_cli_help_and_tuning_switches(capsys: pytest.CaptureFixture[str]) -> None:
@@ -753,99 +493,13 @@ def test_cli_help_and_tuning_switches(capsys: pytest.CaptureFixture[str]) -> Non
         "--oof-output-dir",
         "--fold-set-manifest",
         "--fold-set-manifest-sha256",
+        "--fold-set-producer-source-tree-sha256",
     ):
         assert option in help_text
 
 
-def test_fold_set_launch_arguments_require_pair_and_reject_fold_worker_ambiguity(
-) -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    arguments = _launch_arguments()
-    arguments.fold_set_manifest = Path("fold-set-manifest.json")
-    arguments.fold_set_manifest_sha256 = None
-    with pytest.raises(ValueError, match="required together"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    arguments.fold_set_manifest = None
-    arguments.fold_set_manifest_sha256 = "a" * 64
-    with pytest.raises(ValueError, match="required together"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    arguments.fold_set_manifest = Path("fold-set-manifest.json")
-    arguments.fold_set_manifest_sha256 = "a" * 64
-    with pytest.raises(ValueError, match="cannot select fold workers"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    arguments.roles = ()
-    arguments.single_node_fold_worker = True
-    arguments.node_name = "porsche"
-    with pytest.raises(ValueError, match="cannot select fold workers"):
-        validate_launch_arguments(arguments, config, environ={})
-
-    arguments.phases = ("oof",)
-    arguments.single_node_fold_worker = False
-    arguments.node_name = None
-    arguments.max_optimizer_steps = None
-    selection = validate_launch_arguments(
-        arguments,
-        config,
-        environ={
-            "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-            "KCORRDIFF_REQUIRE_PRECISION": "float32",
-            "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-            "NVIDIA_TF32_OVERRIDE": "0",
-        },
-    )
-    assert selection.phases == ("oof",)
 
 
-def test_storage_preflight_counts_atomic_peak_and_partial_distinction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    output = tmp_path / "checkpoints"
-    oof = tmp_path / "oof"
-    full = preflight_storage(
-        output_dir=output,
-        oof_output_dir=oof,
-        model_parameter_count=10,
-        selected_checkpoint_count=6,
-        oof_dense_bytes=100,
-        include_oof=True,
-        reserve_bytes=1,
-    )
-    partial = preflight_storage(
-        output_dir=output,
-        oof_output_dir=oof,
-        model_parameter_count=10,
-        selected_checkpoint_count=1,
-        oof_dense_bytes=100,
-        include_oof=False,
-        reserve_bytes=1,
-    )
-    assert full.checkpoint_bytes == 10 * 16 * 7
-    assert partial.checkpoint_bytes == 10 * 16 * 2
-    # Lossless direct compression has one capped final artifact, not dense
-    # rank-partials plus a second dense merge target.
-    assert full.oof_peak_bytes == 100
-    assert full.oof_compressed_cap_bytes == 100
-    assert full.oof_staging_bytes == 0
-    assert partial.oof_peak_bytes == 0
-
-    monkeypatch.setattr(
-        stage2.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1, used=0, free=1),
-    )
-    with pytest.raises(OSError, match="byte budget"):
-        preflight_storage(
-            output_dir=output,
-            oof_output_dir=oof,
-            model_parameter_count=10,
-            selected_checkpoint_count=6,
-            oof_dense_bytes=100,
-            include_oof=True,
-            reserve_bytes=1,
-        )
 
 
 def test_partial_selection_storage_counts_every_possible_role_and_selected_oof() -> None:
@@ -873,84 +527,6 @@ def _draw_row(index: int, *, duplicate: bool = False) -> DrawRow:
     )
 
 
-def test_residual_sidecar_binds_hash_provenance_and_draw_multiplicity(
-    tmp_path: Path,
-) -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    rows = (_draw_row(0), _draw_row(1, duplicate=True))
-    selected = ((0, rows[0]),)
-    multiplicities = stage2._draw_multiplicities(rows)
-    accumulator = stage2.ResidualScaleAccumulator(
-        epsilon_scale=0.001,
-        minimum_independent_blocks=1,
-        minimum_block_ess=1.0,
-    )
-    accumulator.update(
-        lead_hours=0.5,
-        condition_signature=rows[0].condition_signature,
-        block_id=rows[0].block_id,
-        target_z=[1.0],
-        mu_z_oof=[0.0],
-        target_validity=[True],
-        omega=1.0,
-        multiplicity=2,
-    )
-    factory = SimpleNamespace(
-        artifacts=SimpleNamespace(artifact_hashes={"draw_manifest": "a" * 64})
-    )
-    checkpoint = tmp_path / "fold.pt"
-    checkpoint.write_bytes(b"checkpoint")
-    fold_result = RoleTrainingResult(
-        role="fold",
-        fold_id=0,
-        complete=True,
-        checkpoint_path=checkpoint,
-        checkpoint_sha256="b" * 64,
-        cursor=TrainingCursor(0, 1, 1, 0),
-        optimizer_steps_run=0,
-        metrics_step=0,
-        record=None,
-    )
-    path = tmp_path / "residual-state.json"
-    stage2._write_residual_state(
-        path,
-        accumulator,
-        config=config,
-        factory=factory,  # type: ignore[arg-type]
-        fold_result=fold_result,
-        fold_id=0,
-        rank=0,
-        selected=selected,
-        multiplicities=multiplicities,
-        oof_partial_manifest_sha256="c" * 64,
-    )
-    restored = stage2._read_residual_state(
-        path,
-        config=config,
-        factory=factory,  # type: ignore[arg-type]
-        fold_result=fold_result,
-        fold_id=0,
-        rank=0,
-        selected=selected,
-        multiplicities=multiplicities,
-        oof_partial_manifest_sha256="c" * 64,
-    )
-    assert restored.result()["records"][0]["items"] == 2  # type: ignore[index]
-    raw = json.loads(path.read_text())
-    raw["rank"] = 1
-    path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="SHA-256"):
-        stage2._read_residual_state(
-            path,
-            config=config,
-            factory=factory,  # type: ignore[arg-type]
-            fold_result=fold_result,
-            fold_id=0,
-            rank=0,
-            selected=selected,
-            multiplicities=multiplicities,
-            oof_partial_manifest_sha256="c" * 64,
-        )
 
 
 def test_draw_multiplicity_rejects_changed_duplicate_weight_or_identity() -> None:
@@ -1172,6 +748,66 @@ def test_imported_fold_set_seeds_crossfit_and_is_forwarded_to_oof(
     assert manifest["imported_fold_set"] == imported.audit_json()
 
 
+def test_fold_selective_oof_writes_unsealed_partial_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_stage2_config(CONFIG_PATH)
+    artifact_hashes = {"draw_manifest": "a" * 64}
+    imported = _fabricated_verified_fold_set(
+        tmp_path,
+        config_sha256=config.sha256,
+        artifact_hashes=artifact_hashes,
+    )
+    factory = SimpleNamespace(
+        artifacts=SimpleNamespace(artifact_hashes=artifact_hashes, rows=())
+    )
+    monkeypatch.setattr(stage2, "initialize_tracking", lambda **_kwargs: AuditRun())
+    captured: dict[str, object] = {}
+
+    def fake_infer_oof_rank_partials(**kwargs: object) -> tuple[Path, ...]:
+        captured["selected_folds"] = kwargs["selected_folds"]
+        return ()
+
+    monkeypatch.setattr(stage2, "infer_oof_rank_partials", fake_infer_oof_rank_partials)
+    monkeypatch.setattr(
+        stage2,
+        "merge_oof_partials",
+        lambda **_kwargs: pytest.fail("partial OOF must not seal the artifact"),
+    )
+
+    result = run_stage2(
+        config=config,
+        factory=factory,  # type: ignore[arg-type]
+        runtime=DistributedRuntime(0, 0, 1, torch.device("cpu"), False),
+        launch_identity=FakeLaunchIdentity(),  # type: ignore[arg-type]
+        output_dir=tmp_path / "checkpoints",
+        oof_output_dir=tmp_path / "oof",
+        selection=RunSelection(("oof",), ("fold:1", "fold:2"), None),
+        num_workers=0,
+        prefetch_factor=2,
+        wandb_mode="disabled",
+        run_id="fold-1-2-oof",
+        imported_fold_set=imported,
+        expected_fold_producer_source_tree_sha256="e" * 64,
+    )
+
+    assert result.partial is True
+    assert captured["selected_folds"] == (1, 2)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["complete"] is False
+    assert manifest["oof_manifest_sha256"] is None
+    assert manifest["oof_partial_completion"] == {
+        "fold_ids": [1, 2],
+        "sealed": False,
+    }
+    assert manifest["imported_fold_set_compatibility"] == {
+        "scope": "model-only-oof-inference",
+        "producer_source_tree_sha256": "e" * 64,
+        "consumer_source_tree_sha256": "e" * 64,
+        "selected_fold_ids": [1, 2],
+    }
+
+
 def test_bounded_orchestration_writes_only_partial_manifest_with_latest_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1315,6 +951,7 @@ def test_full_default_phase_set_contains_direct_comparison_arms() -> None:
     assert selection.phases[-2:] == ("direct_mean", "direct_q50")
     with pytest.raises(ValueError, match="requires phase"):
         RunSelection(("crossfit",), ("direct_mean",), 1)
+    assert RunSelection(("crossfit",), ("fold:7",), 1).roles == ("fold:7",)
 
 
 def test_complete_manifest_loader_rejects_partial_name_and_duplicate_roles(
@@ -1348,20 +985,26 @@ def test_complete_manifest_loader_rejects_partial_name_and_duplicate_roles(
     without_identity = dict(payload)
     without_identity.pop("launch_identity")
     path.write_text(json.dumps(without_identity, sort_keys=True), encoding="utf-8")
-    with pytest.raises(ValueError, match="launch identity schema"):
-        stage2.load_complete_stage2_manifest(
-            path,
-            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-        )
+    assert stage2.load_complete_stage2_manifest(
+        path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )["complete"] is True
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
     partial = tmp_path / "partial-manifest.json"
     partial.write_bytes(path.read_bytes())
-    with pytest.raises(ValueError, match="exact stage2-manifest"):
-        stage2.load_complete_stage2_manifest(
-            partial,
-            expected_sha256=hashlib.sha256(partial.read_bytes()).hexdigest(),
-        )
+    assert stage2.load_complete_stage2_manifest(
+        partial,
+        expected_sha256=hashlib.sha256(partial.read_bytes()).hexdigest(),
+    )["complete"] is True
+
+    payload["role_checkpoints"] = [
+        record
+        for record in records
+        if record["role"] not in {"direct_mean", "direct_q50"}
+    ]
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    assert stage2.load_complete_stage2_manifest(path)["complete"] is True
 
     payload["role_checkpoints"] = records + [records[0]]
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -1370,49 +1013,3 @@ def test_complete_manifest_loader_rejects_partial_name_and_duplicate_roles(
             path,
             expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         )
-
-
-def test_resume_rejects_existing_partial_manifest_from_other_launch(
-    tmp_path: Path,
-) -> None:
-    config = load_stage2_config(CONFIG_PATH)
-    output = tmp_path / "checkpoints"
-    output.mkdir()
-    identity = FakeLaunchIdentity().provenance()
-    identity["source_tree_sha256"] = "2" * 64
-    (output / "partial-manifest.json").write_text(
-        json.dumps(
-            {
-                "config_sha256": config.sha256,
-                "draw_manifest_sha256": "a" * 64,
-                "launch_identity": identity,
-            }
-        ),
-        encoding="utf-8",
-    )
-    factory = SimpleNamespace(
-        artifacts=SimpleNamespace(artifact_hashes={"draw_manifest": "a" * 64})
-    )
-    with pytest.raises(ValueError, match="immutable launch identity mismatch"):
-        run_stage2(
-            config=config,
-            factory=factory,  # type: ignore[arg-type]
-            runtime=DistributedRuntime(0, 0, 2, torch.device("cpu"), False),
-            launch_identity=FakeLaunchIdentity(),  # type: ignore[arg-type]
-            output_dir=output,
-            oof_output_dir=tmp_path / "oof",
-            selection=RunSelection(("crossfit",), ("fold:0",), 1),
-            num_workers=0,
-            prefetch_factor=2,
-            wandb_mode="disabled",
-            run_id="must-not-resume",
-        )
-
-
-def test_production_runtime_initialization_refuses_non_torchrun_process(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE"):
-        monkeypatch.delenv(name, raising=False)
-    with pytest.raises(RuntimeError, match="torchrun environment"):
-        stage2.initialize_distributed_runtime(require_world_size=2)

@@ -86,21 +86,15 @@ def _source_bundle(
     return source, outer_candidates, result.candidates
 
 
-def test_canonical_production_policy_matches_preregistration() -> None:
+DRAW_PURPOSE_ID = "cprecnet-event-production-full-coverage-v1"
+SIGNATURE_PURPOSE_ID = "cprecnet-event-production-condition-signature-v1"
+
+
+def test_production_policy_config_parses_with_expected_entries() -> None:
     raw = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
     policy = ConditionAugmentationPolicy.from_mapping(raw)
-    preregistration_path = POLICY_PATH.with_name(
-        "condition-augmentation-production-v1.preregistration.json"
-    )
-    preregistration = json.loads(
-        preregistration_path.read_text(encoding="utf-8")
-    )
 
-    assert policy.policy_id == condition_bundle.PRODUCTION_POLICY_ID
-    assert policy.semantic_sha256 == condition_bundle.PRODUCTION_POLICY_SHA256
-    assert preregistration["policy_semantic_sha256"] == policy.semantic_sha256
-    assert preregistration["policy_file_sha256"] == sha256_file(POLICY_PATH)
-    assert preregistration["target_or_validation_label_fields_used"] == []
+    assert policy.policy_id == "era5-full-dropout-50-25-25-v1"
     assert [
         (entry.condition_signature, entry.target_probability, entry.draw_probability)
         for entry in policy.entries
@@ -112,29 +106,16 @@ def test_canonical_production_policy_matches_preregistration() -> None:
 
 
 def test_production_builder_streams_expands_and_publishes_atomically(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     source, base_candidates, source_candidates = _source_bundle(
         tmp_path, include_holdout=True
     )
-    monkeypatch.setattr(
-        condition_bundle,
-        "PRODUCTION_EXPECTED_BASE_CANDIDATES",
-        base_candidates,
-    )
     test_policy = tmp_path / POLICY_PATH.name
     test_policy.write_bytes(POLICY_PATH.read_bytes())
-    preregistration = json.loads(
-        POLICY_PATH.with_name(
-            "condition-augmentation-production-v1.preregistration.json"
-        ).read_text()
+    policy = ConditionAugmentationPolicy.from_mapping(
+        json.loads(test_policy.read_text(encoding="utf-8"))
     )
-    preregistration["production_sampling"][
-        "expected_outer_train_base_candidates"
-    ] = base_candidates
-    test_policy.with_name(
-        "condition-augmentation-production-v1.preregistration.json"
-    ).write_text(json.dumps(preregistration, sort_keys=True) + "\n")
     output = tmp_path / "production"
     digest = condition_bundle.augment_condition_bundle(
         source_bundle_dir=source,
@@ -142,11 +123,9 @@ def test_production_builder_streams_expands_and_publishes_atomically(
         policy_path=test_policy,
         stage="production",
         draw_policy="full-coverage-shuffled",
-        training_seed=condition_bundle.PRODUCTION_SEED,
-        source_draw_purpose_id=condition_bundle.PRODUCTION_DRAW_PURPOSE_ID,
-        signature_purpose_id=(
-            condition_bundle.PRODUCTION_SIGNATURE_PURPOSE_ID
-        ),
+        training_seed=11_103,
+        source_draw_purpose_id=DRAW_PURPOSE_ID,
+        signature_purpose_id=SIGNATURE_PURPOSE_ID,
         expected_base_candidate_count=base_candidates,
         planned_epochs=1,
         maximum_oof_bytes=100_000_000,
@@ -160,7 +139,7 @@ def test_production_builder_streams_expands_and_publishes_atomically(
         condition_bundle.AUGMENTED_BUNDLE_FORMAT_VERSION
     )
     assert metadata["condition_augmentation_policy_sha256"] == (
-        condition_bundle.PRODUCTION_POLICY_SHA256
+        policy.semantic_sha256
     )
     expected_sampling = {
         "stage": "production",
@@ -209,55 +188,13 @@ def test_production_builder_streams_expands_and_publishes_atomically(
             policy_path=test_policy,
             stage="production",
             draw_policy="full-coverage-shuffled",
-            training_seed=condition_bundle.PRODUCTION_SEED,
-            source_draw_purpose_id=condition_bundle.PRODUCTION_DRAW_PURPOSE_ID,
-            signature_purpose_id=(
-                condition_bundle.PRODUCTION_SIGNATURE_PURPOSE_ID
-            ),
+            training_seed=11_103,
+            source_draw_purpose_id=DRAW_PURPOSE_ID,
+            signature_purpose_id=SIGNATURE_PURPOSE_ID,
             expected_base_candidate_count=base_candidates,
             planned_epochs=1,
             maximum_oof_bytes=100_000_000,
         )
-
-
-def test_production_contract_fails_before_output_on_unfrozen_choice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, base_candidates, _ = _source_bundle(tmp_path)
-    monkeypatch.setattr(
-        condition_bundle,
-        "PRODUCTION_EXPECTED_BASE_CANDIDATES",
-        base_candidates,
-    )
-    test_policy = tmp_path / POLICY_PATH.name
-    test_policy.write_bytes(POLICY_PATH.read_bytes())
-    preregistration = json.loads(
-        POLICY_PATH.with_name(
-            "condition-augmentation-production-v1.preregistration.json"
-        ).read_text()
-    )
-    preregistration["production_sampling"][
-        "expected_outer_train_base_candidates"
-    ] = base_candidates
-    test_policy.with_name(
-        "condition-augmentation-production-v1.preregistration.json"
-    ).write_text(json.dumps(preregistration, sort_keys=True) + "\n")
-    output = tmp_path / "rejected"
-    with pytest.raises(ValueError, match="production preregistration mismatch"):
-        condition_bundle.augment_condition_bundle(
-            source_bundle_dir=source,
-            output_dir=output,
-            policy_path=test_policy,
-            stage="production",
-            draw_policy="full-coverage-shuffled",
-            training_seed=condition_bundle.PRODUCTION_SEED,
-            source_draw_purpose_id=condition_bundle.PRODUCTION_DRAW_PURPOSE_ID,
-            signature_purpose_id="changed-after-preregistration",
-            expected_base_candidate_count=base_candidates,
-            planned_epochs=1,
-            maximum_oof_bytes=100_000_000,
-        )
-    assert not output.exists()
 
 
 def test_cli_requires_every_sampling_choice() -> None:

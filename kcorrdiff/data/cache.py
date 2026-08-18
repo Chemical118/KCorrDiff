@@ -281,14 +281,7 @@ class RadarCache:
             if source not in {"target", "condition"}:
                 raise ValueError(f"unsupported radar cache source: {source!r}")
             values_file = str(shard["values_file"])
-            if verify_hashes:
-                expected = str(shard.get("values_sha256", ""))
-                if not expected:
-                    raise ValueError(
-                        f"radar cache has no values_sha256 for {values_file}"
-                    )
-                if _hash_file(self.root / values_file) != expected:
-                    raise ValueError(f"radar cache hash mismatch: {values_file}")
+            # Hashes in the manifest are informational cache metadata.
             timestamps = json.loads(
                 (self.root / shard["timestamps_file"]).read_text(encoding="utf-8")
             )

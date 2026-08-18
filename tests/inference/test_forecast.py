@@ -439,16 +439,6 @@ def test_only_identity_can_supply_models_keys_and_scalar_scale(
         )
 
 
-class _ExecutableVerifiedForecastIdentity(VerifiedForecastIdentity):
-    """Use tiny models to execute a preconstructed verified fallback cell."""
-
-    def validate_model_bindings(self):
-        return (
-            self.regression_binding.validate(),
-            self.residual_binding.validate(),
-        )
-
-
 def _unsupported_verified_identity(
     development_case: SimpleNamespace,
 ) -> VerifiedForecastIdentity:
@@ -491,7 +481,7 @@ def _unsupported_verified_identity(
             for threshold in OFFICIAL_Q_THRESHOLDS_MM
         ),
     }
-    identity = object.__new__(_ExecutableVerifiedForecastIdentity)
+    identity = object.__new__(VerifiedForecastIdentity)
     for name, value in values.items():
         object.__setattr__(identity, name, value)
     return identity

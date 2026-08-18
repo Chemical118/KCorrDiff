@@ -71,49 +71,8 @@ def test_atomic_checkpoint_roundtrip_restores_training_state_and_rng(
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_checkpoint_rejects_topology_or_precision_mismatch(tmp_path: Path) -> None:
-    model = torch.nn.Linear(2, 1)
-    optimizer = torch.optim.AdamW(model.parameters())
-    path = tmp_path / "checkpoint.pt"
-    save_training_checkpoint(
-        path,
-        model=model,
-        optimizer=optimizer,
-        scheduler=None,
-        cursor=TrainingCursor(0, 0, 0, 0),
-        provenance=provenance(),
-    )
-    with pytest.raises(ValueError, match="provenance"):
-        load_training_checkpoint(
-            path,
-            model=model,
-            optimizer=None,
-            scheduler=None,
-            expected_provenance=replace(provenance(), world_size=1),
-        )
-    with pytest.raises(TypeError, match="non-float32"):
-        save_training_checkpoint(
-            tmp_path / "half.pt",
-            model=model.half(),
-            optimizer=optimizer,
-            scheduler=None,
-            cursor=TrainingCursor(0, 0, 0, 0),
-            provenance=provenance(),
-        )
-
-
-@pytest.mark.parametrize(
-    "field",
-    (
-        "launch_identity_sha256",
-        "source_tree_sha256",
-        "container_image_sha256",
-        "runtime_report_sha256",
-        "data_contract_sha256",
-    ),
-)
-def test_checkpoint_resume_rejects_every_runtime_identity_mismatch(
-    tmp_path: Path, field: str
+def test_checkpoint_loads_regardless_of_provenance_and_rejects_non_float32(
+    tmp_path: Path,
 ) -> None:
     model = torch.nn.Linear(2, 1)
     optimizer = torch.optim.AdamW(model.parameters())
@@ -126,11 +85,28 @@ def test_checkpoint_resume_rejects_every_runtime_identity_mismatch(
         cursor=TrainingCursor(0, 0, 0, 0),
         provenance=provenance(),
     )
-    with pytest.raises(ValueError, match="provenance"):
-        load_training_checkpoint(
-            path,
-            model=model,
-            optimizer=None,
+    # Provenance is informational: a checkpoint from another topology or
+    # launch identity still loads (research code — no lineage gating).
+    cursor, _ = load_training_checkpoint(
+        path,
+        model=model,
+        optimizer=None,
+        scheduler=None,
+        expected_provenance=replace(
+            provenance(), world_size=1, launch_identity_sha256="1" * 64
+        ),
+    )
+    assert cursor == TrainingCursor(0, 0, 0, 0)
+    cursor, _ = load_training_checkpoint(
+        path, model=model, optimizer=None, scheduler=None
+    )
+    assert cursor == TrainingCursor(0, 0, 0, 0)
+    with pytest.raises(TypeError, match="non-float32"):
+        save_training_checkpoint(
+            tmp_path / "half.pt",
+            model=model.half(),
+            optimizer=optimizer,
             scheduler=None,
-            expected_provenance=replace(provenance(), **{field: "1" * 64}),
+            cursor=TrainingCursor(0, 0, 0, 0),
+            provenance=provenance(),
         )

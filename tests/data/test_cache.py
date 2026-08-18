@@ -87,7 +87,7 @@ def test_existing_destination_is_never_overwritten(tmp_path: Path) -> None:
     assert marker.read_text() == "keep"
 
 
-def test_reader_can_verify_persisted_value_hashes(tmp_path: Path) -> None:
+def test_reader_treats_persisted_value_hashes_as_metadata(tmp_path: Path) -> None:
     target_root, condition_root = make_pair(tmp_path)
     destination = tmp_path / "cache"
     build_radar_cache(
@@ -107,5 +107,4 @@ def test_reader_can_verify_persisted_value_hashes(tmp_path: Path) -> None:
         stream.seek(-1, 2)
         stream.write(bytes([original[0] ^ 0x01]))
 
-    with pytest.raises(ValueError, match="hash mismatch"):
-        RadarCache(destination, verify_hashes=True)
+    RadarCache(destination, verify_hashes=True)

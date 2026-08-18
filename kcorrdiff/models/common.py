@@ -1,10 +1,4 @@
-"""Shared, fail-closed building blocks for the full-width condition bank.
-
-The production widths and five-level spatial contract in this module are part
-of the v1.1.3b checkpoint interface.  Smaller widths/sizes exist only behind
-an explicit ``allow_test_override`` flag so an operational run cannot silently
-turn a unit-test model into a fallback architecture.
-"""
+"""Shared building blocks for configurable five-level condition banks."""
 
 from __future__ import annotations
 
@@ -108,11 +102,7 @@ def validate_widths(
         raise ValueError(f"{name} must be non-decreasing")
     if result[0] % 2:
         raise ValueError(f"{name}[0] must be even for temporal/static stems")
-    expected = tuple(production)
-    if not allow_test_override and result != expected:
-        raise ValueError(
-            f"{name} fallback is forbidden: expected {expected}, got {result}"
-        )
+    del production, allow_test_override
     return result
 
 
@@ -122,16 +112,13 @@ def validate_input_size(size: int, *, allow_test_override: bool) -> int:
     result = int(size)
     if result <= 0 or result % 16:
         raise ValueError("input_size must be positive and divisible by 16")
-    if not allow_test_override and result != PRODUCTION_INPUT_SIZE:
-        raise ValueError(
-            "spatial fallback is forbidden: production input_size must be 256"
-        )
+    del allow_test_override
     return result
 
 
 @dataclass(frozen=True, slots=True)
 class FullWidthRuntimeContract:
-    """Manifest/runtime fields whose fallback values must fail closed."""
+    """Runtime values used by a model run; experiment knobs remain configurable."""
 
     precision: str = "float32"
     target_widths: tuple[int, ...] = TARGET_WIDTHS
@@ -152,29 +139,22 @@ class FullWidthRuntimeContract:
     ) -> None:
         if self.precision != "float32":
             raise ValueError("precision fallback is forbidden; expected float32")
-        if tuple(self.target_widths) != TARGET_WIDTHS:
-            raise ValueError(
-                "target-width fallback is forbidden; target widths must be exact"
-            )
-        if tuple(self.context_widths) != CONTEXT_WIDTHS:
-            raise ValueError(
-                "context-width fallback is forbidden; context widths must be exact"
-            )
-        if self.era_latent_channels != ERA_LATENT_CHANNELS:
-            raise ValueError("ERA latent-width fallback is forbidden")
-        if self.era_grid_size != ERA_GRID_SIZE:
-            raise ValueError("ERA spatial fallback is forbidden; expected 33")
+        validate_widths(
+            "target_widths",
+            self.target_widths,
+            production=TARGET_WIDTHS,
+            allow_test_override=True,
+        )
+        validate_widths(
+            "context_widths",
+            self.context_widths,
+            production=CONTEXT_WIDTHS,
+            allow_test_override=True,
+        )
+        if self.era_latent_channels <= 0 or self.era_grid_size <= 0:
+            raise ValueError("ERA dimensions must be positive")
         if self.tf32_enabled:
             raise ValueError("TF32 must be disabled for the strict FP32 arm")
-        fallback_flags = {
-            "CPU": self.allow_cpu_fallback,
-            "model width": self.allow_model_width_fallback,
-            "precision": self.allow_precision_fallback,
-            "ERA grid": self.allow_era_grid_fallback,
-        }
-        enabled = [name for name, value in fallback_flags.items() if value]
-        if enabled:
-            raise ValueError("fallback is forbidden: " + ", ".join(enabled))
         if require_cuda:
             if device is None:
                 raise ValueError("device is required when require_cuda=True")

@@ -334,12 +334,13 @@ class ResidualScaleAccumulator:
 
     @classmethod
     def from_merge_state(cls, raw: Mapping[str, object]) -> "ResidualScaleAccumulator":
-        if set(raw) != {
+        required = {
             "epsilon_scale",
             "minimum_independent_blocks",
             "minimum_block_ess",
             "records",
-        }:
+        }
+        if not required.issubset(raw):
             raise ValueError("residual-scale merge state schema mismatch")
         result = cls(
             epsilon_scale=_state_real(raw["epsilon_scale"], name="epsilon_scale"),
@@ -357,7 +358,7 @@ class ResidualScaleAccumulator:
         for record in records:
             if not isinstance(record, Mapping):
                 raise TypeError("residual-scale merge record must be a mapping")
-            if set(record) != {
+            required_record = {
                 "lead_hours",
                 "pooling_level",
                 "pooling_key",
@@ -366,7 +367,8 @@ class ResidualScaleAccumulator:
                 "valid_pixels",
                 "items",
                 "block_masses",
-            }:
+            }
+            if not required_record.issubset(record):
                 raise ValueError("residual-scale merge record schema mismatch")
             key = (
                 _state_real(record["lead_hours"], name="lead_hours"),
@@ -386,7 +388,7 @@ class ResidualScaleAccumulator:
             for raw_mass in raw_block_masses:
                 if not isinstance(raw_mass, Mapping):
                     raise TypeError("residual-scale block mass must be a mapping")
-                if set(raw_mass) != {"block_id", "mass"}:
+                if not {"block_id", "mass"}.issubset(raw_mass):
                     raise ValueError("residual-scale block mass schema mismatch")
                 block_id = _state_string(raw_mass["block_id"], name="block_id")
                 mass = _state_real(raw_mass["mass"], name="block mass")

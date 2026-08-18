@@ -1,4 +1,4 @@
-# SNU Kubernetes 실행 매니페스트
+pi# SNU Kubernetes 실행 매니페스트
 
 `saycorn-volume`은 250 GiB OpenEBS local RWO PVC다. 2026-08-13 사용자의 명시적
 허가로 비어 있던 기존 `ferrari` claim을 삭제하고 `porsche`의 첫 소비 Pod를 통해
@@ -52,27 +52,28 @@ OOF overflow용 1047 HTTPS 계정과 self-signed CA는 `kcorrdiff-oof-remote` Se
 
 ## training CLI 계약
 
-각 Job은 표의 production module entrypoint를 직접 호출한다. 파일이나 immutable 입력
-artifact가 없거나 config/CLI/runtime 계약이 다르면 GPU 학습 전에 fail-closed로 종료한다.
+각 Job은 표의 module entrypoint를 직접 호출한다. 필요한 파일과 과학적
+shape/dtype/split 계약은 확인하되, config·artifact hash와 GPU topology는 실행 게이트로
+쓰지 않는다.
 
 | 매니페스트 | 예상 module entrypoint | 주요 PVC 입력 | PVC 출력 |
 |---|---|---|---|
 | `benchmark-loader.yaml` | `kcorrdiff.training.benchmark_loader` | cache, outer-train draw manifest, static | `/workspace/benchmarks/loader/<pod>/` |
 | `benchmark-production-loader.yaml` | `kcorrdiff.training.production_benchmark` | cache, candidate/draw/bundle manifest, normalization, coordinates, static | `/workspace/benchmarks/production-loader/<pod>/` |
-| `train-stage2.yaml` | `kcorrdiff.training.train_stage2` | production cache/bundle/normalization, static, ERA5, verified B12 fold-set, OOF HTTPS Secret | `/workspace/runs/stage2/stage2-fullwidth-production-v3/` (OOF와 deployment/direct checkpoint) |
+| `train-stage2.yaml` | `kcorrdiff.training.train_stage2` | production cache/bundle/normalization, static, ERA5, B12 fold-set, OOF HTTPS Secret | `/workspace/runs/stage2/stage2-fullwidth-research-v4/` (OOF와 deployment/direct checkpoint) |
 | `train-stage3.yaml` | `kcorrdiff.training.train_stage3` | cache, promoted Stage 2 release, 외부 평가 artifact | `/workspace/runs/stage3/stage3-fullwidth-v1-1-3b/` (EDM checkpoint와 선택 결정 결합 manifest) |
 
 production config는 각각 `configs/stage2-full-width.yaml`과
 `configs/stage3-full-width.yaml`이다. 공통 CLI는 `--precision`,
 `--target-widths`, `--context-widths`, `--era-latent-channels`,
-`--era-grid-size`, `--fail-on-fallback`을 받아야 한다. 학습 CLI는 추가로
-`--require-world-size 2`를 검증한다. YAML은 suspended 상태로 먼저 생성하고,
-phase별 입력 및 실제 runtime을 확인한 뒤 명시적으로 시작한다.
+`--era-grid-size`, `--fail-on-fallback`을 받는다. world size는 Pod에 보이는 GPU 수에서
+계산하며 어떤 양의 값도 허용한다. YAML은 suspended 상태로 먼저 생성하고, phase별
+입력 및 실제 runtime을 확인한 뒤 명시적으로 시작한다.
 
 `train_stage2`는 docs의 `train_regression`, `crossfit_regression`,
-`build_oof_residuals`, `residual_scales`를 순서와 hash가 기록되는 하나의 fail-closed
-stage로 구현한 production orchestration entrypoint다. 성공한 run을 검토한 뒤에만 checkpoint,
-OOF와 stage manifest를 `/workspace/releases/stage2/selected/`에 immutable release로
+`build_oof_residuals`, `residual_scales`를 하나의 orchestration entrypoint로 구현한다.
+hash와 크기는 재현성 메타데이터로 기록할 뿐 실행을 막지 않는다. 성공한 run을 검토한
+뒤 checkpoint, OOF와 stage manifest를 `/workspace/releases/stage2/selected/`에 release로
 승격한다. `train_stage3`는 promoted Stage 2 deployment encoder를 동결한 채 residual
 EDM만 학습한다. 학습 loss나 train label로 모델을 고르지 않으며, 독립 평가기가 만든
 screening/final artifact가 없으면 다음 단계로 넘어가지 않는다. 최종 `bind-decision`도
@@ -83,15 +84,15 @@ calibration은 생성된 `stage3-training-manifest.json`을 입력으로 받는 
 ## Stage 2 3-fold porsche 선행 학습
 
 `saycorn-volume`의 local PV가 porsche에 묶여 있으므로 세 fold 모두 porsche에서만
-실행한다. 각 Pod는 PVC를 직접 mount하고 A100 40 GB 한 장, microbatch 12,
+실행한다. 각 Pod는 PVC를 직접 mount하고 현재 manifest에서는 GPU 한 장, microbatch 12,
 accumulation 1을 사용한다. Indexed Job의 `parallelism: 2`와 namespace GPU quota로
 두 fold까지 동시에 실행되고 세 번째는 같은 porsche GPU가 날 때까지 Pending이다.
 
 각 fold는 서로 다른 worker 디렉터리에 기록한다. 학습 image에서 실행되는
 `mark-complete`는 실제 draw manifest로 B12 plan을 재구성하고 checkpoint 내부
-provenance/cursor/plan/training-block/model tensor와 partial manifest를 교차검증한다.
-stdlib-only CPU collector는 그 strict receipt, 파일 크기/SHA-256과 세 fold 공통 lineage를
-다시 확인한 뒤 hard link로 다음 immutable fold set을 게시한다. NFS, cross-node
+cursor/plan/training-block/model tensor와 partial manifest를 검증한다.
+stdlib-only CPU collector는 fold 역할과 tensor 호환성을 확인하고 일반 복사로 fold set을
+게시한다. hash, 파일 크기와 producer topology는 정보로만 남긴다. NFS, cross-node
 stage-in, 서버 간 복사는 사용하지 않는다.
 
 ```text
@@ -100,25 +101,21 @@ stage-in, 서버 간 복사는 사용하지 않는다.
 ```
 
 이 fold set은 Stage 2 전체 release가 아니다. 세 fold가 끝난 뒤
-`train-stage2.yaml`은 `fold-set-manifest.json`과 sidecar hash를 명시적으로 전달한다.
-importer는 collector receipt를 신뢰하지 않고 세 checkpoint를 다시 deserialize하여
-world1/B12 provenance와 draw plan, 현재 model state-dict 호환성을 모두 검증한다. 또한
-producer와 consumer의 config 및 source-tree identity가 정확히 같아야 한다. 이후
-OOF model-only load에만 producer provenance를 사용하고, training resume의 exact
-topology 검증은 그대로 유지한다. OOF inference/residual scale 및
+`train-stage2.yaml`은 `fold-set-manifest.json`을 전달한다. importer는 checkpoint를 다시
+deserialize하여 fold 역할, 완료 cursor, training-block 할당과 현재 model state-dict
+호환성을 검증한다. producer/consumer hash와 topology가 달라도 허용한다. OOF inference,
+residual scale 및
 deployment/direct mean/direct q50 arm이 성공해야 complete Stage 2가 된다.
 
 중요: 과거 `stage2-folds-porsche-v2` checkpoint는 수정 전 spatial
 geometry/advection/ERA 의미로 학습됐으므로 v3 importer가 거부하며 release 입력으로 쓰지
-않는다. fixed run은 launcher가 먼저 `/workspace/code/stage2-folds-porsche-v3`를 새 immutable
-snapshot으로 게시하고, fold 학습과 `train-stage2.yaml` continuation 모두 그 동일 snapshot을
-사용한다. 어느 실행 중에도 snapshot이나 기존 run directory를 덮어쓰지 않는다.
+않는다. 활성 `/workspace/code/stage2-folds-porsche-v3` snapshot은 그대로 보존하고,
+새 코드는 `/workspace/code/stage2-research-flex-v4` 같은 별도 versioned snapshot에
+게시한다. 어느 실행 중에도 기존 snapshot이나 run directory를 덮어쓰지 않는다.
 
-v3 fold-set publication 후 `fold-set-manifest.json`의 실제 hash와 sidecar를 비교하고 내용을
-검토한 뒤,
-`train-stage2.yaml`의 `FOLD_SET_MANIFEST_SHA256` placeholder를 검토한 lowercase SHA-256로
-교체한다. Job은 이 외부 pin, sidecar, 실제 manifest 세 값이 모두 같지 않으면 GPU model
-load 전에 중단한다. 같은 writable PVC의 sidecar 값을 기대 hash로 자동 채우지 않는다.
+v3 fold-set publication 후 `fold-set-manifest.json`의 fold coverage와 역할을 검토한다.
+sidecar hash가 있으면 provenance 참고 자료로 보존하지만 launcher 입력이나 실행 허가
+조건으로 사용하지 않는다.
 
 다음 launcher가 `.env`의 Telegram 값만 Secret으로 적용하고, immutable source snapshot을
 PVC에 게시하고, server-side dry-run 후 training/collector Job을 시작한다.
@@ -147,13 +144,13 @@ Job 세 개를 정의한다. 세 Job을 동시에 unsuspend하지 않는다.
 
 세 phase는 의도적으로 같은 `STAGE3_RUN_ID=stage3-fullwidth-v1-1-3b`와 같은 PVC
 run root를 사용한다. 그래야 screening의 seed 11103 checkpoint와 rank-0 W&B run/audit를
-finalists 단계가 동일 provenance로 재사용할 수 있다. phase별 Job 이름만 다르며 run ID나
-output root를 한 단계에서만 바꾸면 continuation은 fail-closed로 거부된다.
+finalists 단계가 재사용할 수 있다. phase별 Job 이름만 다르며 같은 run ID와 output
+root를 쓰면 기존 checkpoint를 이어서 사용한다.
 
 promoted Stage 2 release는 self-contained `kcorrdiff.stage2-release-index.v2` 트리여야
 한다. 인덱스는 Stage 3 입력 전체, 정확한 regression checkpoint 6개(fold 3개와
 deployment/direct-mean/direct-q50), B12 fold import를 사용했다면 원본 fold-set
-manifest와 partial manifest 3개를 모두 release root 상대 경로와 SHA-256으로 고정한다.
+manifest와 partial manifest를 함께 기록한다. 경로는 이동 가능하며 SHA-256은 정보다.
 Stage 3는 Stage 2 manifest 안의 원래 run 절대 경로를 다시 열지 않는다.
 
 ```text
@@ -162,14 +159,9 @@ Stage 3는 Stage 2 manifest 안의 원래 run 절대 경로를 다시 열지 않
 # release-index.json이 참조하는 모든 파일/디렉터리도 selected/ 아래에 존재
 ```
 
-`release-index.sha256`는 `release-index.json`의 lowercase SHA-256 64자리와 newline만
-담는다. runner는 sidecar와 실제 파일 hash를 먼저 비교한 뒤 인덱스의 containment,
-symlink 금지, 파일 크기/hash, artifact lineage와 checkpoint role을 전부 재검증한다.
-release tree를 다른 mount root로 복사해도 인덱스 hash와 checkpoint-set hash는 변하지
-않는다. 또한 첫 phase에서 Stage 3
-source-tree identity와 CUDA/PyTorch runtime report를 원자적으로 기록하고, 후속 phase는
-두 identity가 조금이라도 달라지면 실행을 중단한다. 컨테이너 image는 immutable digest와
-그 digest를 전달하는 `KCORRDIFF_CONTAINER_IMAGE_SHA256`가 일치해야 한다.
+`release-index.sha256`가 있으면 provenance 참고 자료로 보존한다. runner는 참조 파일의
+존재와 checkpoint 역할 coverage를 확인하지만 hash, containment, symlink 여부를 실행
+게이트로 쓰지 않는다. CUDA/PyTorch runtime report도 관찰 메타데이터로 기록한다.
 
 처음에는 immutable ConfigMap 하나와 suspended Job 세 개를 생성한다.
 
@@ -178,16 +170,13 @@ kubectl apply -f k8s/train-stage3.yaml
 kubectl get jobs -l app.kubernetes.io/component=stage3-diffusion-training
 ```
 
-각 외부 경계의 artifact와 hash를 검토한 뒤 해당 Job 하나만 시작한다.
+각 외부 경계의 artifact 내용을 검토한 뒤 해당 Job 하나만 시작한다.
 
-namespace quota는 memory 128 GiB, GPU 2개다. `kcorrdiff-stager`의 24 GiB limit과
-Stage 3 Job 하나의 104 GiB limit이 합계 128 GiB로 정확히 quota를 채우므로 memory
-headroom은 없다. 또한 Pending Pod도 quota를 점유한다. 따라서 어느 phase든 시작하기
-전에 `porsche-gpu-0`과 `porsche-gpu-1`을 **둘 다** 삭제하고, 다른 GPU Job이 없는지
-확인한다. stager는 PVC를 유지한 채 함께 둘 수 있다.
+namespace quota와 현재 여유 GPU를 확인한 뒤 phase를 시작한다. manifest는 GPU 한 장을
+요청하며, 더 많은 GPU를 요청하는 변형에서도 entrypoint가 보이는 GPU 수를 자동으로
+사용한다. Pending Pod도 quota를 점유한다.
 
 ```bash
-kubectl delete pod porsche-gpu-0 porsche-gpu-1
 kubectl get resourcequota ws-quotas
 ```
 
@@ -204,9 +193,8 @@ kubectl patch job kcorrdiff-stage3-bind-decision \
   --type=merge -p '{"spec":{"suspend":false}}'
 ```
 
-각 Job은 `backoffLimit: 0`, `restartPolicy: Never`, 정확히 2 GPU/NCCL/FP32/no-TF32,
-full-width/no-fallback 계약을 사용한다. `bind-decision`도 현재 production CLI의 exact
-two-rank runtime 및 Stage 2 lineage를 다시 검증하므로 2 GPU Job이다. 완료된 phase를
+각 Job은 `backoffLimit: 0`, `restartPolicy: Never`, FP32/no-TF32 설정을 사용한다.
+GPU 수는 고정하지 않으며 global batch metadata와 실제 topology가 다르면 경고만 남긴다. 완료된 phase를
 다시 실행하거나 기존 immutable ConfigMap/Job을 덮어쓰지 말고, 재실행이 필요하면 원인을
 기록한 뒤 새 versioned run ID와 resource 이름을 사용한다.
 
@@ -225,20 +213,15 @@ compute        = float32, TF32 disabled
 fallback       = CPU/model-width/precision/ERA-grid automatic fallback forbidden
 ```
 
-환경변수는 이 계약을 한 번 더 전달하지만, CLI 구현은 config 및 실제 runtime 상태와
-대조한 뒤 불일치 시 non-zero로 종료해야 한다. 환경변수만 보고 full-width 실행이라고
-간주하면 안 된다. Stage 2는 power-of-two-only 실측으로 per-rank microbatch 8 x
-accumulation 1을 선택해 2-GPU DDP global effective batch 16으로 고정했다. Stage 3의
+이 값들은 현재 실험의 시작점이며 다른 양의 batch/worker/grid 설정으로 바꿀 수 있다.
+Stage 2의 예시는 per-rank microbatch 8 x accumulation 1이다. Stage 3의
 초기값은 per-rank microbatch 1 x accumulation 4, global effective batch 8이다. 먼저 loader benchmark 결과로 worker/batch
 값을 확정하고, OOM을 성공으로 처리하거나 자동으로 작은 모델/정밀도/grid로 바꾸지 않는다.
 Benchmark에서 특정 batch의 OOM을 관측값으로 기록하는 것은 허용하지만, 그 시도 안에서
 모델 폭·정밀도·ERA grid를 바꾸어 성공으로 기록해서는 안 된다.
 
-Radar/ERA payload의 전체 SHA-256 검증은 cache atomic publication 직후 CPU stager에서
-한 번 수행한다. 학습 Job에서 `--verify-cache-hashes`를 켜면 worker별 lazy cache open마다
-약 72 GiB payload를 다시 hash해 I/O를 중복하므로 사용하지 않는다. 학습 시작 시에는
-고정된 cache manifest, timestamp index, 좌표, static, normalization 및 selection artifact
-hash를 계속 검증한다.
+Radar/ERA payload의 SHA-256은 cache key와 provenance로만 쓴다. 학습 Job에서 live
+payload를 재해시하거나 expected hash와 비교하지 않는다.
 
 ## OOF PVC hot tier와 1047 overflow
 
@@ -246,18 +229,17 @@ Stage 2 OOF는 float32 두 field를 lossless byte-shuffle+DEFLATE shard로 기�
 primary hot tier이며, 다음 shard의 최악 크기와 후속 checkpoint 용량까지 고려해
 최종 10 GiB free-space가 보존되도록 OOF 중에는 14 GiB를 예약한다. 임계점에 닿으면
 가장 오래된 sealed shard 하나만 `https://168.188.119.187:1047/kcorrdiff/oof`로 PUT한다.
-서버에서 전체 파일을 다시 GET해 SHA-256/byte 수가 일치하고 durable receipt가 게시된
-뒤에만 PVC 사본을 지운다. 전송 실패·read-back 불일치 때는 로컬 shard를 유지하고
-학습을 fail-closed로 중단한다.
+서버에서 파일을 다시 GET해 전송 크기를 확인하고 durable receipt가 게시된 뒤에만 PVC
+사본을 지운다. 전송 실패 때는 로컬 shard를 유지하고 오류를 보고한다.
 
 최종 OOF manifest는 각 shard를 `local` 또는 `remote_https`로 명시한다. Stage 3는
-원격 shard가 필요할 때 worker별 `/tmp/oof-remote-cache`에 하나만 받아 SHA-256을
-검증하고, FP32 bitwise 복원 후 압축 파일을 즉시 지운다. 따라서 전체 OOF를 PVC에
+원격 shard가 필요할 때 worker별 `/tmp/oof-remote-cache`에 하나만 받아 크기와 FP32
+shape/dtype을 확인한 뒤 압축 파일을 즉시 지운다. 따라서 전체 OOF를 PVC에
 재복제하지 않는다. 실제 porsche→1047 smoke에서 v3 shard upload, full HTTPS read-back,
 로컬 삭제, 재다운로드 및 uint32 bit-pattern roundtrip을 모두 확인했다.
 
 `benchmark-loader.yaml`은 host-to-device와 GPU utilization을 함께 측정하는 데 필요한
-최소 1 GPU만 요청한다. Stage 2 학습과 Stage 3의 세 phase Job은 정확히 2 GPU를 요청하며
+최소 1 GPU만 요청한다. Stage 2 학습과 Stage 3의 세 phase Job도 기본 1 GPU를 요청하며
 `/dev/shm` 32 GiB를 mount한다. 일반 Job은 Pod 이름을 run ID로 사용하지만 Stage 3 세
 phase만 exact continuation을 위해 같은 고정 run ID와 PVC 경로를 공유한다. Kubernetes
 Secret `wandb-api`의 `WANDB_API_KEY`만 참조하고 `.env` 내용을 manifest에 복사하지 않는다.

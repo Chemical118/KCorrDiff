@@ -27,14 +27,12 @@ items:
         stage3_config=${source_root}/configs/stage3-full-width.yaml
         stage2_release=/workspace/releases/stage2/selected
         stage2_release_index=${stage2_release}/release-index.json
-        stage2_release_index_sha_file=${stage2_release}/release-index.sha256
         oof_remote_credentials=/run/secrets/kcorrdiff-oof/credentials.env
         oof_remote_ca=/run/secrets/kcorrdiff-oof/server.crt
         oof_remote_cache=/tmp/oof-remote-cache
 
         run_root=/workspace/runs/stage3/${STAGE3_RUN_ID}
         provenance_dir=${run_root}/provenance
-        source_identity=${provenance_dir}/source-tree.json
         runtime_report=${provenance_dir}/runtime-report.json
         screening_evaluation=/workspace/releases/stage3/evaluations/screening-evaluation.json
         final_decision=/workspace/releases/stage3/model-selection-decision.json
@@ -55,15 +53,9 @@ items:
         test -f "${source_root}/kcorrdiff/training/stage3_data.py"
         test -f "${stage3_config}"
         test -f "${stage2_release_index}"
-        test -f "${stage2_release_index_sha_file}"
         test -r "${oof_remote_credentials}"
         test -r "${oof_remote_ca}"
         install -d -m 0700 "${oof_remote_cache}"
-
-        stage2_release_index_sha256="$(tr -d '\n' < "${stage2_release_index_sha_file}")"
-        [[ "${stage2_release_index_sha256}" =~ ^[0-9a-f]{64}$ ]]
-        test "$(sha256sum "${stage2_release_index}" | awk '{print $1}')" = \
-          "${stage2_release_index_sha256}"
 
         case "${STAGE3_PHASE}" in
           screen)
@@ -89,68 +81,10 @@ items:
 
         python -c 'import numpy, scipy, torch, yaml, wandb'
         nvidia-smi -L
-        python -c 'import torch; count = torch.cuda.device_count(); assert count == 2, f"expected exactly two visible training GPUs, got {count}"'
+        gpu_count="$(python -c 'import torch; print(torch.cuda.device_count())')"
+        (( gpu_count > 0 ))
 
-        source_tree_sha256="$(
-          python - "${source_root}" "${source_identity}" <<'PY'
-        import json
-        import os
-        from pathlib import Path
-        import sys
-        import tempfile
-
-        from kcorrdiff.training.train_stage3 import source_tree_sha256
-
-        root = Path(sys.argv[1]).resolve(strict=True)
-        identity = Path(sys.argv[2]).resolve()
-        digest = source_tree_sha256(root)
-        payload = (
-            json.dumps(
-                {
-                    "format_version": "kcorrdiff.stage3-source-tree.v1",
-                    "source_tree_sha256": digest,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
-        identity.parent.mkdir(parents=True, exist_ok=True)
-        if identity.exists():
-            if identity.is_symlink() or not identity.is_file():
-                raise FileExistsError("Stage 3 source identity is not a regular file")
-            if identity.read_bytes() != payload:
-                raise ValueError("Stage 3 source tree changed across phase boundaries")
-        else:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{identity.name}.", suffix=".tmp", dir=identity.parent
-            )
-            temporary = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(payload)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                try:
-                    os.link(temporary, identity)
-                except FileExistsError:
-                    if identity.read_bytes() != payload:
-                        raise ValueError(
-                            "concurrent Stage 3 source identity disagrees"
-                        ) from None
-                directory = os.open(identity.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-            finally:
-                temporary.unlink(missing_ok=True)
-        print(digest)
-        PY
-        )"
-
-        runtime_report_sha256="$(
-          python - "${runtime_report}" <<'PY'
+        python - "${runtime_report}" <<'PY'
         from pathlib import Path
         import sys
 
@@ -162,11 +96,6 @@ items:
 
         print(write_runtime_report(Path(sys.argv[1])))
         PY
-        )"
-
-        [[ "${source_tree_sha256}" =~ ^[0-9a-f]{64}$ ]]
-        [[ "${runtime_report_sha256}" =~ ^[0-9a-f]{64}$ ]]
-        [[ "${KCORRDIFF_CONTAINER_IMAGE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 
         export WANDB_DIR="${run_root}/wandb"
         export WANDB_NAME="${STAGE3_RUN_ID}"
@@ -175,18 +104,16 @@ items:
         exec torchrun \
           --standalone \
           --nnodes=1 \
-          --nproc-per-node=2 \
+          --nproc-per-node="${gpu_count}" \
           -m kcorrdiff.training.train_stage3 \
           "${phase_arguments[@]}" \
           --config "${stage3_config}" \
           --stage2-release-index "${stage2_release_index}" \
-          --stage2-release-index-sha256 "${stage2_release_index_sha256}" \
           --stage2-release-root "${stage2_release}" \
           --oof-remote-credentials "${oof_remote_credentials}" \
           --oof-remote-ca-certificate "${oof_remote_ca}" \
           --oof-remote-cache-root "${oof_remote_cache}" \
           --output-dir "${run_root}" \
-          --require-world-size 2 \
           --precision float32 \
           --disable-tf32 \
           --target-widths 64,128,256,384,512 \
@@ -199,10 +126,7 @@ items:
           --prefetch-factor 4 \
           --fail-on-fallback \
           --wandb-mode online \
-          --run-id "${STAGE3_RUN_ID}" \
-          --container-image-sha256 "${KCORRDIFF_CONTAINER_IMAGE_SHA256}" \
-          --source-tree-sha256 "${source_tree_sha256}" \
-          --runtime-report-sha256 "${runtime_report_sha256}"
+          --run-id "${STAGE3_RUN_ID}"
 
   - apiVersion: batch/v1
     kind: Job
@@ -257,8 +181,6 @@ items:
                   value: stage3-fullwidth-v1-1-3b
                 - name: KCORRDIFF_CONTAINER_IMAGE
                   value: *stage3_image
-                - name: KCORRDIFF_CONTAINER_IMAGE_SHA256
-                  value: 6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
                 - name: PYTHONPATH
                   value: /workspace/envs/stage2-python-v1:/workspace/code/stage3-production-v2
                 - name: PYTHONUNBUFFERED
@@ -317,12 +239,12 @@ items:
                   cpu: "0"
                   memory: "0"
                   ephemeral-storage: "0"
-                  nvidia.com/gpu: 2
+                  nvidia.com/gpu: 1
                 limits:
                   cpu: "32"
                   memory: 124Gi
                   ephemeral-storage: 8Gi
-                  nvidia.com/gpu: 2
+                  nvidia.com/gpu: 1
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:

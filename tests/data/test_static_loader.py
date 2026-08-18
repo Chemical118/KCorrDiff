@@ -49,28 +49,20 @@ def test_static_loader_uses_declared_outer_train_stats_and_names(tmp_path: Path)
     path = tmp_path / "static.npz"
     write_static(path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    result = load_target_static(
-        path, normalization=normalization(), expected_sha256=digest
-    )
+    result = load_target_static(path, normalization=normalization())
     assert result.values.shape == (7, 256, 256)
     assert result.values.dtype == np.float32
     assert result.values[0, 0, 0] == 1.0
     assert result.values[3, 0, 0] == 1.0
     assert result.coverage.all()
     assert result.x_lcc_km[-1] == 127.5
+    assert result.source_sha256 == digest
 
 
-def test_static_loader_rejects_unhashed_or_nontrain_stats(tmp_path: Path) -> None:
-    path = tmp_path / "static.npz"
-    write_static(path)
-    with pytest.raises(ValueError, match="SHA-256"):
-        load_target_static(
-            path, normalization=normalization(), expected_sha256="bad"
-        )
+def test_static_loader_rejects_nontrain_stats() -> None:
     with pytest.raises(ValueError, match="outer_train"):
         StaticNormalization(
             means=normalization().means,
             standard_deviations=normalization().standard_deviations,
             fit_split="calibration",
-            fit_manifest_sha256="a",
         )

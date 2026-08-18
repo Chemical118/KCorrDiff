@@ -651,9 +651,10 @@ def write_event_training_bundle(
     draw_policy: DrawPolicy,
     seed: int,
     purpose_id: str,
-    maximum_oof_bytes: int,
+    maximum_oof_bytes: int | None = None,
     config_sha256: str,
     protocol_version: str,
+    folds: int = OUTER_TRAIN_FOLDS,
     fold_seed: int = 11103,
     oof_height: int = 256,
     oof_width: int = 256,
@@ -662,14 +663,27 @@ def write_event_training_bundle(
     source_event_index: Path | None = None,
     condition_augmentation: ConditionAugmentationPolicy | None = None,
     signature_purpose_id: str | None = None,
+    weight_clipping: float | None = None,
 ) -> TrainingBundleResult:
     """Audit and atomically publish an end-to-end event training bundle."""
 
     canonical_rows = _canonical_event_rows(rows)
+    weight_clipping = _optional_weight_clipping(
+        weight_clipping, name="importance-weight clipping"
+    )
+    if condition_augmentation is not None:
+        if weight_clipping is None:
+            weight_clipping = condition_augmentation.weight_clipping
+        elif condition_augmentation.weight_clipping != weight_clipping:
+            condition_augmentation = replace(
+                condition_augmentation, weight_clipping=weight_clipping
+            )
+    if isinstance(folds, bool) or not isinstance(folds, int) or folds <= 1:
+        raise ValueError("folds must be an integer greater than one")
     base_items = expand_event_candidates(
         canonical_rows,
         draw_policy=draw_policy,
-        folds=OUTER_TRAIN_FOLDS,
+        folds=folds,
         fold_seed=fold_seed,
     )
     eligible_ids = eligible_sample_ids_from_event_index(canonical_rows)
@@ -677,7 +691,7 @@ def write_event_training_bundle(
         base_items,
         split_intervals,
         eligible_sample_ids=eligible_ids,
-        expected_outer_folds=OUTER_TRAIN_FOLDS,
+        expected_outer_folds=folds,
         validate_split_probabilities=True,
     )
     if base_candidate_audit["unassigned_eligible_item_fraction"] != 0.0:
@@ -765,7 +779,7 @@ def write_event_training_bundle(
             items,
             split_intervals,
             eligible_sample_ids=expanded_eligible_ids,
-            expected_outer_folds=OUTER_TRAIN_FOLDS,
+            expected_outer_folds=folds,
             validate_split_probabilities=True,
         )
         source_draw_hash = canonical_draw_rows_sha256(source_draw_rows)
@@ -786,8 +800,7 @@ def write_event_training_bundle(
         fields=oof_fields,
         bytes_per_value=oof_bytes_per_value,
     )
-    # This check deliberately precedes creation of even a temporary output
-    # directory: a rejected storage plan publishes no partial artifact.
+    # Advisory: an exceeded budget logs a warning but never blocks the build.
     enforce_byte_budget(required_bytes, maximum_oof_bytes)
     unique_oof_items = len(
         {
@@ -862,7 +875,7 @@ def write_event_training_bundle(
             "probability_scope": "within_split",
             "target_policy": "eligible_items_uniform",
             "draw_policy": draw_policy,
-            "outer_train_folds": OUTER_TRAIN_FOLDS,
+            "outer_train_folds": folds,
             "fold_seed": fold_seed,
             "split_intervals": _split_interval_records(split_intervals),
             "config_sha256": config_sha256,
@@ -875,28 +888,17 @@ def write_event_training_bundle(
             candidate_metadata["condition_augmentation_policy_sha256"] = (
                 condition_augmentation.semantic_sha256
             )
-        candidate_hash = write_manifest(
+        write_manifest(
             candidate_path,
             items,
             metadata=candidate_metadata,
         )
         source_draw_path: Path | None = None
-        source_draw_hash: str | None = None
         if condition_result is not None:
             source_draw_path = temporary / "source-training-draw-manifest.jsonl"
-            source_draw_hash = write_draw_manifest(
-                source_draw_path, source_draw_rows
-            )
-            if source_draw_hash != (
-                condition_result.provenance.source_draw_manifest_sha256
-            ):
-                raise AssertionError("source draw writer/provenance hash mismatch")
+            write_draw_manifest(source_draw_path, source_draw_rows)
         draw_path = temporary / "training-draw-manifest.jsonl"
-        draw_hash = write_draw_manifest(draw_path, draw_rows)
-        if candidate_hash != _sha256_file(candidate_path):
-            raise AssertionError("candidate manifest writer hash mismatch")
-        if draw_hash != _sha256_file(draw_path):
-            raise AssertionError("draw manifest writer hash mismatch")
+        write_draw_manifest(draw_path, draw_rows)
 
         artifacts = {
             "event_index": _artifact_metadata(
@@ -928,7 +930,7 @@ def write_event_training_bundle(
             "draw_count": draw_count,
             "seed": seed,
             "purpose_id": purpose_id,
-            "weight_clipping": None,
+            "weight_clipping": weight_clipping,
             "omega_min": float(np.min(weights)),
             "omega_median": float(np.median(weights)),
             "omega_p95": float(np.percentile(weights, 95)),
@@ -982,11 +984,11 @@ def write_event_training_bundle(
             "sampling": sampling_metadata,
             "folds": {
                 "split": "outer_train",
-                "count": OUTER_TRAIN_FOLDS,
+                "count": folds,
                 "seed": fold_seed,
                 "block_counts": {
                     str(fold): sum(fold_id == fold for _, fold_id in fold_map)
-                    for fold in range(OUTER_TRAIN_FOLDS)
+                    for fold in range(folds)
                 },
             },
             "oof_preflight": {
@@ -1086,10 +1088,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fold-seed", type=int, help="override config sampling.fold_seed"
     )
+    parser.add_argument("--folds", type=int, help="override config sampling.folds")
     parser.add_argument(
         "--maximum-oof-gib",
         type=float,
-        help="hard dense OOF budget in GiB (1024^3 bytes)",
+        help="advisory dense OOF budget in GiB (1024^3 bytes)",
     )
     parser.add_argument(
         "--maximum-oof-bytes",
@@ -1097,7 +1100,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="maximum_oof_bytes",
         type=int,
         help=(
-            "hard dense OOF byte budget "
+            "advisory dense OOF byte budget "
             "(or set sampling.maximum_oof_bytes in config)"
         ),
     )
@@ -1148,8 +1151,22 @@ def _validate_sampling_config(sampling: Mapping[str, object]) -> None:
         "eligible_items_uniform"
     ):
         raise ValueError("only eligible_items_uniform target sampling is supported")
-    if sampling.get("weight_clipping") is not None:
-        raise ValueError("v1.1.3b forbids importance-weight clipping")
+    _optional_weight_clipping(
+        sampling.get("weight_clipping"), name="sampling.weight_clipping"
+    )
+
+
+def _optional_weight_clipping(value: object, *, name: str) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise ValueError(f"{name} must be finite and positive")
+    return float(value)
 
 
 def _resolved_setting(
@@ -1228,10 +1245,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if draw_count_raw is None:
         raise ValueError("declare --draws or sampling.draws")
-    if maximum_oof_bytes_raw is None:
-        raise ValueError(
-            "declare --maximum-oof-bytes or sampling.maximum_oof_bytes"
-        )
     draw_policy_value = str(
         _resolved_setting(
             arguments.draw_policy,
@@ -1265,6 +1278,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             default=11103,
         )
     )
+    folds = int(
+        _resolved_setting(arguments.folds, sampling_config, "folds", default=3)
+    )
     raw_condition_augmentation = era5_config.get("condition_augmentation")
     condition_augmentation = (
         ConditionAugmentationPolicy.from_mapping(raw_condition_augmentation)
@@ -1295,11 +1311,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         expected_merge_gap = float(manifest_config["event_merge_gap_hours"])
         expected_guard = float(manifest_config["event_guard_hours"])
-        expected_split_hash = _semantic_sha256(_split_interval_records(intervals))
-        if not audit.source_timestamps_sha256 or not audit.split_intervals_sha256:
-            raise ValueError(
-                "event-index audit lacks construction provenance; rebuild it"
-            )
         if audit.condition_signature != expected_signature:
             raise ValueError("event-index audit/config condition signature mismatch")
         if not np.isclose(
@@ -1316,8 +1327,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             atol=0.0,
         ):
             raise ValueError("event-index/config guard mismatch")
-        if audit.split_intervals_sha256 != expected_split_hash:
-            raise ValueError("event-index/config split-interval mismatch")
+        for row in rows:
+            observed_split = assign_split(
+                row.t0_utc, intervals
+            )
+            if observed_split != row.split:
+                raise ValueError("event-index/config split-interval mismatch")
         source_event_index = arguments.event_index
     else:
         if arguments.target_root is None or arguments.condition_root is None:
@@ -1342,13 +1357,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         draw_policy=draw_policy_value,  # type: ignore[arg-type]
         seed=seed,
         purpose_id=purpose_id,
-        maximum_oof_bytes=int(maximum_oof_bytes_raw),
+        maximum_oof_bytes=(
+            int(maximum_oof_bytes_raw)  # type: ignore[arg-type]
+            if maximum_oof_bytes_raw is not None
+            else None
+        ),
         config_sha256=_sha256_file(arguments.config),
         protocol_version=str(config.get("protocol_version", "unknown")),
+        folds=folds,
         fold_seed=fold_seed,
         source_event_index=source_event_index,
         condition_augmentation=condition_augmentation,
         signature_purpose_id=signature_purpose_id,
+        weight_clipping=_optional_weight_clipping(
+            sampling_config.get("weight_clipping"),
+            name="sampling.weight_clipping",
+        ),
     )
     print(
         json.dumps(

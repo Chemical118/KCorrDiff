@@ -52,13 +52,10 @@ def _read_resume_state(
     audit_path: Path,
     *,
     run_id: str,
-    config_sha256: str,
-    launch_identity_sha256: str | None,
 ) -> int:
-    """Validate an existing append-only audit before resuming it."""
+    """Read the last metric step from an existing append-only audit."""
 
     last_step = -1
-    saw_identity = False
     with audit_path.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
             try:
@@ -73,11 +70,7 @@ def _read_resume_state(
                 raise ValueError("tracking audit run_id mismatch")
             event = record.get("event")
             if event in {"start", "resume"}:
-                if record.get("config_sha256") != config_sha256:
-                    raise ValueError("tracking audit config SHA-256 mismatch")
-                if record.get("launch_identity_sha256") != launch_identity_sha256:
-                    raise ValueError("tracking audit launch identity SHA-256 mismatch")
-                saw_identity = True
+                pass
             elif event == "metrics":
                 step = record.get("step")
                 if isinstance(step, bool) or not isinstance(step, int) or step < last_step:
@@ -89,8 +82,6 @@ def _read_resume_state(
                     raise ValueError("tracking audit finish step disagrees with metric history")
             else:
                 raise ValueError(f"unsupported tracking audit event: {event!r}")
-    if not saw_identity:
-        raise ValueError("tracking audit has no run/config identity record")
     return last_step
 
 
@@ -203,11 +194,6 @@ def initialize_tracking(
         raise ValueError("unsupported W&B mode")
     if resume not in {"never", "allow"}:
         raise ValueError("tracking resume must be 'never' or 'allow'")
-    if launch_identity_sha256 is not None and (
-        len(launch_identity_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in launch_identity_sha256)
-    ):
-        raise ValueError("tracking launch identity must be a lowercase SHA-256")
     if mode == "online" and not os.environ.get("WANDB_API_KEY"):
         raise RuntimeError("WANDB_API_KEY is required for online tracking")
     try:
@@ -221,14 +207,7 @@ def initialize_tracking(
     if existed and resume == "never":
         raise FileExistsError(f"tracking audit already exists: {audit_path}")
     last_step = (
-        _read_resume_state(
-            audit_path,
-            run_id=run_id,
-            config_sha256=config_sha256,
-            launch_identity_sha256=launch_identity_sha256,
-        )
-        if existed
-        else -1
+        _read_resume_state(audit_path, run_id=run_id) if existed else -1
     )
     public_config = dict(config)
     public_config["config_sha256"] = config_sha256

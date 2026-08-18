@@ -114,3 +114,16 @@ def test_atomic_artifact_round_trip_and_named_application(tmp_path: Path) -> Non
     output.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="strictly positive"):
         read_normalization_artifact(output)
+
+
+def test_artifact_without_provenance_still_loads(tmp_path: Path) -> None:
+    output = tmp_path / "normalization.json"
+    write_normalization_artifact(output, _artifact())
+    raw = json.loads(output.read_text())
+    del raw["provenance"]
+    del raw["statistics_semantic_sha256"]
+    stripped = tmp_path / "stripped.json"
+    stripped.write_text(json.dumps(raw))
+    restored = read_normalization_artifact(stripped)
+    assert restored.provenance == {}
+    assert restored.statistics["group"]["value"].count == 2

@@ -114,7 +114,7 @@ def test_resume_appends_same_run_and_restores_monotonic_step(
     assert calls[0]["resume"] == calls[1]["resume"] == "allow"
 
 
-def test_resume_fails_closed_on_run_or_config_identity_change(
+def test_resume_rejects_foreign_run_but_tolerates_identity_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setitem(
@@ -140,12 +140,14 @@ def test_resume_fails_closed_on_run_or_config_identity_change(
     )
     run = initialize_tracking(**base)
     run.finish()
+    # Interleaving a different run into the same audit is a real bug.
     with pytest.raises(ValueError, match="run_id"):
         initialize_tracking(**{**base, "run_id": "run-b"})
-    with pytest.raises(ValueError, match="config SHA-256"):
-        initialize_tracking(**{**base, "config_sha256": "b" * 64})
-    with pytest.raises(ValueError, match="launch identity SHA-256"):
-        initialize_tracking(**{**base, "launch_identity_sha256": "d" * 64})
+    # Config/launch identity changes are informational and never block resume.
+    run = initialize_tracking(
+        **{**base, "config_sha256": "b" * 64, "launch_identity_sha256": "d" * 64}
+    )
+    run.finish()
 
 
 def test_external_log_failure_keeps_durable_monotonic_resume_cursor(

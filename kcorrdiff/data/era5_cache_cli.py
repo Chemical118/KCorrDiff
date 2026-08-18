@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,7 @@ class _ExclusiveBuildLock(AbstractContextManager["_ExclusiveBuildLock"]):
         self.path = self.output.parent / f".{self.output.name}.build.lock"
         self.token = uuid.uuid4().hex
         self._owned = False
+        self._stream = None
 
     def __enter__(self) -> "_ExclusiveBuildLock":
         self.output.parent.mkdir(parents=True, exist_ok=True)
@@ -52,34 +54,31 @@ class _ExclusiveBuildLock(AbstractContextManager["_ExclusiveBuildLock"]):
             "started_utc": datetime.now(UTC).isoformat(),
             "output": str(self.output),
         }
+        stream = self.path.open("a+", encoding="utf-8")
         try:
-            descriptor = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o644,
-            )
-        except FileExistsError as error:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            stream.close()
             raise FileExistsError(
-                f"ERA5 build lock already exists; inspect the owner before removing it: "
+                f"another ERA5 builder currently holds the lock: "
                 f"{self.path}"
             ) from error
-        try:
-            os.write(descriptor, (json.dumps(payload, sort_keys=True) + "\n").encode())
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        stream.seek(0)
+        stream.truncate()
+        stream.write(json.dumps(payload, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        self._stream = stream
         self._owned = True
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         if not self._owned:
             return
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return
-        if payload.get("token") == self.token:
-            self.path.unlink()
+        assert self._stream is not None
+        fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+        self._stream.close()
+        self._stream = None
         self._owned = False
 
 

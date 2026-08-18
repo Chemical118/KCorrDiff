@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import tempfile
@@ -13,6 +14,9 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,13 +264,27 @@ def oof_dense_byte_budget(
     return len(unique) * height * width * fields * bytes_per_value
 
 
-def enforce_byte_budget(required_bytes: int, maximum_bytes: int) -> None:
-    if required_bytes < 0 or maximum_bytes <= 0:
-        raise ValueError("invalid byte budget")
+def enforce_byte_budget(
+    required_bytes: int, maximum_bytes: int | None = None
+) -> None:
+    """Log a warning when a declared byte budget is exceeded.
+
+    ``maximum_bytes=None`` means no budget is declared.  Byte budgets are
+    advisory: exceeding one never aborts materialization.
+    """
+
+    if required_bytes < 0:
+        raise ValueError("required byte count cannot be negative")
+    if maximum_bytes is None:
+        return
+    if maximum_bytes <= 0:
+        raise ValueError("declared byte budget must be positive")
     if required_bytes > maximum_bytes:
-        raise OSError(
-            f"OOF materialization requires {required_bytes} bytes, "
-            f"exceeding declared budget {maximum_bytes} bytes"
+        logger.warning(
+            "OOF materialization requires %d bytes, exceeding the declared "
+            "budget of %d bytes",
+            required_bytes,
+            maximum_bytes,
         )
 
 

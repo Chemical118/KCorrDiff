@@ -261,9 +261,9 @@ def test_missing_era_is_finite_and_cannot_contribute() -> None:
     assert torch.count_nonzero(output.era_l4_contribution) == 0
 
 
-def test_production_model_rejects_width_fallback() -> None:
-    with pytest.raises(ValueError, match="fallback"):
-        RegressionUNet(target_widths=TARGET, context_widths=CONTEXT)
+def test_model_accepts_configured_widths() -> None:
+    model = RegressionUNet(target_widths=TARGET, context_widths=CONTEXT)
+    assert model.target_widths == TARGET
 
 
 @pytest.mark.parametrize("statistic", ["mean", "q50"])

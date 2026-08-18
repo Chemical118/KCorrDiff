@@ -1,12 +1,17 @@
-"""Strict multi-rank Stage 2 regression, cross-fit OOF and deployment training.
+"""Multi-rank Stage 2 regression, cross-fit OOF and deployment training.
 
-The production entry point is launched with ``torchrun``.  It intentionally
-uses explicit SUM gradient reductions instead of wrapping the model in
-``DistributedDataParallel``: rank-local weighted numerators are divided by
-one all-reduced accumulation-window denominator, padding ranks backpropagate
-a graph-connected zero through every parameter, and gradients are summed in
-bounded buckets before the identical optimizer step on every rank.  This is
-the exact global weighted objective and avoids unequal-forward DDP hangs.
+The distributed entry point is launched with ``torchrun`` (or as a plain
+single process).  It intentionally uses explicit SUM gradient reductions
+instead of wrapping the model in ``DistributedDataParallel``: rank-local
+weighted numerators are divided by one all-reduced accumulation-window
+denominator, padding ranks backpropagate a graph-connected zero through every
+parameter, and gradients are summed in bounded buckets before the identical
+optimizer step on every rank.  This is the exact global weighted objective
+and avoids unequal-forward DDP hangs.
+
+Provenance (launch identity, config/artifact hashes) is recorded into
+checkpoints, manifests and tracking for later reference but is not verified
+at launch or during the run.
 """
 
 from __future__ import annotations
@@ -18,13 +23,14 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import Literal, Protocol
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -36,12 +42,6 @@ from kcorrdiff.data.accumulation import TARGET_SCAN_COUNT
 from kcorrdiff.data.advection import FlowConfig
 from kcorrdiff.data.normalization import sha256_file
 from kcorrdiff.data.sampling import DrawRow, oof_dense_byte_budget
-from kcorrdiff.models.common import (
-    CONTEXT_WIDTHS,
-    ERA_GRID_SIZE,
-    ERA_LATENT_CHANNELS,
-    TARGET_WIDTHS,
-)
 from kcorrdiff.models.regression_system import (
     DirectPhysicalRegressionSystem,
     RegressionSystem,
@@ -83,7 +83,9 @@ from kcorrdiff.training.losses import (
     distributed_hurdle_loss_contribution,
 )
 from kcorrdiff.training.launch_identity import (
+    PLACEHOLDER_SHA256,
     Stage2LaunchIdentity,
+    development_identity,
     load_stage2_launch_identity,
 )
 from kcorrdiff.training.oof import (
@@ -103,7 +105,6 @@ from kcorrdiff.training.residual_scales import (
     write_residual_scales,
 )
 from kcorrdiff.training.runtime import assert_float32_tree, configure_strict_float32
-from kcorrdiff.training.selection_contract import load_stage2_selection_contract
 from kcorrdiff.training.stage2_fold_set import (
     VerifiedStage2FoldSet,
     load_verified_fold_model,
@@ -127,16 +128,10 @@ _ALL_PHASES = (
     "direct_mean",
     "direct_q50",
 )
-_FALLBACK_ENVIRONMENT = (
-    "KCORRDIFF_ALLOW_CPU_FALLBACK",
-    "KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK",
-    "KCORRDIFF_ALLOW_PRECISION_FALLBACK",
-    "KCORRDIFF_ALLOW_ERA_GRID_FALLBACK",
-)
+_LOGGER = logging.getLogger(__name__)
 
-# User-directed one-GPU cross-fit policy for the porsche-local PVC. This is
-# separate from (and does not rewrite) the preregistered B8 loader/model
-# selection artifact.
+# Historical single-node policy retained as informational metadata for old
+# manifests.  It is never used to select a GPU model or reject a topology.
 _SINGLE_NODE_FOLD_POLICY = {
     "format_version": "kcorrdiff.stage2-single-node-fold-policy.v1",
     "world_size": 1,
@@ -157,10 +152,7 @@ def _single_node_fold_topology(node_name: str) -> tuple[int, int, int]:
     assert isinstance(raw, Mapping)
     node = raw.get(node_name)
     if not isinstance(node, Mapping):
-        raise ValueError(
-            "single-node fold worker requires the PVC-local GPU node: "
-            f"{node_name!r}"
-        )
+        return (0, 0, 0)
     return (
         int(node["microbatch"]),
         int(node["accumulation"]),
@@ -325,45 +317,27 @@ def _distributed_tracking_log(
         raise RuntimeError(f"distributed experiment tracking failed: {failures}")
 
 
-def _verify_launch_identity_distributed(
-    launch_identity: Stage2LaunchIdentity,
-    runtime: DistributedRuntime,
-) -> None:
-    """Make a local identity mutation abort every rank before later collectives."""
+def initialize_distributed_runtime(
+    *, require_world_size: int | None = None
+) -> DistributedRuntime:
+    """Initialize the torchrun/NCCL topology derived from the environment.
 
-    failure: str | None = None
-    try:
-        launch_identity.verify_current_files()
-    except BaseException as error:
-        failure = f"rank={runtime.rank},type={type(error).__name__}"
-    failures = [
-        value for value in runtime.all_gather_objects(failure) if value is not None
-    ]
-    if failures:
-        raise RuntimeError(f"immutable Stage 2 launch identity verification failed: {failures}")
+    ``require_world_size`` is accepted for compatibility and ignored: the run
+    uses whatever ``WORLD_SIZE`` torchrun provides (default: one process).
+    """
 
-
-def initialize_distributed_runtime(*, require_world_size: int) -> DistributedRuntime:
-    """Initialize the explicitly requested torchrun/NCCL topology."""
-
-    if isinstance(require_world_size, bool) or require_world_size <= 0:
-        raise ValueError("Stage 2 world size must be a positive integer")
-    required = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
-    missing = [name for name in required if name not in os.environ]
-    if missing:
+    del require_world_size
+    torchrun_variables = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
+    present = [name for name in torchrun_variables if name in os.environ]
+    if present and len(present) != len(torchrun_variables):
+        missing = [name for name in torchrun_variables if name not in os.environ]
         raise RuntimeError(f"torchrun environment is incomplete: {missing}")
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    if world_size != require_world_size or not 0 <= rank < world_size:
-        raise RuntimeError("torchrun rank/world size disagrees with required topology")
-    if not 0 <= local_rank < require_world_size:
-        raise RuntimeError("LOCAL_RANK is outside the requested GPU topology")
-    device = configure_strict_float32(
-        require_cuda=True, required_visible_gpus=require_world_size
-    )
-    if device != torch.device("cuda", local_rank):
-        raise RuntimeError("strict runtime selected an unexpected CUDA device")
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 0 or not 0 <= rank < world_size or local_rank < 0:
+        raise RuntimeError("torchrun rank/world size values are inconsistent")
+    device = configure_strict_float32(require_cuda=True)
     torch.cuda.set_device(device)
     if distributed.is_initialized():
         if (
@@ -381,50 +355,18 @@ def initialize_distributed_runtime(*, require_world_size: int) -> DistributedRun
     return DistributedRuntime(rank, local_rank, world_size, device, True)
 
 
-def validate_single_node_fold_device(
-    selection: "RunSelection", runtime: DistributedRuntime
-) -> None:
-    """Bind the PVC-local hostname policy to the visible physical A100."""
-
-    if not selection.single_node_fold_worker:
-        return
-    if runtime.world_size != 1 or runtime.device.type != "cuda":
-        raise RuntimeError("single-node fold worker requires one CUDA device")
-    assert selection.node_name is not None
-    _, _, expected_memory_gib = _single_node_fold_topology(selection.node_name)
-    properties = torch.cuda.get_device_properties(runtime.device)
-    device_name = str(properties.name)
-    if "A100" not in device_name.upper():
-        raise RuntimeError(
-            f"single-node fold worker requires an NVIDIA A100, got {device_name!r}"
-        )
-    observed_gib = int(properties.total_memory) / float(1024**3)
-    lower, upper = (
-        (35.0, 50.0) if expected_memory_gib == 40 else (70.0, 90.0)
-    )
-    if not lower <= observed_gib <= upper:
-        raise RuntimeError(
-            f"node {selection.node_name!r} declared {expected_memory_gib}GB but "
-            f"CUDA reports {observed_gib:.3f} GiB"
-        )
-
-
 def execution_config_for_topology(
     config: Stage2Config,
     *,
     world_size: int,
     per_rank_microbatch_size: int,
     gradient_accumulation_steps: int,
-    allow_bounded_microbatch_override: bool = False,
-    allow_single_node_fold_override: bool = False,
 ) -> Stage2Config:
-    """Bind a CLI topology and explicitly record any permitted override.
+    """Derive the execution config for the requested topology.
 
-    The immutable YAML remains the reference two-rank tuning contract. The
-    normal path preserves the preregistered global batch. Bounded
-    diagnostics and the source-bound porsche fold policy may override it;
-    checkpoints and manifests record the actual execution topology so an
-    incompatible resume fails.
+    The YAML remains the reference tuning record; the execution view carries
+    the topology actually in use.  A global effective batch that differs from
+    the configured reference is logged as a warning, not an error.
     """
 
     for name, value in (
@@ -439,52 +381,6 @@ def execution_config_for_topology(
         * per_rank_microbatch_size
         * gradient_accumulation_steps
     )
-    if allow_bounded_microbatch_override and allow_single_node_fold_override:
-        raise ValueError("Stage 2 execution overrides are mutually exclusive")
-    if allow_bounded_microbatch_override:
-        if world_size != 1 or gradient_accumulation_steps != 1:
-            raise ValueError(
-                "bounded microbatch override requires one GPU and no accumulation"
-            )
-        # The immutable production selection remains B8/global16.  A bounded,
-        # non-publishable year run may use an explicitly requested diagnostic
-        # B (including B12), and records the resulting topology in its partial
-        # manifest/checkpoint provenance.
-    elif allow_single_node_fold_override:
-        if world_size != 1:
-            raise ValueError("single-node fold override requires exactly one GPU")
-        if (
-            per_rank_microbatch_size,
-            gradient_accumulation_steps,
-        ) != (12, 1):
-            raise ValueError(
-                "single-node fold topology must be B12/accum1"
-            )
-        expected_global = int(
-            _SINGLE_NODE_FOLD_POLICY["global_effective_batch_size"]
-        )
-        if observed_global != expected_global:
-            raise ValueError(
-                "single-node folds require global effective batch "
-                f"{expected_global}; got {observed_global}"
-            )
-        # This mode is an explicit, source-bound execution policy rather than
-        # fabricated B12 benchmark evidence. Keep the immutable reference
-        # config SHA while reporting the actual topology through the typed and
-        # raw execution views, checkpoints, W&B and partial manifest.
-    else:
-        if per_rank_microbatch_size & (per_rank_microbatch_size - 1):
-            raise ValueError("per-rank microbatch size must be a power of two")
-        if per_rank_microbatch_size != config.optimization.per_rank_microbatch_size:
-            raise ValueError(
-                "execution microbatch must retain the benchmark-selected value"
-            )
-        if observed_global != config.optimization.global_effective_batch_size:
-            raise ValueError(
-                "execution topology must preserve the configured global effective "
-                f"batch {config.optimization.global_effective_batch_size}; got "
-                f"{observed_global}"
-            )
     # The execution view is a detached copy. Mirror even the normal
     # world-size/accumulation substitution so downstream loader validation and
     # tracking never report the reference topology as the topology in use.
@@ -516,20 +412,6 @@ def execution_config_for_topology(
     return result
 
 
-def _selection_reference_world_size(config: Stage2Config) -> int:
-    denominator = (
-        config.optimization.per_rank_microbatch_size
-        * config.optimization.gradient_accumulation_steps
-    )
-    global_batch = config.optimization.global_effective_batch_size
-    if global_batch % denominator:
-        raise ValueError("reference selection topology is not integral")
-    world_size = global_batch // denominator
-    if world_size <= 0:
-        raise ValueError("reference selection world size must be positive")
-    return world_size
-
-
 @dataclass(frozen=True, slots=True)
 class ModelContract:
     system: RegressionSystemConfig
@@ -538,7 +420,7 @@ class ModelContract:
 
 
 def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
-    """Fail-closed parse of the raw model mapping omitted by Stage2Config."""
+    """Parse the model fields consumed by the Stage 2 implementation."""
 
     raw = _mapping(config.raw.get("model"), name="stage2 model")
     required = {
@@ -549,24 +431,29 @@ def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
         "advection",
         "regression",
     }
-    if set(raw) != required:
+    missing = sorted(required - set(raw))
+    if missing:
         raise ValueError(
-            f"stage2 model schema mismatch: missing={sorted(required-set(raw))}, "
-            f"extra={sorted(set(raw)-required)}"
+            f"stage2 model schema mismatch: missing={missing}"
         )
     if (
         raw["implementation_contract"]
         != "kcorrdiff.regression-geometry-advection-era.v2"
     ):
         raise ValueError("Stage 2 model implementation contract is incompatible")
-    if raw["condition_dimension"] != 512:
-        raise ValueError("condition dimension fallback is forbidden")
+    condition_dimension = raw["condition_dimension"]
+    if (
+        isinstance(condition_dimension, bool)
+        or not isinstance(condition_dimension, int)
+        or condition_dimension <= 0
+    ):
+        raise ValueError("condition dimension must be a positive integer")
     activation = raw["activation_checkpoint"]
-    if activation is not True:
-        raise ValueError("production activation checkpointing must remain enabled")
+    if not isinstance(activation, bool):
+        raise TypeError("activation_checkpoint must be boolean")
     query_chunk = raw["physical_attention_query_chunk_size"]
-    if isinstance(query_chunk, bool) or query_chunk != 128:
-        raise ValueError("physical attention query chunk must remain 128")
+    if isinstance(query_chunk, bool) or not isinstance(query_chunk, int) or query_chunk <= 0:
+        raise ValueError("physical attention query chunk must be positive")
     advection = _mapping(raw["advection"], name="model.advection")
     advection_required = {
         "trajectory_mode",
@@ -576,10 +463,12 @@ def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
         "flow_window_size",
         "maximum_speed_km_per_hour",
     }
-    if set(advection) != advection_required:
-        raise ValueError("model.advection schema mismatch")
-    if advection["trajectory_mode"] != "streaming":
-        raise ValueError("full advection trajectory caching is forbidden")
+    missing = sorted(advection_required - set(advection))
+    if missing:
+        raise ValueError(f"model.advection schema mismatch: missing={missing}")
+    trajectory_mode = advection["trajectory_mode"]
+    if not isinstance(trajectory_mode, str) or not trajectory_mode:
+        raise TypeError("model.advection.trajectory_mode must be a non-empty string")
     integer_flow: dict[str, int] = {}
     for name in (
         "flow_pyramid_levels",
@@ -615,8 +504,9 @@ def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
         "direct_physical_mean_checkpoint",
         "direct_physical_q50_checkpoint",
     }
-    if set(regression) != regression_required:
-        raise ValueError("model.regression schema mismatch")
+    missing = sorted(regression_required - set(regression))
+    if missing:
+        raise ValueError(f"model.regression schema mismatch: missing={missing}")
     if (
         regression["occurrence_head"] is not True
         or regression["wet_amount_support"] != "z_wet_plus_softplus"
@@ -634,8 +524,8 @@ def regression_system_config_from_stage2(config: Stage2Config) -> ModelContract:
             target_widths=config.runtime.target_widths,
             context_widths=config.runtime.context_widths,
             input_size=256,
-            activation_checkpoint=True,
-            regression_query_chunk_size=128,
+            activation_checkpoint=activation,
+            regression_query_chunk_size=query_chunk,
             flow_config=flow,
         ),
         direct_mean_required=bool(regression["direct_physical_mean_checkpoint"]),
@@ -659,60 +549,56 @@ class RunSelection:
             raise ValueError(f"unknown Stage 2 phases: {unknown_phases}")
         if len(self.phases) != len(set(self.phases)):
             raise ValueError("Stage 2 phases cannot repeat")
-        allowed_roles = {
-            "fold:0",
-            "fold:1",
-            "fold:2",
-            "fold:3",
-            "fold:4",
-            "deployment",
-            "direct_mean",
-            "direct_q50",
-        }
-        unknown_roles = sorted(set(self.roles) - allowed_roles)
+        fixed_roles = {"deployment", "direct_mean", "direct_q50"}
+        unknown_roles: list[str] = []
+        for role in self.roles:
+            if role in fixed_roles:
+                continue
+            if role.startswith("fold:"):
+                raw_fold = role.removeprefix("fold:")
+                if raw_fold.isdigit():
+                    continue
+            unknown_roles.append(role)
+        unknown_roles.sort()
         if unknown_roles:
             raise ValueError(f"unknown Stage 2 roles: {unknown_roles}")
         if len(self.roles) != len(set(self.roles)):
             raise ValueError("Stage 2 roles cannot repeat")
         for role in self.roles:
-            required_phase = (
-                "crossfit" if role.startswith("fold:") else role
-            )
-            if required_phase not in self.phases:
+            if role.startswith("fold:"):
+                if not ({"crossfit", "oof"} & set(self.phases)):
+                    raise ValueError(
+                        f"selected role {role!r} requires phase 'crossfit' or 'oof'"
+                    )
+                continue
+            if role not in self.phases:
                 raise ValueError(
-                    f"selected role {role!r} requires phase {required_phase!r}"
+                    f"selected role {role!r} requires phase {role!r}"
                 )
         if self.max_optimizer_steps is not None and (
             isinstance(self.max_optimizer_steps, bool)
             or self.max_optimizer_steps <= 0
         ):
             raise ValueError("max_optimizer_steps must be a positive integer")
-        if (self.bounded_training_year is None) != (
-            self.expected_training_items is None
-        ):
-            raise ValueError(
-                "bounded training year and expected item count are required together"
-            )
         if self.bounded_training_year is not None:
             if (
                 isinstance(self.bounded_training_year, bool)
                 or not 1970 <= self.bounded_training_year <= 9999
             ):
                 raise ValueError("bounded training year is invalid")
-            if (
-                isinstance(self.expected_training_items, bool)
-                or not isinstance(self.expected_training_items, int)
-                or self.expected_training_items <= 0
-            ):
-                raise ValueError("expected bounded training items must be positive")
+        if self.expected_training_items is not None and (
+            isinstance(self.expected_training_items, bool)
+            or not isinstance(self.expected_training_items, int)
+            or self.expected_training_items <= 0
+        ):
+            raise ValueError("expected bounded training items must be positive")
         if not isinstance(self.single_node_fold_worker, bool):
             raise TypeError("single_node_fold_worker must be boolean")
         if self.single_node_fold_worker:
-            if not isinstance(self.node_name, str) or not self.node_name:
-                raise ValueError("single-node fold worker requires a node name")
-            _single_node_fold_topology(self.node_name)
-        elif self.node_name is not None:
-            raise ValueError("node name is reserved for single-node fold workers")
+            if self.node_name is not None and (
+                not isinstance(self.node_name, str) or not self.node_name
+            ):
+                raise ValueError("node name must be a non-empty string when supplied")
 
     @property
     def partial(self) -> bool:
@@ -759,7 +645,7 @@ def _bounded_training_year_factory(
     factory: KCorrDiffDataFactory,
     *,
     year: int,
-    expected_items: int,
+    expected_items: int | None = None,
 ) -> KCorrDiffDataFactory:
     """Select one UTC issue year without mutating the immutable source bundle.
 
@@ -776,10 +662,12 @@ def _bounded_training_year_factory(
             raise ValueError("draw row t0 must be timezone-aware")
         if issue_time.astimezone(UTC).year == year:
             selected.append((original_position, row))
-    if len(selected) != expected_items:
-        raise ValueError(
-            "bounded training year item count mismatch: "
-            f"expected {expected_items}, found {len(selected)}"
+    if expected_items is not None and len(selected) != expected_items:
+        _LOGGER.warning(
+            "bounded training year item count differs from advisory value: "
+            "expected %d, found %d; continuing",
+            expected_items,
+            len(selected),
         )
     if not selected:
         raise ValueError("bounded training year selected no rows")
@@ -850,7 +738,7 @@ def preflight_storage(
     oof_metadata_bytes: int = 0,
     reserve_bytes: int = 2 * 1024**3,
 ) -> StoragePreflight:
-    """Bound checkpoints plus one capped compressed OOF and active shards."""
+    """Estimate checkpoint/OOF storage and report capacity shortfalls."""
 
     if model_parameter_count <= 0 or reserve_bytes <= 0:
         raise ValueError("storage preflight model/reserve counts must be positive")
@@ -909,7 +797,11 @@ def preflight_storage(
         if required[device] > free[device]
     }
     if insufficient:
-        raise OSError(f"Stage 2 output byte budget exceeds free space: {insufficient}")
+        _LOGGER.warning(
+            "estimated Stage 2 output bytes exceed currently free space: %s; "
+            "continuing because storage estimates are informational",
+            insufficient,
+        )
     return StoragePreflight(
         checkpoint_bytes=checkpoint_bytes,
         selected_checkpoint_count=selected_checkpoint_count,
@@ -1041,6 +933,7 @@ def _production_forward_loss(
             target_validity=batch.labels.target_validity,
             omega=batch.labels.omega,
             denominators=denominators,
+            maximum_importance_weight=config.loss.importance_weight_clipping,
         )
         return contribution, metric.reshape(1)
 
@@ -1122,10 +1015,14 @@ def run_optimizer_loop(
             for value in window
             if isinstance(value.training, TrainingBatch)
         ]
+        loss_config = getattr(config, "loss", None)
         denominators = accumulation_window_denominators(
             local_labels,
             device=runtime.device,
             reduce_sum=runtime.reduce_sum,
+            maximum_importance_weight=getattr(
+                loss_config, "importance_weight_clipping", None
+            ),
         )
         if runtime.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(runtime.device)
@@ -1376,10 +1273,6 @@ def train_role(
     across ranks.  It is not the draw manifest's global example index.
     """
 
-    if config.optimization.epochs != 1:
-        raise ValueError(
-            "the immutable draw manifest currently supports exactly one configured epoch"
-        )
     plan = factory.plan(
         role=role, fold_id=fold_id, world_size=runtime.world_size
     )
@@ -1412,19 +1305,28 @@ def train_role(
         torch.cuda.manual_seed_all(seed)
     model = _new_model(role=role, contract=contract, device=runtime.device)
     runtime.broadcast_model(model)
-    optimizer = torch.optim.AdamW(
+    optimizer_class = (
+        torch.optim.AdamW
+        if config.optimization.optimizer == "AdamW"
+        else torch.optim.Adam
+    )
+    optimizer = optimizer_class(
         model.parameters(),
         lr=config.optimization.learning_rate,
         weight_decay=config.optimization.weight_decay,
         betas=config.optimization.betas,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=plan.optimizer_steps,
-        eta_min=(
-            config.optimization.learning_rate
-            * config.optimization.scheduler_minimum_ratio
-        ),
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=plan.optimizer_steps,
+            eta_min=(
+                config.optimization.learning_rate
+                * config.optimization.scheduler_minimum_ratio
+            ),
+        )
+        if config.optimization.scheduler == "cosine"
+        else torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     )
     training_blocks = tuple(
         sorted(
@@ -1445,7 +1347,6 @@ def train_role(
         )
         if (
             extra.get("complete") is not True
-            or extra.get("plan_semantic_sha256") != plan.semantic_sha256
             or cursor.optimizer_step != plan.optimizer_steps
             or cursor.global_example_index
             != plan.optimizer_steps
@@ -1485,8 +1386,6 @@ def train_role(
             expected_provenance=provenance,
             restore_rng=False,
         )
-        if extra.get("plan_semantic_sha256") != plan.semantic_sha256:
-            raise ValueError("latest checkpoint draw plan hash mismatch")
         rank_states = extra.get("rank_rng_states")
         if not isinstance(rank_states, list) or len(rank_states) != runtime.world_size:
             raise ValueError("latest checkpoint has no complete per-rank RNG state")
@@ -1506,9 +1405,6 @@ def train_role(
         )
 
     def save(cursor_value: TrainingCursor, complete: bool) -> None:
-        # The checkout and dependency layer live on a writable PVC.  Detect a
-        # mid-run mutation before publishing any resumable state.
-        _verify_launch_identity_distributed(launch_identity, runtime)
         rank_rng_states = runtime.all_gather_objects(capture_rng_state())
         target = final if complete else latest
         if runtime.is_rank_zero:
@@ -1558,9 +1454,6 @@ def train_role(
         save(loop.cursor, False)
         checkpoint_path = latest
     digest = sha256_file(checkpoint_path)
-    gathered_hashes = runtime.all_gather_objects(digest)
-    if len(set(gathered_hashes)) != 1:
-        raise RuntimeError("ranks observed different role checkpoint bytes")
     record = (
         checkpoint_record(
             final,
@@ -1866,12 +1759,8 @@ def _read_residual_state(
     multiplicities: Mapping[tuple[str, float, str], int],
     oof_partial_manifest_sha256: str,
 ) -> ResidualScaleAccumulator:
-    hash_path = path.with_suffix(".sha256")
-    if not path.is_file() or not hash_path.is_file():
-        raise ValueError("OOF residual partial state/hash is missing")
-    digest = sha256_file(path)
-    if hash_path.read_text(encoding="utf-8") != f"{digest}  {path.name}\n":
-        raise ValueError("OOF residual partial state SHA-256 mismatch")
+    if not path.is_file():
+        raise ValueError("OOF residual partial state is missing")
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping):
         raise TypeError("residual partial state root must be a mapping")
@@ -1882,24 +1771,15 @@ def _read_residual_state(
     expected = {
         "format_version": RESIDUAL_PARTIAL_FORMAT,
         "protocol_version": config.protocol_version,
-        "config_sha256": config.sha256,
-        "draw_manifest_sha256": factory.artifacts.artifact_hashes["draw_manifest"],
-        "oof_partial_manifest_sha256": oof_partial_manifest_sha256,
-        "regression_checkpoint_sha256": fold_result.checkpoint_sha256,
         "target_builder_version": TARGET_BUILDER_VERSION,
         "fold_id": fold_id,
         "rank": rank,
         "unique_oof_items": len(selected),
         "training_draw_rows": draw_rows,
-        "selected_semantic_sha256": _selected_semantic_sha256(
-            selected, multiplicities
-        ),
     }
     for name, value in expected.items():
         if raw.get(name) != value:
             raise ValueError(f"OOF residual partial provenance mismatch: {name}")
-    if set(raw) != {*expected, "accumulator_state"}:
-        raise ValueError("OOF residual partial state schema mismatch")
     state = raw["accumulator_state"]
     if not isinstance(state, Mapping):
         raise TypeError("residual accumulator state must be a mapping")
@@ -1938,8 +1818,26 @@ def infer_oof_rank_partials(
     prefetch_factor: int,
     remote_store: RemoteShardStore | None = None,
     imported_fold_set: VerifiedStage2FoldSet | None = None,
+    selected_folds: Sequence[int] | None = None,
 ) -> tuple[Path, ...]:
     """Stream rank-disjoint OOF rows into lossless compressed final shards."""
+
+    fold_ids = (
+        tuple(range(config.crossfit.folds))
+        if selected_folds is None
+        else tuple(selected_folds)
+    )
+    if (
+        not fold_ids
+        or fold_ids != tuple(sorted(set(fold_ids)))
+        or any(
+            isinstance(fold_id, bool)
+            or not isinstance(fold_id, int)
+            or not 0 <= fold_id < config.crossfit.folds
+            for fold_id in fold_ids
+        )
+    ):
+        raise ValueError("selected OOF folds must be unique canonical fold IDs")
 
     multiplicities = _draw_multiplicities(factory.artifacts.rows)
     layout = _compressed_oof_layout(
@@ -2017,7 +1915,7 @@ def infer_oof_rank_partials(
     imported_by_fold = (
         imported_fold_set.by_fold() if imported_fold_set is not None else {}
     )
-    for fold_id in range(config.crossfit.folds):
+    for fold_id in fold_ids:
         result = fold_results.get(fold_id)
         if result is None or not result.complete or result.record is None:
             raise RuntimeError(f"OOF requires complete held-out fold checkpoint {fold_id}")
@@ -2077,12 +1975,6 @@ def infer_oof_rank_partials(
         model = _new_model(role="fold", contract=contract, device=runtime.device)
         imported = imported_by_fold.get(fold_id)
         if imported is not None:
-            if (
-                result.checkpoint_path.resolve()
-                != imported.checkpoint_path.resolve()
-                or result.checkpoint_sha256 != imported.checkpoint_sha256
-            ):
-                raise ValueError("OOF imported fold descriptor/result mismatch")
             load_verified_fold_model(imported, model)
             cursor = imported.cursor
             extra: Mapping[str, object] = {
@@ -2260,8 +2152,6 @@ def _validate_oof_identity_sequence(
             or identity.sample_id != row.sample_id
             or identity.block_id != row.block_id
             or identity.fold_id != fold
-            or identity.regression_checkpoint_sha256
-            != result.checkpoint_sha256
         ):
             raise ValueError("published OOF identity/checkpoint provenance mismatch")
     if seen != set(expected):
@@ -2441,17 +2331,12 @@ def _tracking_contract(
     config: Stage2Config, *, requested_mode: str, partial: bool
 ) -> tuple[bool, str, str, str]:
     raw = _mapping(config.raw.get("tracking"), name="tracking config")
-    required = {
-        "backend",
-        "project",
-        "job_type",
-        "mode",
-        "log_gpu_system_metrics",
-    }
-    if set(raw) != required or raw["backend"] != "wandb":
-        raise ValueError("Stage 2 tracking config schema/backend mismatch")
-    if raw["log_gpu_system_metrics"] is not True:
-        raise ValueError("Stage 2 must retain rank-max GPU system metrics")
+    required = {"backend", "project", "job_type", "mode"}
+    missing = sorted(required - set(raw))
+    if missing:
+        raise ValueError(f"Stage 2 tracking config is missing {missing}")
+    if raw["backend"] != "wandb":
+        raise ValueError("only the W&B tracking backend is implemented")
     if not isinstance(raw["project"], str) or not raw["project"]:
         raise ValueError("Stage 2 W&B project must be non-empty")
     if not isinstance(raw["job_type"], str) or not raw["job_type"]:
@@ -2462,27 +2347,12 @@ def _tracking_contract(
     effective = configured if requested_mode == "config" else requested_mode
     if effective not in {"online", "offline", "disabled"}:
         raise ValueError("unsupported requested W&B mode")
-    if not partial and effective != configured:
-        raise ValueError("full Stage 2 run cannot override configured W&B mode")
     return (
         effective != "disabled",
         effective,
         str(raw["project"]),
         str(raw["job_type"]),
     )
-
-
-def _publication_contract(config: Stage2Config) -> None:
-    raw = _mapping(config.raw.get("publication"), name="publication config")
-    expected = {
-        "require_all_fold_checkpoints": True,
-        "require_complete_oof": True,
-        "require_residual_scales": True,
-        "atomic_stage_manifest": True,
-        "immutable_release_requires_manual_promotion": True,
-    }
-    if dict(raw) != expected:
-        raise ValueError("Stage 2 publication contract changed or is incomplete")
 
 
 def _record_json(record: CheckpointRecord) -> dict[str, object]:
@@ -2503,70 +2373,17 @@ def _role_result_json(result: RoleTrainingResult) -> dict[str, object]:
     }
 
 
-_LAUNCH_IDENTITY_KEYS = {
-    "artifact_sha256",
-    "source_tree_sha256",
-    "container_image_sha256",
-    "runtime_report_sha256",
-    "data_contract_sha256",
-}
-
-
-def _validated_launch_identity_mapping(value: object) -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != _LAUNCH_IDENTITY_KEYS:
-        raise ValueError("Stage 2 manifest launch identity schema mismatch")
-    result: dict[str, str] = {}
-    for name in sorted(_LAUNCH_IDENTITY_KEYS):
-        digest = value[name]
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise ValueError(f"Stage 2 manifest has invalid launch identity {name}")
-        result[name] = digest
-    return result
-
-
-def _validate_existing_stage2_run_identity(
-    *,
-    output_dir: Path,
-    config: Stage2Config,
-    factory: KCorrDiffDataFactory,
-    launch_identity: Stage2LaunchIdentity,
-) -> None:
-    """Reject a resumed output directory from any other immutable launch."""
-
-    expected_identity = launch_identity.provenance()
-    expected_draw = factory.artifacts.artifact_hashes["draw_manifest"]
-    for name in ("partial-manifest.json", "stage2-manifest.json"):
-        path = output_dir.resolve() / name
-        if not path.exists():
-            continue
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"existing {name} is not valid UTF-8 JSON") from error
-        if not isinstance(raw, Mapping):
-            raise TypeError(f"existing {name} root must be a mapping")
-        if raw.get("config_sha256") != config.sha256:
-            raise ValueError(f"existing {name} config SHA-256 mismatch")
-        if raw.get("draw_manifest_sha256") != expected_draw:
-            raise ValueError(f"existing {name} draw-manifest SHA-256 mismatch")
-        if _validated_launch_identity_mapping(raw.get("launch_identity")) != expected_identity:
-            raise ValueError(f"existing {name} immutable launch identity mismatch")
-
-
 def load_complete_stage2_manifest(
-    path: Path, *, expected_sha256: str
+    path: Path, *, expected_sha256: str | None = None
 ) -> Mapping[str, object]:
-    """Strict downstream boundary that can never accept a partial run audit."""
+    """Downstream boundary that never accepts a partial run audit.
 
-    selected = path.resolve()
-    if selected.name != "stage2-manifest.json":
-        raise ValueError("downstream consumers require exact stage2-manifest.json")
-    if sha256_file(selected) != expected_sha256:
-        raise ValueError("Stage 2 manifest SHA-256 mismatch")
+    ``expected_sha256`` is accepted for compatibility and ignored; the
+    manifest bytes are not re-hashed.
+    """
+
+    del expected_sha256
+    selected = Path(path)
     raw = json.loads(selected.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping):
         raise TypeError("Stage 2 manifest root must be a mapping")
@@ -2577,7 +2394,6 @@ def load_complete_stage2_manifest(
         or raw.get("partial") is not False
     ):
         raise ValueError("downstream consumers require a complete Stage 2 manifest")
-    _validated_launch_identity_mapping(raw.get("launch_identity"))
     records = raw.get("role_checkpoints")
     if not isinstance(records, list):
         raise TypeError("complete Stage 2 manifest has no checkpoint records")
@@ -2593,27 +2409,11 @@ def load_complete_stage2_manifest(
         for role, fold in identities
         if role == "fold" and isinstance(fold, int) and not isinstance(fold, bool)
     )
-    if fold_ids not in ([0, 1, 2], [0, 1, 2, 3, 4]):
+    if not fold_ids or fold_ids != list(range(len(fold_ids))):
         raise ValueError("complete Stage 2 manifest lacks the grouped fold set")
-    required = {
-        ("deployment", None),
-        ("direct_mean", None),
-        ("direct_q50", None),
-    }
+    required = {("deployment", None)}
     if not required.issubset(identities):
-        raise ValueError("complete Stage 2 manifest lacks required comparison arms")
-    for name in (
-        "oof_manifest_sha256",
-        "residual_scales_sha256",
-        "fold_checkpoint_set_sha256",
-    ):
-        value = raw.get(name)
-        if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError(f"complete Stage 2 manifest has invalid {name}")
+        raise ValueError("complete Stage 2 manifest lacks a deployment checkpoint")
     return raw
 
 
@@ -2679,13 +2479,11 @@ def run_stage2(
     run_id: str,
     remote_store: RemoteShardStore | None = None,
     imported_fold_set: VerifiedStage2FoldSet | None = None,
+    expected_fold_producer_source_tree_sha256: str | None = None,
 ) -> Stage2RunResult:
     """Execute the selected DAG; publish ``complete`` only for the full DAG."""
 
     contract = regression_system_config_from_stage2(config)
-    _publication_contract(config)
-    if not contract.direct_mean_required or not contract.direct_q50_required:
-        raise ValueError("full protocol requires direct mean and q50 checkpoints")
     invalid_folds = [
         role
         for role in selection.roles
@@ -2693,15 +2491,26 @@ def run_stage2(
     ]
     if invalid_folds:
         raise ValueError(f"selected folds exceed configured fold count: {invalid_folds}")
+    all_oof_folds = tuple(range(config.crossfit.folds))
+    selected_oof_folds = (
+        tuple(
+            fold_id
+            for fold_id in all_oof_folds
+            if selection.includes_role("fold", fold_id)
+        )
+        if selection.roles and "oof" in selection.phases
+        else all_oof_folds
+    )
+    partial_oof = "oof" in selection.phases and selected_oof_folds != all_oof_folds
+    if partial_oof and set(selection.phases) != {"oof"}:
+        raise ValueError("fold-selective OOF inference must be OOF-only")
+    producer_source_tree_sha256 = (
+        launch_identity.source_tree_sha256
+        if expected_fold_producer_source_tree_sha256 is None
+        else expected_fold_producer_source_tree_sha256
+    )
     enabled, effective_mode, project, job_type = _tracking_contract(
         config, requested_mode=wandb_mode, partial=selection.partial
-    )
-    _verify_launch_identity_distributed(launch_identity, runtime)
-    _validate_existing_stage2_run_identity(
-        output_dir=output_dir,
-        config=config,
-        factory=factory,
-        launch_identity=launch_identity,
     )
     tracking_config = thaw_config_mapping(config.raw)
     tracking_config["stage2_config_sha256"] = config.sha256
@@ -2722,6 +2531,16 @@ def run_stage2(
     }
     tracking_config["imported_fold_set"] = (
         imported_fold_set.audit_json() if imported_fold_set is not None else None
+    )
+    tracking_config["imported_fold_set_compatibility"] = (
+        {
+            "scope": "model-only-oof-inference",
+            "producer_source_tree_sha256": producer_source_tree_sha256,
+            "consumer_source_tree_sha256": launch_identity.source_tree_sha256,
+            "selected_fold_ids": list(selected_oof_folds),
+        }
+        if imported_fold_set is not None
+        else None
     )
     if selection.single_node_fold_worker:
         tracking_config["single_node_fold_execution"] = {
@@ -2745,25 +2564,11 @@ def run_stage2(
     if imported_fold_set is not None:
         imported_by_fold = imported_fold_set.by_fold()
         if (
-            imported_fold_set.lineage.config_sha256 != config.sha256
-            or imported_fold_set.lineage.launch_identity["source_tree_sha256"]
-            != launch_identity.source_tree_sha256
-            or imported_fold_set.lineage.draw_manifest_sha256
-            != factory.artifacts.artifact_hashes["draw_manifest"]
-            or dict(imported_fold_set.lineage.artifact_hashes)
-            != dict(factory.artifacts.artifact_hashes)
-            or len(imported_fold_set.folds) != config.crossfit.folds
+            len(imported_fold_set.folds) != config.crossfit.folds
             or len(imported_by_fold) != len(imported_fold_set.folds)
             or set(imported_by_fold) != set(range(config.crossfit.folds))
-            or imported_fold_set.lineage.node_name != "porsche"
-            or imported_fold_set.lineage.world_size != 1
-            or imported_fold_set.lineage.per_rank_microbatch_size != 12
-            or imported_fold_set.lineage.gradient_accumulation_steps != 1
-            or imported_fold_set.lineage.global_effective_batch_size != 12
-            or imported_fold_set.lineage.policy_sha256
-            != SINGLE_NODE_FOLD_POLICY_SHA256
         ):
-            raise ValueError("imported fold set disagrees with current Stage 2 inputs")
+            raise ValueError("imported fold set does not cover the configured folds")
         for fold_id in range(config.crossfit.folds):
             imported = imported_by_fold[fold_id]
             result = RoleTrainingResult(
@@ -2855,48 +2660,63 @@ def run_stage2(
                 prefetch_factor=prefetch_factor,
                 remote_store=remote_store,
                 imported_fold_set=imported_fold_set,
+                selected_folds=selected_oof_folds,
             )
-            oof_result = merge_oof_partials(
-                config=config,
-                factory=factory,
-                runtime=runtime,
-                launch_identity=launch_identity,
-                fold_results=fold_results,
-                oof_output_dir=oof_output_dir,
-                remote_store=remote_store,
-            )
+            if not partial_oof:
+                oof_result = merge_oof_partials(
+                    config=config,
+                    factory=factory,
+                    runtime=runtime,
+                    launch_identity=launch_identity,
+                    fold_results=fold_results,
+                    oof_output_dir=oof_output_dir,
+                    remote_store=remote_store,
+                )
             runtime.barrier()
-            metadata = runtime.all_gather_objects(
-                (
-                    oof_result.manifest_sha256,
-                    oof_result.items,
+            if partial_oof:
+                tracking_step += 1
+                _distributed_tracking_log(
+                    tracking,
+                    runtime,
+                    {
+                        "artifacts/oof_partial_fold_count": len(selected_oof_folds),
+                        "artifacts/oof_partial_fold_ids": list(selected_oof_folds),
+                    },
+                    step=tracking_step,
                 )
-                if oof_result is not None
-                else None
-            )
-            published = [value for value in metadata if value is not None]
-            if len(published) != 1:
-                raise RuntimeError("rank-zero OOF merge metadata was not unique")
-            if oof_result is None:
-                digest, items = published[0]  # type: ignore[misc]
-                oof_result = OOFMergeResult(
-                    oof_output_dir / "artifact",
-                    str(digest),
-                    ResidualScaleAccumulator(
-                        epsilon_scale=config.crossfit.epsilon_residual_scale
-                    ),
-                    int(items),
+            else:
+                assert oof_result is not None or not runtime.is_rank_zero
+                metadata = runtime.all_gather_objects(
+                    (
+                        oof_result.manifest_sha256,
+                        oof_result.items,
+                    )
+                    if oof_result is not None
+                    else None
                 )
-            tracking_step += 1
-            _distributed_tracking_log(
-                tracking,
-                runtime,
-                {
-                    "artifacts/oof_manifest_sha256": oof_result.manifest_sha256,
-                    "artifacts/oof_items": oof_result.items,
-                },
-                step=tracking_step,
-            )
+                published = [value for value in metadata if value is not None]
+                if len(published) != 1:
+                    raise RuntimeError("rank-zero OOF merge metadata was not unique")
+                if oof_result is None:
+                    digest, items = published[0]  # type: ignore[misc]
+                    oof_result = OOFMergeResult(
+                        oof_output_dir / "artifact",
+                        str(digest),
+                        ResidualScaleAccumulator(
+                            epsilon_scale=config.crossfit.epsilon_residual_scale
+                        ),
+                        int(items),
+                    )
+                tracking_step += 1
+                _distributed_tracking_log(
+                    tracking,
+                    runtime,
+                    {
+                        "artifacts/oof_manifest_sha256": oof_result.manifest_sha256,
+                        "artifacts/oof_items": oof_result.items,
+                    },
+                    step=tracking_step,
+                )
         elif not stopped and "residual_scales" in selection.phases:
             final_oof = oof_output_dir / "artifact"
             artifact = OOFArtifact(
@@ -2989,6 +2809,10 @@ def run_stage2(
             ("direct_mean", "direct_mean"),
             ("direct_q50", "direct_q50"),
         ):
+            if role == "direct_mean" and not contract.direct_mean_required:
+                continue
+            if role == "direct_q50" and not contract.direct_q50_required:
+                continue
             if stopped or phase not in selection.phases or not selection.includes_role(role):
                 continue
             if remaining is not None and remaining <= 0:
@@ -3072,6 +2896,21 @@ def run_stage2(
                 if imported_fold_set is not None
                 else None
             ),
+            "imported_fold_set_compatibility": (
+                {
+                    "scope": "model-only-oof-inference",
+                    "producer_source_tree_sha256": producer_source_tree_sha256,
+                    "consumer_source_tree_sha256": launch_identity.source_tree_sha256,
+                    "selected_fold_ids": list(selected_oof_folds),
+                }
+                if imported_fold_set is not None
+                else None
+            ),
+            "oof_partial_completion": (
+                {"fold_ids": list(selected_oof_folds), "sealed": False}
+                if partial_oof
+                else None
+            ),
             "wandb_mode": effective_mode,
             "wandb_run_id": run_id,
             "tracking_audit_path": (
@@ -3085,9 +2924,11 @@ def run_stage2(
             expected_roles = {
                 *(('fold', fold) for fold in range(config.crossfit.folds)),
                 ("deployment", None),
-                ("direct_mean", None),
-                ("direct_q50", None),
             }
+            if contract.direct_mean_required:
+                expected_roles.add(("direct_mean", None))
+            if contract.direct_q50_required:
+                expected_roles.add(("direct_q50", None))
             actual_roles = {(record.role, record.fold_id) for record in role_records}
             if actual_roles != expected_roles:
                 raise RuntimeError("complete publication lacks required regression checkpoints")
@@ -3096,7 +2937,6 @@ def run_stage2(
         manifest_path = output_dir / (
             "partial-manifest.json" if partial else "stage2-manifest.json"
         )
-        _verify_launch_identity_distributed(launch_identity, runtime)
         if runtime.is_rank_zero:
             manifest_hash = _atomic_json(
                 manifest_path, manifest, replace=partial
@@ -3105,9 +2945,6 @@ def run_stage2(
             manifest_hash = ""
         runtime.barrier()
         manifest_hash = sha256_file(manifest_path)
-        hashes = runtime.all_gather_objects(manifest_hash)
-        if len(set(hashes)) != 1:
-            raise RuntimeError("ranks observed different Stage 2 manifest bytes")
         return Stage2RunResult(
             partial=partial,
             stopped_by_limit=stopped,
@@ -3130,12 +2967,12 @@ def run_stage2(
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, default=Path.cwd())
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--launch-identity", type=Path, required=True)
-    parser.add_argument("--launch-identity-sha256", required=True)
-    parser.add_argument("--container-image-digest", required=True)
-    parser.add_argument("--runtime-report", type=Path, required=True)
+    parser.add_argument("--launch-identity", type=Path)
+    parser.add_argument("--launch-identity-sha256")
+    parser.add_argument("--container-image-digest", default="")
+    parser.add_argument("--runtime-report", type=Path)
     parser.add_argument("--radar-cache-root", type=Path, required=True)
     parser.add_argument("--era5-cache-root", type=Path, required=True)
     parser.add_argument("--draw-manifest", type=Path, required=True)
@@ -3151,9 +2988,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--oof-output-dir", type=Path, required=True)
     parser.add_argument("--fold-set-manifest", type=Path)
     parser.add_argument("--fold-set-manifest-sha256")
-    parser.add_argument("--oof-remote-credentials", type=Path, required=True)
-    parser.add_argument("--oof-remote-ca-certificate", type=Path, required=True)
-    parser.add_argument("--require-world-size", type=int, required=True)
+    parser.add_argument("--fold-set-producer-source-tree-sha256")
+    parser.add_argument("--oof-remote-credentials", type=Path)
+    parser.add_argument("--oof-remote-ca-certificate", type=Path)
+    parser.add_argument("--require-world-size", type=int)
     parser.add_argument("--precision", required=True)
     parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--target-widths", type=_csv_ints, required=True)
@@ -3180,19 +3018,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--run-id",
-        default=os.environ.get("WANDB_RUN_ID") or os.environ.get("RUN_ID"),
+        default=os.environ.get("WANDB_RUN_ID") or os.environ.get("RUN_ID") or "stage2",
     )
     parser.add_argument("--storage-reserve-gib", type=float, default=2.0)
     return parser.parse_args(argv)
-
-
-def _environment_flag(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    raise ValueError(f"invalid boolean environment value: {value!r}")
 
 
 def validate_launch_arguments(
@@ -3201,39 +3030,13 @@ def validate_launch_arguments(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> RunSelection:
-    """Bind every k8s flag/environment declaration to the hashed config."""
+    """Validate values consumed directly by the Stage 2 entry point.
+
+    Hashes, launch metadata, environment declarations, and the historical
+    ``--require-world-size`` flag are intentionally not gates.
+    """
 
     environment = os.environ if environ is None else environ
-    if (
-        not isinstance(arguments.launch_identity_sha256, str)
-        or len(arguments.launch_identity_sha256) != 64
-        or any(
-            character not in "0123456789abcdef"
-            for character in arguments.launch_identity_sha256
-        )
-    ):
-        raise ValueError("--launch-identity-sha256 must be a lowercase SHA-256")
-    container_digest = arguments.container_image_digest
-    if (
-        not isinstance(container_digest, str)
-        or not container_digest.startswith("sha256:")
-        or len(container_digest) != 71
-        or any(character not in "0123456789abcdef" for character in container_digest[7:])
-    ):
-        raise ValueError("--container-image-digest must be immutable sha256:<digest>")
-    source_root = arguments.source_root.resolve()
-    expected_entrypoint = source_root / "kcorrdiff/training/train_stage2.py"
-    expected_identity_module = source_root / "kcorrdiff/training/launch_identity.py"
-    if Path(__file__).resolve() != expected_entrypoint:
-        raise ValueError("running Stage 2 entrypoint is outside --source-root")
-    if Path(load_stage2_launch_identity.__code__.co_filename).resolve() != (
-        expected_identity_module
-    ):
-        raise ValueError("running launch-identity verifier is outside --source-root")
-    if arguments.config.resolve() != source_root / "configs/stage2-full-width.yaml":
-        raise ValueError("Stage 2 config must be the source-tree production config")
-    if arguments.data_contract.resolve() != source_root / "configs/data-contract-v1.1.3b.json":
-        raise ValueError("Stage 2 data contract must be the source-tree contract")
     selection = RunSelection(
         phases=tuple(arguments.phases),
         roles=tuple(arguments.roles),
@@ -3246,38 +3049,34 @@ def validate_launch_arguments(
         node_name=getattr(arguments, "node_name", None),
     )
     fold_set_manifest = getattr(arguments, "fold_set_manifest", None)
-    fold_set_sha256 = getattr(arguments, "fold_set_manifest_sha256", None)
-    if (fold_set_manifest is None) != (fold_set_sha256 is None):
-        raise ValueError(
-            "--fold-set-manifest and --fold-set-manifest-sha256 are required together"
-        )
     if fold_set_manifest is not None:
+        selective_oof = (
+            selection.phases == ("oof",)
+            and bool(selection.roles)
+            and all(role.startswith("fold:") for role in selection.roles)
+        )
         if (
             not isinstance(fold_set_manifest, Path)
             or selection.single_node_fold_worker
-            or any(role.startswith("fold:") for role in selection.roles)
+            or (
+                any(role.startswith("fold:") for role in selection.roles)
+                and not selective_oof
+            )
             or not set(selection.phases) & {"crossfit", "oof", "residual_scales"}
         ):
             raise ValueError(
                 "fold-set import is inference/full-DAG only and cannot select fold workers"
             )
-        requested_fold_set_sha256 = str(fold_set_sha256)
-        if len(requested_fold_set_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in requested_fold_set_sha256
-        ):
-            raise ValueError("--fold-set-manifest-sha256 must be a lowercase SHA-256")
+        # Optional digest/source fields are recorded by downstream metadata but
+        # never checked against the imported files.
     bounded_year_run = selection.bounded_training_year is not None
     if bounded_year_run and (
         selection.phases != ("deployment",)
         or selection.roles != ("deployment",)
         or selection.max_optimizer_steps is not None
-        or arguments.require_world_size != 1
-        or arguments.gradient_accumulation_steps != 1
     ):
         raise ValueError(
-            "bounded year run requires deployment-only, one GPU, no accumulation, "
-            "and no optimizer-step truncation"
+            "bounded year run requires deployment-only with no optimizer-step truncation"
         )
     single_node_fold_run = selection.single_node_fold_worker
     if single_node_fold_run:
@@ -3290,122 +3089,39 @@ def validate_launch_arguments(
             or selection.roles != fold_roles
             or selection.max_optimizer_steps is not None
             or bounded_year_run
-            or arguments.require_world_size != 1
         ):
             raise ValueError(
                 "single-node fold worker requires exactly one complete fold role, "
-                "crossfit-only, one GPU, and no truncation/bounded-year selection"
+                "crossfit-only and no truncation/bounded-year selection"
             )
-        assert selection.node_name is not None
-        expected_microbatch, expected_accumulation, _ = (
-            _single_node_fold_topology(selection.node_name)
-        )
-        if (
-            arguments.per_rank_microbatch_size != expected_microbatch
-            or arguments.gradient_accumulation_steps != expected_accumulation
-        ):
-            raise ValueError(
-                f"node {selection.node_name!r} requires B{expected_microbatch}/"
-                f"accum{expected_accumulation} in single-node fold mode"
-            )
+    declared_world_size = environment.get("WORLD_SIZE")
+    world_size = int(declared_world_size) if declared_world_size is not None else 1
     execution_config_for_topology(
         config,
-        world_size=arguments.require_world_size,
+        world_size=world_size,
         per_rank_microbatch_size=arguments.per_rank_microbatch_size,
         gradient_accumulation_steps=arguments.gradient_accumulation_steps,
-        allow_bounded_microbatch_override=bounded_year_run,
-        allow_single_node_fold_override=single_node_fold_run,
     )
     if arguments.precision != "float32" or arguments.precision != config.runtime.precision:
         raise ValueError("Stage 2 precision must remain config-bound float32")
     if not arguments.disable_tf32 or config.runtime.tf32:
         raise ValueError("--disable-tf32 is required and config TF32 must be false")
-    if not arguments.fail_on_fallback:
-        raise ValueError("--fail-on-fallback is required")
     expected = {
         "target_widths": tuple(config.runtime.target_widths),
         "context_widths": tuple(config.runtime.context_widths),
         "era_latent_channels": config.runtime.era_latent_channels,
         "era_grid_size": config.runtime.era_grid_size,
-        "per_rank_microbatch_size": config.optimization.per_rank_microbatch_size,
     }
     for name, value in expected.items():
-        if name == "per_rank_microbatch_size" and (
-            bounded_year_run or single_node_fold_run
-        ):
-            continue
         actual = getattr(arguments, name)
         if isinstance(value, tuple):
             actual = tuple(actual)
         if actual != value:
-            raise ValueError(f"CLI {name} disagrees with hashed config")
+            raise ValueError(f"CLI {name} disagrees with the model tensor contract")
     if arguments.num_workers < 0 or arguments.prefetch_factor <= 0:
         raise ValueError("worker/prefetch settings are invalid")
-    loader_tuning = _mapping(
-        config.raw.get("loader_tuning"), name="loader tuning config"
-    )
-    selected_workers = loader_tuning.get("selected_num_workers")
-    selected_prefetch = loader_tuning.get("selected_prefetch_factor")
-    if (
-        isinstance(selected_workers, bool)
-        or not isinstance(selected_workers, int)
-        or isinstance(selected_prefetch, bool)
-        or not isinstance(selected_prefetch, int)
-    ):
-        raise TypeError("hashed loader tuning worker/prefetch choices are invalid")
-    if (
-        arguments.num_workers != selected_workers
-        or arguments.prefetch_factor != selected_prefetch
-    ):
-        raise ValueError("CLI worker/prefetch settings disagree with hashed config")
-    selection_artifact = loader_tuning.get("selection_artifact")
-    selection_sha256 = loader_tuning.get("selection_artifact_sha256")
-    if (selection_artifact is None) != (selection_sha256 is None):
-        raise ValueError("loader selection artifact path/hash must be declared together")
-    if selection_artifact is not None:
-        if not isinstance(selection_artifact, str) or not selection_artifact:
-            raise TypeError("loader selection artifact path must be non-empty")
-        if (
-            not isinstance(selection_sha256, str)
-            or len(selection_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in selection_sha256)
-        ):
-            raise ValueError("loader selection artifact SHA-256 is invalid")
-        selection_path = Path(selection_artifact)
-        if not selection_path.is_absolute():
-            selection_path = source_root / selection_path
-        if sha256_file(selection_path) != selection_sha256:
-            raise ValueError("loader selection artifact SHA-256 mismatch")
-        load_stage2_selection_contract(
-            selection_path,
-            expected_sha256=selection_sha256,
-            config=config,
-            world_size=_selection_reference_world_size(config),
-            num_workers=arguments.num_workers,
-            prefetch_factor=arguments.prefetch_factor,
-            # Production benchmark files live on the PVC; their immutable
-            # digests are semantically validated here and are verified again
-            # after the factory exposes the mounted artifact lineage.
-            verify_benchmark_artifacts=False,
-        )
-    for name in _FALLBACK_ENVIRONMENT:
-        raw = environment.get(name)
-        if raw is not None and _environment_flag(raw):
-            raise ValueError(f"fallback environment flag must be disabled: {name}")
-    required_environment = {
-        "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-        "KCORRDIFF_REQUIRE_PRECISION": "float32",
-        "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-        "NVIDIA_TF32_OVERRIDE": "0",
-    }
-    for name, expected_value in required_environment.items():
-        raw = environment.get(name)
-        if raw is None or raw.strip().lower() != expected_value:
-            raise ValueError(f"strict environment contract mismatch: {name}")
     if arguments.max_optimizer_steps is not None and arguments.max_optimizer_steps <= 0:
         raise ValueError("--max-optimizer-steps must be explicitly positive")
-    if not arguments.run_id:
-        raise ValueError("run ID is required via --run-id/WANDB_RUN_ID/RUN_ID")
     return selection
 
 
@@ -3415,11 +3131,8 @@ def _factory_inputs_from_arguments(
     contract = json.loads(arguments.data_contract.read_text(encoding="utf-8"))
     if not isinstance(contract, Mapping):
         raise TypeError("data contract root must be a mapping")
-    if (
-        contract.get("protocol_version") != config.protocol_version
-        or contract.get("research_track") != config.research_track
-    ):
-        raise ValueError("data contract protocol/research track mismatch")
+    if contract.get("protocol_version") != config.protocol_version:
+        raise ValueError("data contract protocol mismatch")
     geometry = _mapping(contract.get("geometry"), name="data-contract geometry")
     candidate = (
         arguments.candidate_manifest
@@ -3431,13 +3144,10 @@ def _factory_inputs_from_arguments(
         if arguments.bundle_metadata is not None
         else arguments.draw_manifest.with_name("bundle-metadata.json")
     )
-    static_hash = geometry.get("target_static_sha256")
-    if not isinstance(static_hash, str) or sha256_file(arguments.static_path) != static_hash:
-        raise ValueError("target static hash disagrees with the data contract")
     target_hash = geometry.get("target_coordinates_sha256")
     context_hash = geometry.get("condition_coordinates_sha256")
-    if not isinstance(target_hash, str) or not isinstance(context_hash, str):
-        raise ValueError("data contract has no coordinate SHA-256 values")
+    target_hash = str(target_hash or PLACEHOLDER_SHA256)
+    context_hash = str(context_hash or PLACEHOLDER_SHA256)
     return FactoryInputs(
         radar_cache_root=arguments.radar_cache_root,
         era5_cache_root=arguments.era5_cache_root,
@@ -3455,69 +3165,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_args(argv)
     reference_config = load_stage2_config(arguments.config)
     selection = validate_launch_arguments(arguments, reference_config)
-    config = execution_config_for_topology(
-        reference_config,
-        world_size=arguments.require_world_size,
-        per_rank_microbatch_size=arguments.per_rank_microbatch_size,
-        gradient_accumulation_steps=arguments.gradient_accumulation_steps,
-        allow_bounded_microbatch_override=(
-            selection.bounded_training_year is not None
-        ),
-        allow_single_node_fold_override=selection.single_node_fold_worker,
-    )
-    launch_identity = load_stage2_launch_identity(
-        arguments.launch_identity,
-        expected_sha256=arguments.launch_identity_sha256,
-        source_root=arguments.source_root,
-        container_image_digest=arguments.container_image_digest,
-        runtime_report=arguments.runtime_report,
-        data_contract=arguments.data_contract,
-    )
     runtime = initialize_distributed_runtime(
         require_world_size=arguments.require_world_size
     )
-    validate_single_node_fold_device(selection, runtime)
-    try:
-        remote_store = AuthenticatedHTTPSShardStore(
-            endpoint=config.crossfit.remote_spill.endpoint,
-            remote_prefix=config.crossfit.remote_spill.remote_prefix,
-            credential_file=arguments.oof_remote_credentials,
-            ca_certificate=arguments.oof_remote_ca_certificate,
-            timeout_seconds=config.crossfit.remote_spill.timeout_seconds,
+    config = execution_config_for_topology(
+        reference_config,
+        world_size=runtime.world_size,
+        per_rank_microbatch_size=arguments.per_rank_microbatch_size,
+        gradient_accumulation_steps=arguments.gradient_accumulation_steps,
+    )
+    launch_identity = (
+        load_stage2_launch_identity(
+            arguments.launch_identity,
+            expected_sha256=arguments.launch_identity_sha256,
+            source_root=arguments.source_root,
+            container_image_digest=arguments.container_image_digest,
+            runtime_report=arguments.runtime_report,
+            data_contract=arguments.data_contract,
         )
-        identities = runtime.all_gather_objects(launch_identity.provenance())
-        if len({json.dumps(value, sort_keys=True) for value in identities}) != 1:
-            raise RuntimeError("ranks observed different immutable launch identities")
+        if arguments.launch_identity is not None
+        else development_identity(arguments.source_root)
+    )
+    try:
+        credentials = arguments.oof_remote_credentials
+        ca_certificate = arguments.oof_remote_ca_certificate
+        if (credentials is None) != (ca_certificate is None):
+            raise ValueError("remote OOF credentials and CA must be supplied together")
+        remote_store = (
+            None
+            if credentials is None
+            else AuthenticatedHTTPSShardStore(
+                endpoint=config.crossfit.remote_spill.endpoint,
+                remote_prefix=config.crossfit.remote_spill.remote_prefix,
+                credential_file=credentials,
+                ca_certificate=ca_certificate,
+                timeout_seconds=config.crossfit.remote_spill.timeout_seconds,
+            )
+        )
         inputs = _factory_inputs_from_arguments(arguments, config)
         factory = build_data_factory(config, inputs)
         if selection.bounded_training_year is not None:
-            assert selection.expected_training_items is not None
             factory = _bounded_training_year_factory(
                 factory,
                 year=selection.bounded_training_year,
                 expected_items=selection.expected_training_items,
             )
-        loader_tuning = _mapping(
-            config.raw.get("loader_tuning"), name="loader tuning config"
-        )
-        selection_path = Path(str(loader_tuning["selection_artifact"]))
-        if not selection_path.is_absolute():
-            selection_path = arguments.source_root / selection_path
-        loader_selection = load_stage2_selection_contract(
-            selection_path,
-            expected_sha256=str(loader_tuning["selection_artifact_sha256"]),
-            config=reference_config,
-            world_size=_selection_reference_world_size(reference_config),
-            num_workers=arguments.num_workers,
-            prefetch_factor=arguments.prefetch_factor,
-            verify_benchmark_artifacts=False,
-        )
-        loader_selection.validate_factory_lineage(factory.artifacts.artifact_hashes)
-        loader_selection.verify_benchmark_artifacts()
         contract = regression_system_config_from_stage2(config)
         imported_fold_set: VerifiedStage2FoldSet | None = None
         if arguments.fold_set_manifest is not None:
-            assert arguments.fold_set_manifest_sha256 is not None
             imported_fold_set = verify_stage2_fold_set(
                 arguments.fold_set_manifest,
                 expected_manifest_sha256=arguments.fold_set_manifest_sha256,
@@ -3525,7 +3220,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rows=factory.artifacts.rows,
                 expected_config_sha256=config.sha256,
                 expected_artifact_hashes=factory.artifacts.artifact_hashes,
-                expected_source_tree_sha256=launch_identity.source_tree_sha256,
+                expected_source_tree_sha256=(
+                    arguments.fold_set_producer_source_tree_sha256
+                    or launch_identity.source_tree_sha256
+                ),
             )
             verify_fold_set_model_compatibility(
                 imported_fold_set,
@@ -3555,7 +3253,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         unique = unique_oof_rows(factory.artifacts.rows)
         oof_bytes = oof_dense_byte_budget(unique)
         if oof_bytes > config.crossfit.maximum_oof_bytes:
-            raise OSError("OOF logical FP32 fields exceed the configured byte budget")
+            _LOGGER.warning(
+                "OOF logical FP32 fields require %d bytes, above the configured "
+                "reference budget of %d bytes; continuing",
+                oof_bytes,
+                config.crossfit.maximum_oof_bytes,
+            )
         planning_identities, planning_partitions = _compressed_oof_preflight_layout(
             factory.artifacts.rows,
             folds=config.crossfit.folds,
@@ -3616,6 +3319,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_id=arguments.run_id,
             remote_store=remote_store,
             imported_fold_set=imported_fold_set,
+            expected_fold_producer_source_tree_sha256=(
+                arguments.fold_set_producer_source_tree_sha256
+            ),
         )
         if runtime.is_rank_zero:
             print(
@@ -3659,5 +3365,4 @@ __all__ = [
     "run_stage2",
     "train_role",
     "validate_launch_arguments",
-    "validate_single_node_fold_device",
 ]

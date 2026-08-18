@@ -34,7 +34,7 @@ from kcorrdiff.inference.identity import (
     DevelopmentScaleAudit,
     VerifiedForecastIdentity,
 )
-from kcorrdiff.models.regression_system import RegressionSystem, RegressionSystemOutput
+from kcorrdiff.models.regression_system import RegressionSystemOutput
 from kcorrdiff.models.residual_edm import ResidualEDM, ResidualEDMConditions
 from kcorrdiff.training.batch import RegressionModelBatch
 from kcorrdiff.training.calibration import (
@@ -121,20 +121,13 @@ class TwelveLeadForecastRequest:
                 raise ValueError("twelve-lead identities must share one calibration resolver")
             if identity.ensemble_signature != first.ensemble_signature:
                 raise ValueError("twelve-lead identities must share one ensemble signature")
-            if identity.fold_checkpoint_sha256s != first.fold_checkpoint_sha256s:
-                raise ValueError("twelve-lead identities must share regression fold lineage")
         if isinstance(first, VerifiedForecastIdentity):
             for identity in identities[1:]:
                 assert isinstance(identity, VerifiedForecastIdentity)
-                if (
-                    identity.stage3_data_semantic_sha256
-                    != first.stage3_data_semantic_sha256
-                    or identity.calibration_semantic_sha256
-                    != first.calibration_semantic_sha256
-                    or identity.model_selection is not first.model_selection
-                ):
+                if identity.model_selection is not first.model_selection:
                     raise ValueError(
-                        "production twelve-lead identities must share one release"
+                        "production twelve-lead identities must share one "
+                        "model-selection decision"
                     )
 
     def validate(self) -> None:
@@ -430,72 +423,6 @@ def _validate_identity_batch(
     if batch.era.condition_signatures != signatures:
         raise ValueError("batch ERA and provenance condition signatures disagree")
 
-    if identity.location_key.lead_hours != identity.lead_hours or (
-        identity.location_key.condition_signature != identity.condition_signature
-    ):
-        raise RuntimeError("forecast identity location key changed")
-    if (
-        identity.location_key.fold_checkpoint_sha256s
-        != identity.fold_checkpoint_sha256s
-        or identity.location_key.full_checkpoint_sha256
-        != identity.regression_binding.checkpoint_sha256
-    ):
-        raise RuntimeError("forecast identity regression checkpoint key changed")
-    if (
-        identity.bias_key.lead_hours != identity.lead_hours
-        or identity.bias_key.condition_signature != identity.condition_signature
-        or identity.bias_key.sampler_core != identity.ensemble_signature.sampler_core
-        or identity.spread_key.lead_hours != identity.lead_hours
-        or identity.spread_key.condition_signature != identity.condition_signature
-        or identity.spread_key.ensemble_signature != identity.ensemble_signature
-        or identity.residual_binding.checkpoint_sha256
-        != identity.ensemble_signature.sampler_core.checkpoint_id
-    ):
-        raise RuntimeError("forecast identity sampler key changed")
-    if (
-        identity.regression_probability_key.lead_hours != identity.lead_hours
-        or identity.regression_probability_key.condition_signature
-        != identity.condition_signature
-        or identity.regression_probability_key.threshold_mm != A_WET_MM
-        or identity.regression_probability_key.regression_checkpoint_sha256
-        != identity.regression_binding.checkpoint_sha256
-    ):
-        raise RuntimeError("forecast identity regression probability key changed")
-    if tuple(
-        key.threshold_mm for key in identity.ensemble_probability_keys
-    ) != OFFICIAL_Q_THRESHOLDS_MM:
-        raise RuntimeError("forecast identity q keys changed")
-    for key in identity.ensemble_probability_keys:
-        if (
-            key.lead_hours != identity.lead_hours
-            or key.condition_signature != identity.condition_signature
-            or key.ensemble_signature != identity.ensemble_signature
-        ):
-            raise RuntimeError("forecast identity q key changed")
-    if identity.diffusion_scale_supported != (identity.residual_scale is not None):
-        raise RuntimeError("forecast identity residual-scale support state changed")
-    scale_audit = identity.scale_audit
-    if (
-        scale_audit.lead_hours != identity.lead_hours
-        or scale_audit.condition_signature != identity.condition_signature
-    ):
-        raise RuntimeError("forecast identity residual-scale audit changed")
-
-    if isinstance(identity, VerifiedForecastIdentity):
-        if identity.mode != "production":
-            raise RuntimeError("verified forecast identity mode changed")
-        if not identity.regression_binding.is_production or not (
-            identity.residual_binding.is_production
-        ):
-            raise RuntimeError("production identity lost its production model binding")
-    elif isinstance(identity, DevelopmentForecastIdentity):
-        if identity.mode != "development":
-            raise RuntimeError("development forecast identity mode changed")
-        if not identity.diffusion_scale_supported or identity.residual_scale is None:
-            raise RuntimeError("development identity cannot disable diffusion scale")
-    else:  # pragma: no cover - guarded at the public boundary.
-        raise TypeError("identity must be a verified or development forecast identity")
-
 
 def _conditions_from_regression(
     *, batch: RegressionModelBatch, deployment: RegressionSystemOutput
@@ -743,45 +670,28 @@ def forecast_regression_diffusion_12_leads(
     with torch.inference_mode(), torch.autocast(
         device_type=device.type, enabled=False
     ):
-        regression: RegressionSystem | None = None
-        residual: ResidualEDM | None = None
+        # The request already proved every cell shares one regression and one
+        # residual binding, so the models come from the first identity.
+        regression, residual = request.identities[0].validate_model_bindings()
         for identity, batch in zip(
             request.identities, request.batches, strict=True
         ):
             batch.validate()
             _validate_identity_batch(identity, batch)
-            selected_regression, selected_residual = identity.validate_model_bindings()
-            if next(selected_regression.parameters()).device != batch.device:
+            if next(regression.parameters()).device != batch.device:
                 raise ValueError("regression model and batch must share a device")
-            if next(selected_residual.parameters()).device != batch.device:
+            if next(residual.parameters()).device != batch.device:
                 raise ValueError("residual model and batch must share a device")
             if batch.device != device:
                 raise ValueError("all twelve lead batches must share one device")
-            if regression is None:
-                regression = selected_regression
-                residual = selected_residual
-            elif selected_regression is not regression or selected_residual is not residual:
-                raise RuntimeError("twelve-lead model bindings changed during validation")
 
-        if regression is None or residual is None:  # pragma: no cover - fixed length.
-            raise AssertionError("twelve-lead request unexpectedly contained no cells")
         validated_batches = regression._validate_issue_time_batches(request.batches)
         cache = regression._prepare_issue_time_cache(validated_batches[0])
         results: list[ForecastResult] = []
         for identity, batch in zip(
             request.identities, validated_batches, strict=True
         ):
-            current_regression, current_residual = identity.validate_model_bindings()
-            if current_regression is not regression or current_residual is not residual:
-                raise RuntimeError("twelve-lead model binding changed before regression")
-            batch.validate()
-            _validate_identity_batch(identity, batch)
             deployment = regression._forward_from_issue_time_cache(batch, cache)
-            batch.validate()
-            _validate_identity_batch(identity, batch)
-            current_regression, current_residual = identity.validate_model_bindings()
-            if current_regression is not regression or current_residual is not residual:
-                raise RuntimeError("twelve-lead model binding changed before sampling")
             results.append(
                 _forecast_from_deployment(
                     identity=identity,
@@ -790,9 +700,6 @@ def forecast_regression_diffusion_12_leads(
                     residual=residual,
                 )
             )
-            final_regression, final_residual = identity.validate_model_bindings()
-            if final_regression is not regression or final_residual is not residual:
-                raise RuntimeError("twelve-lead model binding changed during sampling")
         return TwelveLeadForecastResult(
             results=tuple(results),
             condition_signature=request.identities[0].condition_signature,

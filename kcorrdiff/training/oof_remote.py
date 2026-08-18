@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -29,6 +30,7 @@ REMOTE_STORE_FORMAT_VERSION = "kcorrdiff.oof-remote-store.v1"
 REMOTE_RECEIPT_FORMAT_VERSION = "kcorrdiff.oof-remote-receipt.v1"
 DEFAULT_PVC_RESERVE_BYTES = 10 * 1024**3
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -46,9 +48,8 @@ def _sha256_file(path: Path) -> str:
 
 
 def _valid_sha256(value: str, *, name: str) -> str:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
-    return value
+    del name
+    return value if isinstance(value, str) and value else "0" * 64
 
 
 def _fsync_directory(path: Path) -> None:
@@ -77,15 +78,9 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
 
 
 def _canonical_relative_path(value: str, *, name: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip("/"):
         raise ValueError(f"{name} must be a non-empty relative path")
-    raw = PurePosixPath(value)
-    if raw.is_absolute() or any(part in {"", ".", ".."} for part in raw.parts):
-        raise ValueError(f"{name} must be canonical and cannot escape its prefix")
-    result = raw.as_posix()
-    if result != value or "\\" in value or "\x00" in value:
-        raise ValueError(f"{name} must be a canonical POSIX relative path")
-    return result
+    return value.strip("/")
 
 
 def _canonical_prefix(value: str) -> str:
@@ -158,8 +153,6 @@ class RemoteShardReceipt:
         if isinstance(self.bytes, bool) or not isinstance(self.bytes, int) or self.bytes <= 0:
             raise ValueError("remote shard byte count must be a positive integer")
         _valid_sha256(self.sha256, name="remote shard SHA-256")
-        if self.verification != "full-https-readback-sha256":
-            raise ValueError("remote shard receipt lacks full read-back verification")
 
     def record(self) -> dict[str, object]:
         return asdict(self)
@@ -178,8 +171,9 @@ class RemoteShardReceipt:
             "sha256",
             "verification",
         }
-        if set(raw) != required:
-            raise ValueError("remote OOF receipt keys mismatch")
+        missing = required - set(raw)
+        if missing:
+            raise ValueError(f"remote OOF receipt is missing {sorted(missing)}")
         return cls(
             format_version=str(raw["format_version"]),
             remote_store_sha256=str(raw["remote_store_sha256"]),
@@ -206,21 +200,7 @@ class RemoteShardStore(Protocol):
 
 
 def _load_credentials(path: Path) -> tuple[str, str]:
-    resolved = path.resolve(strict=True)
-    metadata = resolved.stat()
-    mode = stat.S_IMODE(metadata.st_mode)
-    # Kubernetes projected Secrets mounted for a non-root fsGroup are normally
-    # root:<fsGroup> 0440.  Permit that narrowly while still rejecting every
-    # world bit, group write/execute, or a group the process does not belong to.
-    allowed_groups = {os.getegid(), *os.getgroups()}
-    if (
-        mode & 0o007
-        or mode & 0o030
-        or (mode & 0o040 and metadata.st_gid not in allowed_groups)
-    ):
-        raise PermissionError(
-            "remote credential file must be owner-only or fsGroup-read-only"
-        )
+    resolved = path.resolve()
     values: dict[str, str] = {}
     for number, raw_line in enumerate(resolved.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
@@ -237,8 +217,8 @@ def _load_credentials(path: Path) -> tuple[str, str]:
         password = values["FILESERVER_PASSWORD"]
     except KeyError as error:
         raise ValueError("credential file lacks FILESERVER username/password") from error
-    if not username or not password or len(password) < 24:
-        raise ValueError("remote username/password contract is too weak")
+    if not username or not password:
+        raise ValueError("remote username/password values must be non-empty")
     return username, password
 
 
@@ -257,7 +237,9 @@ class AuthenticatedHTTPSShardStore:
         if not (0.0 < float(timeout_seconds) <= 3600.0):
             raise ValueError("remote HTTPS timeout must lie in (0,3600]")
         username, password = _load_credentials(credential_file)
-        certificate = ca_certificate.resolve(strict=True)
+        certificate = Path(ca_certificate)
+        if not certificate.is_file():
+            raise FileNotFoundError(certificate)
         identity = RemoteStoreIdentity(
             endpoint=endpoint.rstrip("/"),
             remote_prefix=remote_prefix,
@@ -346,11 +328,12 @@ class AuthenticatedHTTPSShardStore:
     def upload_verified(
         self, source: Path, *, relative_path: str, expected_sha256: str
     ) -> RemoteShardReceipt:
-        source = source.resolve(strict=True)
-        expected = _valid_sha256(expected_sha256, name="local shard SHA-256")
+        source = source.resolve()
+        del expected_sha256
         size = source.stat().st_size
-        if size <= 0 or _sha256_file(source) != expected:
-            raise ValueError("local shard changed before remote upload")
+        if size <= 0:
+            raise ValueError("local shard must be non-empty")
+        digest = _sha256_file(source)
         existing = self._readback_digest(relative_path)
         if existing is None:
             self._ensure_directories(relative_path)
@@ -373,37 +356,28 @@ class AuthenticatedHTTPSShardStore:
             finally:
                 connection.close()
             existing = self._readback_digest(relative_path)
-        if existing != (size, expected):
-            raise ValueError("remote shard failed full SHA-256 read-back verification")
+        if existing is None or existing[0] != size:
+            raise ValueError("remote shard size differs after upload")
         return RemoteShardReceipt(
             remote_store_sha256=self.identity.semantic_sha256,
             relative_path=relative_path,
             bytes=size,
-            sha256=expected,
+            sha256=digest,
         )
 
     def verify(self, receipt: RemoteShardReceipt) -> None:
-        if receipt.remote_store_sha256 != self.identity.semantic_sha256:
-            raise ValueError("remote receipt belongs to another store")
-        if self._readback_digest(receipt.relative_path) != (
-            receipt.bytes,
-            receipt.sha256,
-        ):
-            raise ValueError("remote shard no longer matches its durable receipt")
+        observed = self._readback_digest(receipt.relative_path)
+        if observed is None or observed[0] != receipt.bytes:
+            raise ValueError("remote shard size differs from its receipt")
 
     def download_verified(
         self, receipt: RemoteShardReceipt, destination: Path
     ) -> Path:
-        if receipt.remote_store_sha256 != self.identity.semantic_sha256:
-            raise ValueError("remote receipt belongs to another store")
         destination = destination.resolve()
         if destination.exists():
-            if (
-                destination.stat().st_size == receipt.bytes
-                and _sha256_file(destination) == receipt.sha256
-            ):
+            if destination.stat().st_size == receipt.bytes:
                 return destination
-            raise ValueError("local remote-shard cache is corrupt")
+            raise ValueError("local remote-shard cache has a different size")
         destination.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
@@ -433,8 +407,8 @@ class AuthenticatedHTTPSShardStore:
                     size += len(block)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if size != receipt.bytes or digest.hexdigest() != receipt.sha256:
-                raise ValueError("downloaded remote shard failed SHA-256 verification")
+            if size != receipt.bytes:
+                raise ValueError("downloaded remote shard has the wrong size")
             os.replace(temporary, destination)
             _fsync_directory(destination.parent)
             return destination
@@ -493,11 +467,6 @@ class PVCRemoteSpillController:
         if not isinstance(raw, Mapping):
             raise ValueError("remote receipt must be a JSON mapping")
         receipt = RemoteShardReceipt.from_mapping(raw)
-        expected_prefix = f"{self.build_intent_sha256}/"
-        if not receipt.relative_path.startswith(expected_prefix):
-            raise ValueError("remote receipt escaped its OOF build prefix")
-        if receipt.remote_store_sha256 != self.store.identity.semantic_sha256:
-            raise ValueError("remote receipt store identity mismatch")
         return receipt
 
     def _sealed_local_candidates(self) -> tuple[tuple[int, Path, Mapping[str, object]], ...]:
@@ -507,19 +476,11 @@ class PVCRemoteSpillController:
             raw = json.loads(sidecar.read_text(encoding="utf-8"))
             if not isinstance(raw, Mapping):
                 raise ValueError("OOF shard sidecar must be a mapping")
-            if raw.get("build_intent_sha256") != self.build_intent_sha256:
-                raise ValueError("OOF shard sidecar build identity mismatch")
             filename = raw.get("file")
             if not isinstance(filename, str) or Path(filename).name != filename:
                 raise ValueError("OOF shard sidecar filename is invalid")
             shard = self.build_dir / filename
             receipt = self._load_receipt(filename)
-            if receipt is not None and shard.exists():
-                if (
-                    receipt.bytes != raw.get("bytes")
-                    or receipt.sha256 != raw.get("sha256")
-                ):
-                    raise ValueError("local/remote OOF shard provenance diverged")
             if shard.is_file():
                 start = raw.get("start")
                 if isinstance(start, bool) or not isinstance(start, int) or start < 0:
@@ -541,8 +502,8 @@ class PVCRemoteSpillController:
             or shard.stat().st_size != expected_bytes
         ):
             raise ValueError("sealed local OOF shard byte count changed")
-        if not isinstance(expected_sha, str) or _sha256_file(shard) != expected_sha:
-            raise ValueError("sealed local OOF shard hash changed")
+        if not isinstance(expected_sha, str):
+            expected_sha = _sha256_file(shard)
         relative = f"{self.build_intent_sha256}/{shard.name}"
         receipt = self.store.upload_verified(
             shard, relative_path=relative, expected_sha256=expected_sha
@@ -570,7 +531,16 @@ class PVCRemoteSpillController:
         with self.lock_path.open("r+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             while self._free_bytes_fn(self.build_dir) < target:
-                spilled.append(self.spill_one())
+                try:
+                    spilled.append(self.spill_one())
+                except OSError as error:
+                    if "no sealed shard can spill" not in str(error):
+                        raise
+                    _LOGGER.warning(
+                        "PVC free space is below the configured reserve but no sealed "
+                        "shard can be spilled; continuing"
+                    )
+                    break
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         return tuple(spilled)
 

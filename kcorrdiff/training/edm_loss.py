@@ -1,4 +1,4 @@
-"""Strict masked EDM objective for normalized OOF residuals.
+"""Masked EDM objective for normalized OOF residuals.
 
 This module is deliberately outside the denoiser model boundary.  The future
 target-validity mask is accepted only while constructing the training state
@@ -37,8 +37,8 @@ def _sigma_vector(sigma: Tensor, *, batch: int, device: torch.device) -> None:
 
 def _require_sigma_data(value: float) -> float:
     result = float(value)
-    if not math.isfinite(result) or result != SIGMA_DATA:
-        raise ValueError("v1.1.3b normalized-residual sigma_data must equal 1.0")
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError("sigma_data must be finite and positive")
     return result
 
 

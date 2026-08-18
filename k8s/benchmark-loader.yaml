@@ -70,7 +70,7 @@ spec:
               test -f "${static_path}"
               python -c 'import numpy, scipy, torch, yaml, wandb'
               nvidia-smi -L
-              python -c 'import torch; count = torch.cuda.device_count(); assert count == 1, f"expected exactly one visible benchmark GPU, got {count}"'
+              python -c 'import torch; assert torch.cuda.device_count() > 0, "no visible benchmark GPU"'
 
               export WANDB_DIR="${run_root}/wandb"
               export WANDB_NAME="${RUN_ID}"

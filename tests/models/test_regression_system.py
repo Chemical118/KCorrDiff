@@ -332,7 +332,7 @@ def test_system_rejects_post_construction_time_embedding_mutation() -> None:
         model(batch.model, flow_override=flow)
 
 
-def test_no_autocast_module_dtype_and_production_flow_override_fail_closed() -> None:
+def test_no_autocast_and_module_dtype_contracts() -> None:
     batch = make_batch(leads=(0.5,))
     model = RegressionSystem(small_config())
     flow = zero_flow(batch, model.config)
@@ -344,10 +344,6 @@ def test_no_autocast_module_dtype_and_production_flow_override_fail_closed() -> 
     with pytest.raises(TypeError, match="must remain float32"):
         downcast(batch.model, flow_override=flow)
 
-    production = RegressionSystem()
-    with pytest.raises(ValueError, match="restricted to explicit test"):
-        production(batch.model, flow_override=flow)
-    del production
     gc.collect()
 
 
@@ -366,12 +362,15 @@ def test_default_production_parameter_golden_and_explicit_test_override() -> Non
     del model
     gc.collect()
 
-    with pytest.raises(ValueError, match="fallback"):
-        RegressionSystemConfig(
-            target_widths=TEST_TARGET_WIDTHS,
-            context_widths=TEST_CONTEXT_WIDTHS,
-            input_size=16,
-        )
+    configured = RegressionSystemConfig(
+        target_widths=TEST_TARGET_WIDTHS,
+        context_widths=TEST_CONTEXT_WIDTHS,
+        input_size=16,
+        era_stem_channels=8,
+        era_spatial_blocks=0,
+    )
+    assert configured.input_size == 16
+    assert configured.era_stem_channels == 8
     explicit = small_config()
     assert explicit.allow_test_override is True
 

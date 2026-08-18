@@ -32,6 +32,7 @@ class DistributedDrawPlan:
     rank_slots: tuple[tuple[DrawSlot, ...], ...]
     semantic_sha256: str
     gradient_accumulation_steps: int = 1
+    epochs: int = 1
 
     @property
     def synchronized_microbatches(self) -> int:
@@ -95,8 +96,9 @@ def build_distributed_draw_plan(
     world_size: int,
     per_rank_microbatch_size: int,
     gradient_accumulation_steps: int = 1,
+    epochs: int = 1,
 ) -> DistributedDrawPlan:
-    """Assign each manifest draw once, with visible zero-loss tail padding.
+    """Assign each manifest draw once per epoch with visible tail padding.
 
     Padding does not invent a sample ID or alter ``P_draw``.  A training loop
     must turn it into a connected zero loss; it may not silently repeat a row.
@@ -106,6 +108,7 @@ def build_distributed_draw_plan(
         world_size <= 0
         or per_rank_microbatch_size <= 0
         or gradient_accumulation_steps <= 0
+        or epochs <= 0
     ):
         raise ValueError("world size, microbatch and accumulation must be positive")
     selected = training_row_indices(rows, role=role, fold_id=fold_id)
@@ -123,7 +126,7 @@ def build_distributed_draw_plan(
         DrawSlot(logical_position=position, row_index=None)
         for position in range(len(flat), padded_length)
     )
-    rank_slots: list[tuple[DrawSlot, ...]] = []
+    one_epoch_rank_slots: list[tuple[DrawSlot, ...]] = []
     for rank in range(world_size):
         local: list[DrawSlot] = []
         for start in range(0, padded_length, synchronized_width):
@@ -136,14 +139,25 @@ def build_distributed_draw_plan(
                 local.extend(
                     flat[rank_start : rank_start + per_rank_microbatch_size]
                 )
-        rank_slots.append(tuple(local))
+        one_epoch_rank_slots.append(tuple(local))
+    rank_slots = tuple(
+        tuple(
+            DrawSlot(
+                logical_position=slot.logical_position + epoch * padded_length,
+                row_index=slot.row_index,
+            )
+            for epoch in range(epochs)
+            for slot in local
+        )
+        for local in one_epoch_rank_slots
+    )
     actual = [
         slot.row_index
         for slots in rank_slots
         for slot in slots
         if slot.row_index is not None
     ]
-    if sorted(actual) != sorted(selected) or len(actual) != len(set(actual)):
+    if sorted(actual) != sorted(selected * epochs):
         raise AssertionError("DDP plan duplicated or dropped a draw position")
     payload = {
         "role": role,
@@ -152,7 +166,8 @@ def build_distributed_draw_plan(
         "world_size": world_size,
         "per_rank_microbatch_size": per_rank_microbatch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
-        "padding_slots": padded_length - len(selected),
+        "epochs": epochs,
+        "padding_slots": epochs * (padded_length - len(selected)),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -166,6 +181,7 @@ def build_distributed_draw_plan(
         rank_slots=tuple(rank_slots),
         semantic_sha256=digest,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        epochs=epochs,
     )
 
 

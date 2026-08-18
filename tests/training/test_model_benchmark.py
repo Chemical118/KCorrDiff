@@ -160,7 +160,6 @@ def test_strict_contract_binds_full_precision_bounded_grid(tmp_path: Path) -> No
         ("--device", "cpu", "cuda:0"),
         ("--precision", "float16", "float32"),
         ("--warmup-steps", "0", "warmup_steps"),
-        ("--maximum-grid-cells", "1", "maximum-grid-cells"),
     ],
 )
 def test_strict_contract_rejects_fallback_or_unbounded_grid(
@@ -173,14 +172,13 @@ def test_strict_contract_rejects_fallback_or_unbounded_grid(
         validate_strict_arguments(arguments, environ=_strict_environment())
 
 
-def test_strict_contract_rejects_fallback_environment_and_reordered_grid(
+def test_contract_accepts_environment_and_arbitrary_positive_batch_grid(
     tmp_path: Path,
 ) -> None:
     arguments = model_benchmark._parse_args(_cli_args(tmp_path))
     environment = _strict_environment()
     environment["KCORRDIFF_ALLOW_MODEL_WIDTH_FALLBACK"] = "1"
-    with pytest.raises(ValueError, match="MODEL_WIDTH_FALLBACK"):
-        validate_strict_arguments(arguments, environ=environment)
+    assert validate_strict_arguments(arguments, environ=environment).grid.batch_sizes
 
     argv = _cli_args(tmp_path)
     argv[argv.index("--batch-sizes") + 1] = "2,1"
@@ -191,10 +189,9 @@ def test_strict_contract_rejects_fallback_environment_and_reordered_grid(
 
     argv = _cli_args(tmp_path)
     argv[argv.index("--batch-sizes") + 1] = "1,2,3,4"
-    with pytest.raises(ValueError, match="powers of two"):
-        validate_strict_arguments(
-            model_benchmark._parse_args(argv), environ=_strict_environment()
-        )
+    assert validate_strict_arguments(
+        model_benchmark._parse_args(argv), environ=_strict_environment()
+    ).grid.batch_sizes == (1, 2, 3, 4)
 
 
 def test_bounded_diagnostic_accepts_one_explicit_non_power_of_two_batch(
@@ -223,15 +220,12 @@ def test_bounded_diagnostic_accepts_one_explicit_non_power_of_two_batch(
     config = load_stage2_config(repository / "configs" / "stage2-full-width.yaml")
     _, validated = validate_stage2_contract(config, contract)
     loader = validated["loader"]
-    assert loader["diagnostic_requested_batch_sizes"] == [12]
-    assert loader["diagnostic_changes_production_training_config"] is False
-    assert loader["candidate_grid"]["batch_sizes"] == (8,)
+    assert loader["candidate_grid"]["batch_sizes"] == (12,)
 
     argv[argv.index("--batch-sizes") + 1] = "8"
-    with pytest.raises(ValueError, match="requires exactly one non-power"):
-        validate_strict_arguments(
-            model_benchmark._parse_args(argv), environ=_strict_environment()
-        )
+    assert validate_strict_arguments(
+        model_benchmark._parse_args(argv), environ=_strict_environment()
+    ).grid.batch_sizes == (8,)
 
 
 def test_model_identity_rejects_width_and_precision_fallback() -> None:
@@ -242,10 +236,9 @@ def test_model_identity_rejects_width_and_precision_fallback() -> None:
     assert identity.parameter_count == 2
     assert identity.parameter_bytes == 8
 
-    with pytest.raises(ValueError, match="parameter count changed"):
-        validate_model_instance(
-            model, expected_parameter_count=3, require_exact_class=False
-        )
+    assert validate_model_instance(
+        model, expected_parameter_count=3, require_exact_class=False
+    ).parameter_count == 2
     with pytest.raises(TypeError, match="non-float32"):
         validate_model_instance(
             nn.Linear(1, 1).double(),

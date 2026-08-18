@@ -55,6 +55,17 @@ def _model(*, device: torch.device | str = "cpu") -> EraEncoder:
     ).to(device).eval()
 
 
+def test_output_width_is_configurable() -> None:
+    model = EraEncoder(
+        condition_dim=CONDITION_DIM,
+        output_channels=32,
+        stem_channels=8,
+        temporal_heads=4,
+        spatial_blocks=0,
+    )
+    assert model.output_channels == 32 and model.head_dim == 8
+
+
 def _encode(model: EraEncoder, values: dict[str, torch.Tensor]):
     return model.encode_frames(
         values["instantaneous"],

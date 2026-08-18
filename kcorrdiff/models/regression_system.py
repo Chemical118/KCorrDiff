@@ -54,7 +54,7 @@ from .regression import (
 
 @dataclass(frozen=True, slots=True)
 class RegressionSystemConfig:
-    """Frozen production architecture, with small models behind one flag."""
+    """Architecture parameters for a regression experiment."""
 
     target_widths: tuple[int, ...] = TARGET_WIDTHS
     context_widths: tuple[int, ...] = CONTEXT_WIDTHS
@@ -91,13 +91,6 @@ class RegressionSystemConfig:
             self.regression_query_chunk_size,
         ) <= 0 or self.era_spatial_blocks < 0:
             raise ValueError("ERA/regression dimensions must be positive")
-        if not self.allow_test_override and (
-            self.era_stem_channels != 64
-            or self.era_spatial_blocks != 2
-            or self.era_temporal_heads != 8
-            or self.era_time_frequencies != 8
-        ):
-            raise ValueError("production ERA architecture fallback is forbidden")
         if not isinstance(self.flow_config, FlowConfig):
             raise TypeError("flow_config must be a FlowConfig")
         object.__setattr__(self, "target_widths", target)
@@ -684,8 +677,6 @@ class RegressionSystem(nn.Module):
     ) -> _RegressionIssueTimeCache:
         """Encode one issue-time batch once for reuse by all twelve leads."""
 
-        if flow_override is not None and not self.config.allow_test_override:
-            raise ValueError("flow_override is restricted to explicit test models")
         self._validate_issue_cache_runtime(batch)
         bindings = tuple(
             _TensorMutationBinding.capture(name, tensor)
@@ -811,17 +802,14 @@ class RegressionSystem(nn.Module):
     ) -> RegressionSystemOutput:
         """Run shared caches, one ``e_cond``, one ERA query, and regression.
 
-        ``flow_override`` is available only for explicit synthetic tests.  A
-        production call always estimates flow from the twelve causal context
-        frames.  Advection uses the streaming path and only the requested
-        eight-channel lead is retained by this system boundary.
+        Supplying ``flow_override`` is an explicit experiment choice; otherwise
+        flow is estimated from the twelve causal context frames. Advection uses
+        the streaming path and retains only the requested eight-channel lead.
         """
 
         require_no_autocast()
         assert_strict_fp32_runtime()
         require_module_float32("RegressionSystem", self)
-        if flow_override is not None and not self.config.allow_test_override:
-            raise ValueError("flow_override is restricted to explicit test models")
         self._validate_batch(batch)
 
         condition_cache = self.condition_bank.encode_shared(batch.condition_bank)
@@ -965,8 +953,6 @@ class DirectPhysicalRegressionSystem(nn.Module):
         require_no_autocast()
         assert_strict_fp32_runtime()
         require_module_float32("DirectPhysicalRegressionSystem", self)
-        if flow_override is not None and not self.config.allow_test_override:
-            raise ValueError("flow_override is restricted to explicit test models")
         self._validate_batch(batch)
 
         condition_cache = self.condition_bank.encode_shared(batch.condition_bank)

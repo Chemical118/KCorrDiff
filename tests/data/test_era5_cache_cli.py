@@ -22,7 +22,7 @@ def test_exclusive_build_lock_refuses_concurrent_same_output(tmp_path: Path) -> 
     output = tmp_path / "era5-v1"
     with _ExclusiveBuildLock(output) as owner:
         assert owner.path.is_file()
-        with pytest.raises(FileExistsError, match="inspect the owner"):
+        with pytest.raises(FileExistsError, match="holds the lock"):
             with _ExclusiveBuildLock(output):
                 pass
-    assert not owner.path.exists()
+    assert owner.path.exists()

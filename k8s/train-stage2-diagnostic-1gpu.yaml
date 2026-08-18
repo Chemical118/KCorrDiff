@@ -47,7 +47,6 @@ spec:
             - |
               source_root=/workspace/code/stage2-2020-b12-1gpu-v1
               run_root=/workspace/runs/stage2-bounded/stage2-regression-2020-b12-1gpu-v2
-              launch_identity=${run_root}/provenance/launch-identity.json
               log_file=${run_root}/logs/train.log
 
               test -r /run/secrets/kcorrdiff-oof/credentials.env
@@ -57,17 +56,8 @@ spec:
               exec > >(tee -a "${log_file}") 2>&1
 
               nvidia-smi -L
-              python -c 'import torch; assert torch.cuda.device_count() == 1'
-              if [[ ! -e "${launch_identity}" ]]; then
-                python -m kcorrdiff.training.launch_identity create \
-                  --source-root "${source_root}" \
-                  --container-image-digest sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4 \
-                  --runtime-report /workspace/envs/stage2-python-v1/pip-report.json \
-                  --data-contract "${source_root}/configs/data-contract-v1.1.3b.json" \
-                  --output "${launch_identity}"
-              fi
-              launch_identity_sha256="$(sha256sum "${launch_identity}" | awk '{print $1}')"
-              [[ "${launch_identity_sha256}" =~ ^[0-9a-f]{64}$ ]]
+              gpu_count="$(python -c 'import torch; print(torch.cuda.device_count())')"
+              (( gpu_count > 0 ))
               export WANDB_DIR="${run_root}/wandb"
               export WANDB_NAME="${RUN_ID}"
               export WANDB_RUN_ID="${RUN_ID}"
@@ -76,12 +66,10 @@ spec:
               exec torchrun \
                 --standalone \
                 --nnodes=1 \
-                --nproc-per-node=1 \
+                --nproc-per-node="${gpu_count}" \
                 -m kcorrdiff.training.train_stage2 \
                 --source-root "${source_root}" \
                 --config "${source_root}/configs/stage2-full-width.yaml" \
-                --launch-identity "${launch_identity}" \
-                --launch-identity-sha256 "${launch_identity_sha256}" \
                 --container-image-digest sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4 \
                 --runtime-report /workspace/envs/stage2-python-v1/pip-report.json \
                 --radar-cache-root /workspace/data/cache/radar-v1 \
@@ -95,7 +83,6 @@ spec:
                 --oof-output-dir "${run_root}/oof" \
                 --oof-remote-credentials /run/secrets/kcorrdiff-oof/credentials.env \
                 --oof-remote-ca-certificate /run/secrets/kcorrdiff-oof/server.crt \
-                --require-world-size 1 \
                 --precision float32 \
                 --disable-tf32 \
                 --target-widths 64,128,256,384,512 \
@@ -108,7 +95,6 @@ spec:
                 --prefetch-factor 2 \
                 --fail-on-fallback \
                 --bounded-training-year 2020 \
-                --expected-training-items 220260 \
                 --phases deployment \
                 --roles deployment \
                 --wandb-mode online \

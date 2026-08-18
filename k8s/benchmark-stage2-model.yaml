@@ -62,7 +62,8 @@ spec:
               test -f "${bundle_root}/bundle-metadata.json"
               python -c 'import numpy, scipy, torch, yaml, wandb'
               nvidia-smi -L
-              python -c 'import torch; count=torch.cuda.device_count(); assert count == 1, f"expected one visible benchmark GPU, got {count}"'
+              python -c 'import torch; assert torch.cuda.device_count() > 0, "no visible benchmark GPU"'
+              gpu_count="$(python -c 'import torch; print(torch.cuda.device_count())')"
 
               export WANDB_DIR="${run_root}/wandb"
               export WANDB_NAME="${RUN_ID}"
@@ -75,13 +76,8 @@ spec:
                 --era5-cache-root /workspace/data/cache/era5-v1 \
                 --target-static /workspace/data/static/target_static.npz \
                 --candidate-manifest "${bundle_root}/candidate-manifest.json" \
-                --candidate-manifest-sha256 badbef862715cab0a1f19606bebe0496e849aa540ad4c1466da192c04f43c318 \
                 --draw-manifest "${bundle_root}/training-draw-manifest.jsonl" \
-                --draw-manifest-sha256 a6ec13fbf9ffbafc5ef4e3d0122b0de437f923d2390268a5fa6b4ffb32cf2a91 \
                 --bundle-metadata "${bundle_root}/bundle-metadata.json" \
-                --bundle-metadata-sha256 243ee0a74a7ea15654aedd3916281635e62a048007306e627438e26d6dfa16b4 \
-                --target-coordinates-sha256 76ab36d56fbc6f9a626164ffe818ef5dc553b2a897a0185efb7617878a59a912 \
-                --context-coordinates-sha256 7ea1d02c8136a8cf59713b5d07ccd40806ee38ca660a8c19ccfb6a6ab3693065 \
                 --output-json "${output_json}" \
                 --device cuda:0 \
                 --precision float32 \
@@ -97,7 +93,7 @@ spec:
                 --maximum-host-pipeline-bytes 85899345920 \
                 --maximum-shm-pipeline-bytes 30064771072 \
                 --payload-safety-factor 1.25 \
-                --logical-world-size 2 \
+                --logical-world-size "${gpu_count}" \
                 --rank 0 \
                 --role deployment \
                 --wandb-mode online

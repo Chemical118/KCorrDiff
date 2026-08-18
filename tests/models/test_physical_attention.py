@@ -293,14 +293,15 @@ def test_fp32_and_geometry_contracts_fail_closed() -> None:
     bad_footprint["source_geometry"] = _geometry(2, 2, footprint=0.0)
     with pytest.raises(ValueError, match="positive"):
         model(**bad_footprint)
-    with pytest.raises(ValueError, match="D=256"):
-        PhysicalCrossAttention(
-            target_channels=4,
-            source_channels=5,
-            condition_dim=6,
-            source_name="forbidden_fallback",
-            attention_dim=128,
-        )
+    configured = PhysicalCrossAttention(
+        target_channels=4,
+        source_channels=5,
+        condition_dim=6,
+        source_name="configured_attention",
+        attention_dim=128,
+        heads=4,
+    )
+    assert configured.attention_dim == 128 and configured.heads == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

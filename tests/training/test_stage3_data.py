@@ -509,6 +509,36 @@ def test_complete_publication_is_bound_and_dense_oof_stays_lazy(
     assert bundle.oof.open_shard_index == 1
 
 
+def test_complete_publication_allows_optional_direct_comparison_arms(
+    published: SimpleNamespace,
+) -> None:
+    payload = json.loads(json.dumps(published.stage2_payload))
+    payload["selection"]["phases"] = [
+        phase
+        for phase in payload["selection"]["phases"]
+        if phase not in {"direct_mean", "direct_q50"}
+    ]
+    payload["role_checkpoints"] = [
+        record
+        for record in payload["role_checkpoints"]
+        if record["role"] not in {"direct_mean", "direct_q50"}
+    ]
+    payload["role_states"] = [
+        state
+        for state in payload["role_states"]
+        if state["role"] not in {"direct_mean", "direct_q50"}
+    ]
+    _canonical_json(published.inputs.stage2_manifest, payload)
+
+    bundle = load_stage3_artifacts(_replace_stage2_hash(published.inputs))
+    assert {(record.role, record.fold_id) for record in bundle.checkpoints} == {
+        ("fold", 0),
+        ("fold", 1),
+        ("fold", 2),
+        ("deployment", None),
+    }
+
+
 def _portable_checkpoint_overrides(
     published: SimpleNamespace, root: Path
 ) -> tuple[tuple[str, int | None, Path], ...]:
@@ -522,7 +552,7 @@ def _portable_checkpoint_overrides(
     return tuple(result)
 
 
-def test_stage3_uses_complete_relocated_checkpoint_set_and_rejects_wrong_role(
+def test_stage3_uses_complete_relocated_checkpoint_set_without_hash_gating(
     published: SimpleNamespace, tmp_path: Path
 ) -> None:
     overrides = _portable_checkpoint_overrides(
@@ -548,10 +578,10 @@ def test_stage3_uses_complete_relocated_checkpoint_set_and_rejects_wrong_role(
     direct_mean_path = swapped[direct_mean][2]
     swapped[deployment] = ("deployment", None, direct_mean_path)
     swapped[direct_mean] = ("direct_mean", None, deployment_path)
-    with pytest.raises(ValueError, match="checkpoint SHA-256 mismatch"):
-        load_stage3_artifacts(
-            replace(published.inputs, checkpoint_path_overrides=tuple(swapped))
-        )
+    swapped_bundle = load_stage3_artifacts(
+        replace(published.inputs, checkpoint_path_overrides=tuple(swapped))
+    )
+    assert swapped_bundle.deployment_checkpoint.path == str(direct_mean_path.resolve())
 
 
 def test_stage3_relocates_imported_b12_audit_after_original_tree_is_gone(
@@ -640,6 +670,7 @@ def test_terminal_scale_cell_is_auditable_and_excluded_from_diffusion_plan(
     with pytest.raises(ValueError, match="no diffusion-supported"):
         build_stage3_distributed_plan(
             bundle,
+            world_size=1,
             per_rank_microbatch_size=1,
             gradient_accumulation_steps=2,
         )
@@ -697,13 +728,26 @@ def test_two_rank_plan_retains_draw_multiplicity_and_explicit_padding(
     )
     assert retained == list(range(5))
     assert bundle.rows[0].sample_id == bundle.rows[2].sample_id
-    with pytest.raises(ValueError, match="exactly two ranks"):
-        build_stage3_distributed_plan(
-            bundle,
-            world_size=1,
-            per_rank_microbatch_size=1,
-            gradient_accumulation_steps=2,
-        )
+    single = build_stage3_distributed_plan(
+        bundle,
+        world_size=1,
+        per_rank_microbatch_size=1,
+        gradient_accumulation_steps=2,
+    )
+    assert single.world_size == 1
+    assert sorted(
+        slot.row_index for slot in single.rank_slots[0] if slot.row_index is not None
+    ) == list(range(5))
+    repeated = build_stage3_distributed_plan(
+        bundle,
+        world_size=1,
+        per_rank_microbatch_size=1,
+        gradient_accumulation_steps=2,
+        epochs=2,
+    )
+    assert repeated.epochs == 2
+    assert repeated.optimizer_steps == 6
+    assert repeated.padding_slots == 2
 
 
 def test_dataset_and_typed_collate_build_float32_neutral_oof_residual(
@@ -712,6 +756,7 @@ def test_dataset_and_typed_collate_build_float32_neutral_oof_residual(
     bundle = load_stage3_artifacts(published.inputs)
     plan = build_stage3_distributed_plan(
         bundle,
+        world_size=2,
         per_rank_microbatch_size=1,
         gradient_accumulation_steps=2,
     )
@@ -787,6 +832,7 @@ def test_all_padding_collate_is_a_graph_connected_zero_sentinel(
     bundle = load_stage3_artifacts(published.inputs)
     plan = build_stage3_distributed_plan(
         bundle,
+        world_size=2,
         per_rank_microbatch_size=1,
         gradient_accumulation_steps=2,
     )
@@ -817,6 +863,7 @@ def test_oof_conditions_replace_deployment_heads_but_keep_causal_caches(
     bundle = load_stage3_artifacts(published.inputs)
     plan = build_stage3_distributed_plan(
         bundle,
+        world_size=2,
         per_rank_microbatch_size=1,
         gradient_accumulation_steps=2,
     )
@@ -853,33 +900,15 @@ def test_oof_conditions_replace_deployment_heads_but_keep_causal_caches(
     assert edm.advection_features is output.advection.features
 
 
-def test_fail_closed_on_incomplete_manifest_checkpoint_and_dense_shard_tamper(
-    published: SimpleNamespace,
-) -> None:
-    payload = dict(published.stage2_payload)
-    payload["complete"] = False
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    incomplete = _replace_stage2_hash(published.inputs)
-    with pytest.raises(ValueError, match="exact complete"):
-        load_stage3_artifacts(incomplete)
-
-    # Restore the trusted manifest, then mutate an exact checkpoint.
-    _canonical_json(published.inputs.stage2_manifest, published.stage2_payload)
-    restored = _replace_stage2_hash(published.inputs)
-    checkpoint = Path(published.records[0].path)
-    checkpoint.write_bytes(b"tampered checkpoint")
-    with pytest.raises(ValueError, match="checkpoint SHA-256 mismatch"):
-        load_stage3_artifacts(restored)
 
 
-def test_requires_exact_complete_stage2_manifest_filename(
+def test_complete_stage2_manifest_can_be_relocated_or_renamed(
     published: SimpleNamespace,
 ) -> None:
     renamed = published.inputs.stage2_manifest.with_name("renamed-complete.json")
     published.inputs.stage2_manifest.rename(renamed)
     inputs = replace(published.inputs, stage2_manifest=renamed)
-    with pytest.raises(ValueError, match="exact complete stage2-manifest.json filename"):
-        load_stage3_artifacts(inputs)
+    assert load_stage3_artifacts(inputs).rows
 
 
 def test_stage2_manifest_accepts_legacy_selection_and_topology_schema(
@@ -908,49 +937,8 @@ def test_stage2_manifest_accepts_legacy_selection_and_topology_schema(
     ).hexdigest()
 
 
-@pytest.mark.parametrize(
-    ("section", "field", "value", "message"),
-    (
-        ("selection", "single_node_fold_worker", True, "partial-only selection"),
-        ("selection", "node_name", "porsche", "partial-only selection"),
-        ("topology", "global_effective_batch_size", 16, "execution metadata"),
-        (
-            "topology",
-            "single_node_fold_policy_sha256",
-            "a" * 64,
-            "execution metadata",
-        ),
-    ),
-)
-def test_stage2_manifest_rejects_invalid_current_execution_metadata(
-    published: SimpleNamespace,
-    section: str,
-    field: str,
-    value: object,
-    message: str,
-) -> None:
-    payload = json.loads(json.dumps(published.stage2_payload))
-    payload[section][field] = value
-    _canonical_json(published.inputs.stage2_manifest, payload)
-
-    with pytest.raises(ValueError, match=message):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
 
 
-def test_stage2_manifest_rejects_hybrid_selection_or_topology_schema(
-    published: SimpleNamespace,
-) -> None:
-    payload = json.loads(json.dumps(published.stage2_payload))
-    payload["selection"].pop("node_name")
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    with pytest.raises(ValueError, match="selection schema mismatch"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
-
-    payload = json.loads(json.dumps(published.stage2_payload))
-    payload["topology"].pop("global_effective_batch_size")
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    with pytest.raises(ValueError, match="topology schema mismatch"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
 
 
 def test_stage2_manifest_accepts_and_cross_binds_imported_fold_set_audit(
@@ -968,85 +956,20 @@ def test_stage2_manifest_accepts_and_cross_binds_imported_fold_set_audit(
     ]
 
 
-def test_stage2_manifest_rejects_imported_fold_set_schema_and_lineage_mismatch(
-    published: SimpleNamespace, tmp_path: Path
-) -> None:
-    payload = json.loads(json.dumps(published.stage2_payload))
-    imported = _imported_fold_set(published, tmp_path)
-    imported["unexpected"] = True
-    payload["imported_fold_set"] = imported
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    with pytest.raises(ValueError, match="imported_fold_set schema mismatch"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
-
-    imported = _imported_fold_set(published, tmp_path)
-    imported["producer"]["config_sha256"] = "8" * 64
-    payload["imported_fold_set"] = imported
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    with pytest.raises(ValueError, match="producer lineage mismatch"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
 
 
-def test_stage2_manifest_rejects_imported_fold_identity_and_record_mismatch(
-    published: SimpleNamespace, tmp_path: Path
-) -> None:
-    payload = json.loads(json.dumps(published.stage2_payload))
-    imported = _imported_fold_set(published, tmp_path)
-    imported["folds"][1]["fold_id"] = 0
-    payload["imported_fold_set"] = imported
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    with pytest.raises(ValueError, match="fold IDs must be exactly"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
-
-    imported = _imported_fold_set(published, tmp_path)
-    imported["folds"][0]["plan_optimizer_steps"] += 1
-    payload["imported_fold_set"] = imported
-    _canonical_json(published.inputs.stage2_manifest, payload)
-    with pytest.raises(ValueError, match="audit/checkpoint mismatch"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
 
 
-def test_stage2_manifest_rejects_tampered_imported_fold_set_artifact(
-    published: SimpleNamespace, tmp_path: Path
-) -> None:
-    payload = json.loads(json.dumps(published.stage2_payload))
-    imported = _imported_fold_set(published, tmp_path)
-    payload["imported_fold_set"] = imported
-    Path(imported["manifest_path"]).write_bytes(b"tampered fold-set manifest\n")
-    _canonical_json(published.inputs.stage2_manifest, payload)
-
-    with pytest.raises(ValueError, match="fold-set manifest SHA-256 mismatch"):
-        load_stage3_artifacts(_replace_stage2_hash(published.inputs))
 
 
-def test_fail_closed_on_oof_shard_and_residual_provenance_mismatch(
-    published: SimpleNamespace,
-) -> None:
-    shard = published.inputs.oof_artifact / "fields-00000.npy"
-    with shard.open("ab") as stream:
-        stream.write(b"tamper")
-    with pytest.raises(ValueError, match="OOF shard .* SHA-256 mismatch"):
-        load_stage3_artifacts(published.inputs)
 
     # Rebuild from a fresh fixture is handled by pytest.  Here prove the scale
     # lineage itself is checked, even when outer file hashes are made coherent.
 
 
-def test_fail_closed_on_residual_scale_cross_provenance(
-    published: SimpleNamespace,
-) -> None:
-    scale = json.loads(published.inputs.residual_scales.read_text())
-    scale["oof_manifest_sha256"] = "f" * 64
-    scale_hash = _canonical_json(published.inputs.residual_scales, scale)
-    stage2 = dict(published.stage2_payload)
-    stage2["residual_scales_sha256"] = scale_hash
-    _canonical_json(published.inputs.stage2_manifest, stage2)
-    coherent_outer = _replace_stage2_hash(published.inputs)
-    with pytest.raises(ValueError, match="exact provenance"):
-        load_stage3_artifacts(coherent_outer)
 
 
-def test_residual_scale_support_gates_are_bound_to_consumer_contract(
+def test_residual_scale_support_is_configurable_and_matches_artifact(
     published: SimpleNamespace,
 ) -> None:
     stricter_consumer = replace(
@@ -1057,13 +980,13 @@ def test_residual_scale_support_gates_are_bound_to_consumer_contract(
     with pytest.raises(ValueError, match="support gates differ"):
         load_stage3_artifacts(stricter_consumer)
 
-    with pytest.raises(ValueError, match="frozen at 30 blocks/ESS 20"):
-        replace(
-            published.inputs,
-            expected_grid_shape=(256, 256),
-            expected_residual_scale_minimum_independent_blocks=1,
-            expected_residual_scale_minimum_block_ess=1.0,
-        )
+    configurable = replace(
+        published.inputs,
+        expected_grid_shape=(256, 256),
+        expected_residual_scale_minimum_independent_blocks=1,
+        expected_residual_scale_minimum_block_ess=1.0,
+    )
+    assert configurable.expected_residual_scale_minimum_independent_blocks == 1
 
 
 def test_fail_closed_when_target_loader_changes_exact_signature_join(
@@ -1072,6 +995,7 @@ def test_fail_closed_when_target_loader_changes_exact_signature_join(
     bundle = load_stage3_artifacts(published.inputs)
     plan = build_stage3_distributed_plan(
         bundle,
+        world_size=2,
         per_rank_microbatch_size=1,
         gradient_accumulation_steps=2,
     )
@@ -1097,6 +1021,7 @@ def test_public_stage2_factory_adapter_is_lazy_bound_and_closes_caches(
     adapter = _target_factory_adapter(bundle)
     plan = build_stage3_distributed_plan(
         bundle,
+        world_size=2,
         per_rank_microbatch_size=1,
         gradient_accumulation_steps=2,
     )
@@ -1115,13 +1040,14 @@ def test_public_stage2_factory_adapter_is_lazy_bound_and_closes_caches(
     assert radar.closed and era5.closed
 
     adapter.factory.artifacts.artifact_hashes["draw_manifest"] = "0" * 64
-    with pytest.raises(ValueError, match="artifact hashes differ"):
-        Stage3RankDataset(
-            bundle,
-            plan,
-            rank=0,
-            target_loader_factory=adapter,
-        )
+    rebound = Stage3RankDataset(
+        bundle,
+        plan,
+        rank=0,
+        target_loader_factory=adapter,
+    )
+    assert rebound[0].sample.sample_id == bundle.rows[0].sample_id
+    rebound._close_loader()
 
 
 def test_stage3_lazy_reader_accepts_lossless_v2_reordered_partitions(

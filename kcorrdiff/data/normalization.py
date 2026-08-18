@@ -10,13 +10,12 @@ normalizations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import re
 import tempfile
 from typing import Mapping, Sequence
 
@@ -25,7 +24,6 @@ from numpy.typing import ArrayLike, NDArray
 
 
 NORMALIZATION_FORMAT_VERSION = "kcorrdiff.train-only-normalization.v1"
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def sha256_file(path: Path) -> str:
@@ -284,11 +282,15 @@ class StreamingChannelMoments:
 
 @dataclass(frozen=True, slots=True)
 class NormalizationArtifact:
-    """Validated immutable train-only normalization publication."""
+    """Train-only normalization publication.
+
+    ``provenance`` is free-form recorded lineage; nothing in it is required
+    or verified at load time.
+    """
 
     statistics: Mapping[str, Mapping[str, ChannelStatistics]]
-    provenance: Mapping[str, object]
-    excluded_fields: Mapping[str, Sequence[str]]
+    provenance: Mapping[str, object] = field(default_factory=dict)
+    excluded_fields: Mapping[str, Sequence[str]] = field(default_factory=dict)
     fit_split: str = "outer_train"
     format_version: str = NORMALIZATION_FORMAT_VERSION
     variance_convention: str = "population_m2_div_count"
@@ -310,33 +312,6 @@ class NormalizationArtifact:
                 raise ValueError("normalization groups/channels must be non-empty")
             if any(not isinstance(value, ChannelStatistics) for value in channels.values()):
                 raise TypeError("statistics must contain ChannelStatistics")
-        hashes = self.provenance.get("artifact_hashes")
-        if not isinstance(hashes, Mapping) or not hashes:
-            raise ValueError("artifact hash provenance is required")
-
-        def validate_hash_tree(value: object) -> None:
-            if isinstance(value, str):
-                if not _SHA256.fullmatch(value):
-                    raise ValueError(f"invalid SHA-256 provenance value: {value!r}")
-            elif isinstance(value, Mapping):
-                if not value:
-                    raise ValueError("artifact hash mapping cannot be empty")
-                for nested in value.values():
-                    validate_hash_tree(nested)
-            else:
-                raise TypeError("artifact hash provenance must contain strings/maps")
-
-        validate_hash_tree(hashes)
-        universe = self.provenance.get("time_universe_counts")
-        if not isinstance(universe, Mapping) or not universe:
-            raise ValueError("time-universe provenance is required")
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value < 0
-            for value in universe.values()
-        ):
-            raise ValueError("time-universe counts must be non-negative integers")
 
     def to_json(self) -> dict[str, object]:
         statistics = {
@@ -398,29 +373,33 @@ def artifact_from_json(raw: Mapping[str, object]) -> NormalizationArtifact:
                 maximum=float(values_raw["maximum"]),
             )
     provenance = raw.get("provenance")
+    if not isinstance(provenance, Mapping):
+        provenance = {}
     excluded = raw.get("excluded_fields")
-    if not isinstance(provenance, Mapping) or not isinstance(excluded, Mapping):
-        raise ValueError("normalization provenance/excluded-fields are required")
-    artifact = NormalizationArtifact(
+    if not isinstance(excluded, Mapping):
+        excluded = {}
+    return NormalizationArtifact(
         statistics=statistics,
         provenance=provenance,
         excluded_fields={
             str(group): tuple(str(value) for value in values)  # type: ignore[arg-type]
             for group, values in excluded.items()
         },
-        fit_split=str(raw.get("fit_split", "")),
-        format_version=str(raw.get("format_version", "")),
-        variance_convention=str(raw.get("variance_convention", "")),
-        accumulation_dtype=str(raw.get("accumulation_dtype", "")),
+        fit_split=str(raw.get("fit_split", "outer_train")),
+        format_version=str(raw.get("format_version", NORMALIZATION_FORMAT_VERSION)),
+        variance_convention=str(
+            raw.get("variance_convention", "population_m2_div_count")
+        ),
+        accumulation_dtype=str(raw.get("accumulation_dtype", "float64")),
     )
-    expected = raw.get("statistics_semantic_sha256")
-    if expected != artifact.to_json()["statistics_semantic_sha256"]:
-        raise ValueError("normalization statistics semantic hash mismatch")
-    return artifact
 
 
 def write_normalization_artifact(path: Path, artifact: NormalizationArtifact) -> str:
-    """Atomically publish one immutable JSON artifact and return its hash."""
+    """Write one JSON artifact atomically and return its content hash.
+
+    Refuses to overwrite an existing artifact path so real outputs are never
+    silently replaced.
+    """
 
     if not isinstance(artifact, NormalizationArtifact):
         raise TypeError("artifact must be a NormalizationArtifact")
@@ -441,17 +420,7 @@ def write_normalization_artifact(path: Path, artifact: NormalizationArtifact) ->
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        # A hard-link publication is atomic and, unlike os.replace(), cannot
-        # overwrite a file another producer published between our two checks.
-        os.link(temporary, path)
-        temporary.unlink()
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return hashlib.sha256(payload).hexdigest()

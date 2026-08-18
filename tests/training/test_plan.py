@@ -69,6 +69,23 @@ def test_plan_padding_completes_whole_gradient_accumulation_window() -> None:
     assert [slot.logical_position for slot in plan.rank_slots[1]] == [1, 3, 5, 7]
 
 
+def test_plan_repeats_each_draw_once_per_configured_epoch() -> None:
+    rows = tuple(row(index, fold=index % 3) for index in range(5))
+    plan = build_distributed_draw_plan(
+        rows,
+        role="deployment",
+        fold_id=None,
+        world_size=1,
+        per_rank_microbatch_size=2,
+        epochs=3,
+    )
+    assert plan.epochs == 3
+    assert plan.optimizer_steps == 9
+    assert sorted(
+        slot.row_index for slot in plan.rank_slots[0] if not slot.is_padding
+    ) == sorted(tuple(range(5)) * 3)
+
+
 def test_unique_oof_is_first_draw_order_and_rank_complete() -> None:
     first = row(0, fold=0)
     second = row(1, fold=1)

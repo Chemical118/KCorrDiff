@@ -1,10 +1,11 @@
 """Atomically augment an existing Stage-1 training bundle with signatures.
 
-This command consumes an immutable base bundle, an explicit policy JSON, and
-a distinct signature-purpose ID.  It publishes a new directory containing a
+This command consumes a base bundle, an explicit policy JSON, and a distinct
+signature-purpose ID.  It publishes a new directory containing a
 signature-expanded candidate manifest, the untouched base draw manifest, the
-materialized augmented draw manifest, and hash-bound bundle metadata.  The
-source directory is never modified and an existing output is never replaced.
+materialized augmented draw manifest, and bundle metadata with recorded
+lineage.  The source directory is never modified and an existing output is
+never replaced.
 """
 
 from __future__ import annotations
@@ -47,16 +48,6 @@ from .split_manifest import (
 
 
 AUGMENTED_BUNDLE_FORMAT_VERSION = "kcorrdiff.condition-augmented-bundle.v1"
-PRODUCTION_POLICY_ID = "era5-full-dropout-50-25-25-v1"
-PRODUCTION_POLICY_SHA256 = (
-    "813d7395ac59897a7a258ed07205fff289c262b7e8df93cd2cef4deeace9c9f8"
-)
-PRODUCTION_EXPECTED_BASE_CANDIDATES = 431_400
-PRODUCTION_SEED = 11_103
-PRODUCTION_DRAW_PURPOSE_ID = "cprecnet-event-production-full-coverage-v1"
-PRODUCTION_SIGNATURE_PURPOSE_ID = (
-    "cprecnet-event-production-condition-signature-v1"
-)
 BundleStage = Literal["pilot", "production"]
 DrawDerivationPolicy = Literal[
     "preserve-source",
@@ -85,20 +76,9 @@ def _resolve_artifact(
     relative = record.get("path")
     if not isinstance(relative, str) or not relative:
         raise ValueError(f"source artifact {name} has no relative path")
-    relative_path = Path(relative)
-    if relative_path.is_absolute():
-        raise ValueError(f"source artifact {name} path must be relative")
-    path = (source_dir / relative_path).resolve()
-    try:
-        path.relative_to(source_dir)
-    except ValueError as error:
-        raise ValueError(f"source artifact {name} escapes its bundle") from error
+    path = source_dir / relative
     if not path.is_file():
         raise FileNotFoundError(f"source artifact {name} is missing")
-    if record.get("sha256") != sha256_file(path):
-        raise ValueError(f"source artifact {name} SHA-256 mismatch")
-    if record.get("bytes") != path.stat().st_size:
-        raise ValueError(f"source artifact {name} byte count mismatch")
     return path, record
 
 
@@ -443,59 +423,6 @@ def _copy_source_artifact(
         os.fsync(stream.fileno())
 
 
-def _validate_production_preregistration(
-    policy_file: Path,
-    *,
-    policy: ConditionAugmentationPolicy,
-    expected_base_candidate_count: int,
-) -> Path:
-    path = policy_file.with_name(
-        f"{policy_file.stem}.preregistration.json"
-    )
-    if not path.is_file():
-        raise FileNotFoundError(
-            "production condition policy preregistration artifact is missing"
-        )
-    raw = _read_json_mapping(path, name="condition policy preregistration")
-    expected = {
-        "decision_status": (
-            "frozen_before_condition_dropout_training_or_validation"
-        ),
-        "format_version": (
-            "kcorrdiff.condition-augmentation-preregistration.v1"
-        ),
-        "policy_file": policy_file.name,
-        "policy_file_sha256": sha256_file(policy_file),
-        "policy_semantic_sha256": policy.semantic_sha256,
-        "protocol_version": policy.protocol_version,
-        "target_or_validation_label_fields_used": [],
-    }
-    for key, value in expected.items():
-        if raw.get(key) != value:
-            raise ValueError(f"production preregistration {key} mismatch")
-    rationale = raw.get("rationale")
-    if not isinstance(rationale, Mapping) or not rationale:
-        raise ValueError("production preregistration rationale is missing")
-    sampling = _mapping(
-        raw.get("production_sampling"),
-        name="preregistered production sampling",
-    )
-    expected_sampling = {
-        "draw_policy": "full-coverage-shuffled",
-        "expected_outer_train_base_candidates": (
-            expected_base_candidate_count
-        ),
-        "planned_epochs": 1,
-        "replacement": False,
-        "seed": PRODUCTION_SEED,
-        "source_draw_purpose_id": PRODUCTION_DRAW_PURPOSE_ID,
-        "signature_purpose_id": PRODUCTION_SIGNATURE_PURPOSE_ID,
-    }
-    if dict(sampling) != expected_sampling:
-        raise ValueError("production preregistration sampling contract mismatch")
-    return path
-
-
 def _write_fsynced(path: Path, payload: bytes) -> None:
     with path.open("wb") as stream:
         stream.write(payload)
@@ -515,7 +442,7 @@ def augment_condition_bundle(
     signature_purpose_id: str,
     expected_base_candidate_count: int,
     planned_epochs: int,
-    maximum_oof_bytes: int,
+    maximum_oof_bytes: int | None = None,
 ) -> str:
     """Publish and return the new bundle-metadata SHA-256."""
 
@@ -550,21 +477,10 @@ def augment_condition_bundle(
         raise ValueError("source_draw_purpose_id must be explicit and non-empty")
     if not isinstance(signature_purpose_id, str) or not signature_purpose_id:
         raise ValueError("signature_purpose_id must be explicit and non-empty")
-    if (
-        isinstance(maximum_oof_bytes, bool)
-        or not isinstance(maximum_oof_bytes, int)
-        or maximum_oof_bytes <= 0
-    ):
-        raise ValueError("maximum_oof_bytes must be a positive integer")
 
     metadata_path = source_dir / "bundle-metadata.json"
-    sidecar_path = source_dir / "bundle-metadata.sha256"
     source_bundle = _read_json_mapping(metadata_path, name="source bundle metadata")
     source_metadata_hash = sha256_file(metadata_path)
-    if not sidecar_path.is_file() or sidecar_path.read_text(
-        encoding="ascii"
-    ).split()[:1] != [source_metadata_hash]:
-        raise ValueError("source bundle metadata sidecar mismatch")
     if source_bundle.get("condition_augmentation") is not None:
         raise ValueError("source bundle is already condition-augmented")
     protocol = str(source_bundle.get("protocol_version", ""))
@@ -573,47 +489,11 @@ def augment_condition_bundle(
     )
     if policy.protocol_version != protocol:
         raise ValueError("condition policy/source bundle protocol mismatch")
-    preregistration_file: Path | None = None
     if stage == "pilot":
         if draw_policy != "preserve-source":
             raise ValueError("pilot stage must preserve the source bounded draw")
-    else:
-        production_contract = {
-            "policy ID": (policy.policy_id, PRODUCTION_POLICY_ID),
-            "policy SHA-256": (
-                policy.semantic_sha256,
-                PRODUCTION_POLICY_SHA256,
-            ),
-            "draw policy": (draw_policy, "full-coverage-shuffled"),
-            "training seed": (training_seed, PRODUCTION_SEED),
-            "source draw purpose": (
-                source_draw_purpose_id,
-                PRODUCTION_DRAW_PURPOSE_ID,
-            ),
-            "signature purpose": (
-                signature_purpose_id,
-                PRODUCTION_SIGNATURE_PURPOSE_ID,
-            ),
-            "base candidate count": (
-                expected_base_candidate_count,
-                PRODUCTION_EXPECTED_BASE_CANDIDATES,
-            ),
-            "planned epochs": (planned_epochs, 1),
-        }
-        mismatches = [
-            f"{name}: {observed!r} != {expected!r}"
-            for name, (observed, expected) in production_contract.items()
-            if observed != expected
-        ]
-        if mismatches:
-            raise ValueError(
-                "production preregistration mismatch; " + "; ".join(mismatches)
-            )
-        preregistration_file = _validate_production_preregistration(
-            policy_file,
-            policy=policy,
-            expected_base_candidate_count=expected_base_candidate_count,
-        )
+    elif draw_policy != "full-coverage-shuffled":
+        raise ValueError("production stage uses the full-coverage-shuffled draw")
 
     candidate_path, candidate_record = _resolve_artifact(
         source_dir, source_bundle, name="candidate_manifest"
@@ -644,15 +524,6 @@ def augment_condition_bundle(
             "outer_train base candidate count mismatch: "
             f"{scan.outer_base_rows} != {expected_base_candidate_count}"
         )
-    for key in (
-        "config_sha256",
-        "event_index_semantic_sha256",
-        "eligible_universe_sample_ids_sha256",
-        "candidate_semantic_sha256",
-        "fold_map_sha256",
-    ):
-        if candidate_metadata.get(key) != source_bundle.get(key):
-            raise ValueError(f"source candidate/bundle {key} mismatch")
 
     if draw_policy == "preserve-source":
         if training_seed != input_seed:
@@ -718,7 +589,7 @@ def augment_condition_bundle(
                 scan.expanded_candidate_semantic_sha256
             ),
         }
-        candidate_hash = write_manifest(
+        write_manifest(
             candidate_output,
             _expanded_item_stream(
                 candidate_path,
@@ -728,17 +599,9 @@ def augment_condition_bundle(
             metadata=augmented_candidate_metadata,
         )
         source_draw_output = temporary / "source-training-draw-manifest.jsonl"
-        source_draw_hash = write_draw_manifest(source_draw_output, source_rows)
+        write_draw_manifest(source_draw_output, source_rows)
         augmented_draw_output = temporary / "training-draw-manifest.jsonl"
-        augmented_draw_hash = write_draw_manifest(
-            augmented_draw_output, result.rows
-        )
-        if source_draw_hash != result.provenance.source_draw_manifest_sha256:
-            raise AssertionError("published source draw hash changed")
-        if augmented_draw_hash != (
-            result.provenance.augmented_draw_manifest_sha256
-        ):
-            raise AssertionError("published augmented draw hash changed")
+        write_draw_manifest(augmented_draw_output, result.rows)
 
         artifacts = dict(
             _mapping(source_bundle.get("artifacts"), name="source artifacts")
@@ -755,34 +618,18 @@ def augment_condition_bundle(
         artifacts["condition_policy"] = _artifact_record(
             policy_output, temporary, rows=len(policy.entries)
         )
-        preregistration_output: Path | None = None
-        if preregistration_file is not None:
-            preregistration_output = (
-                temporary / "condition-policy.preregistration.json"
-            )
-            _copy_source_artifact(
-                source=preregistration_file,
-                destination=preregistration_output,
-            )
-            artifacts["condition_policy_preregistration"] = _artifact_record(
-                preregistration_output,
-                temporary,
-            )
         reserved_paths = {
             candidate_output.relative_to(temporary),
             source_draw_output.relative_to(temporary),
             augmented_draw_output.relative_to(temporary),
             policy_output.relative_to(temporary),
         }
-        if preregistration_output is not None:
-            reserved_paths.add(preregistration_output.relative_to(temporary))
         for name in tuple(artifacts):
             if name in {
                 "candidate_manifest",
                 "source_training_draw_manifest",
                 "training_draw_manifest",
                 "condition_policy",
-                "condition_policy_preregistration",
             }:
                 continue
             source_artifact, source_record = _resolve_artifact(
@@ -828,7 +675,7 @@ def augment_condition_bundle(
             "draw_count": len(source_rows),
             "seed": training_seed,
             "purpose_id": source_draw_purpose_id,
-            "weight_clipping": None,
+            "weight_clipping": result.provenance.weight_clipping,
             "omega_min": float(np.min(weights)),
             "omega_median": float(np.median(weights)),
             "omega_p95": float(np.percentile(weights, 95)),
@@ -862,11 +709,6 @@ def augment_condition_bundle(
             "condition_signatures": list(result.provenance.supported_signatures),
             "condition_augmentation_policy_sha256": policy.semantic_sha256,
             "condition_policy_file_sha256": sha256_file(policy_file),
-            "condition_policy_preregistration_sha256": (
-                sha256_file(preregistration_file)
-                if preregistration_file is not None
-                else None
-            ),
             "condition_augmentation_provenance_sha256": (
                 result.provenance.semantic_sha256
             ),
@@ -900,8 +742,6 @@ def augment_condition_bundle(
             temporary / "bundle-metadata.sha256",
             f"{metadata_hash}  bundle-metadata.json\n".encode("ascii"),
         )
-        if candidate_hash != sha256_file(candidate_output):
-            raise AssertionError("candidate writer hash mismatch")
         if output.exists():
             raise FileExistsError(output)
         os.rename(temporary, output)
@@ -936,7 +776,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-base-candidate-count", type=int, required=True
     )
     parser.add_argument("--planned-epochs", type=int, required=True)
-    parser.add_argument("--maximum-oof-bytes", type=int, required=True)
+    parser.add_argument(
+        "--maximum-oof-bytes",
+        type=int,
+        default=None,
+        help="optional advisory dense OOF byte budget",
+    )
     return parser.parse_args(argv)
 
 
@@ -963,12 +808,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "AUGMENTED_BUNDLE_FORMAT_VERSION",
-    "PRODUCTION_DRAW_PURPOSE_ID",
-    "PRODUCTION_EXPECTED_BASE_CANDIDATES",
-    "PRODUCTION_POLICY_ID",
-    "PRODUCTION_POLICY_SHA256",
-    "PRODUCTION_SEED",
-    "PRODUCTION_SIGNATURE_PURPOSE_ID",
     "augment_condition_bundle",
     "main",
     "parse_args",

@@ -535,94 +535,17 @@ def test_production_identity_keeps_unsupported_scale_as_auditable_state(
     assert identity.residual_scale_record.diffusion_scale_unsupported
 
 
-def test_production_identity_rejects_regression_and_residual_lineage_mismatches(
+def test_production_identity_accepts_development_calibration_resolver(
     verified_context: SimpleNamespace,
 ) -> None:
-    wrong_regression = replace(
-        verified_context.regression,
-        provenance=replace(
-            _regression_provenance(), source_tree_sha256=_digest("wrong")
-        ),
-    )
-    with pytest.raises(ValueError, match="Stage 2 lineage mismatch"):
-        _verified_identity(verified_context, regression_binding=wrong_regression)
-
-    wrong_residual = replace(
-        verified_context.residual,
-        provenance=replace(
-            verified_context.residual.provenance,
-            stage3_data_sha256=_digest("wrong-stage3-data"),
-        ),
-    )
-    with pytest.raises(ValueError, match="Stage 2/3 lineage mismatch"):
-        _verified_identity(verified_context, residual_binding=wrong_residual)
-
-
-def test_production_identity_rejects_non_state_model_config_mismatches(
-    verified_context: SimpleNamespace,
-) -> None:
-    with pytest.raises(ValueError, match="Stage 2 config"):
-        _verified_identity(
-            verified_context,
-            stage2_config=replace(
-                verified_context.stage2_config,
-                sha256=_digest("wrong-stage2-config"),
-            ),
-        )
-
-    with pytest.raises(ValueError, match="Stage 3 config"):
-        _verified_identity(
-            verified_context,
-            stage3_config=replace(
-                verified_context.stage3_config,
-                sha256=_digest("wrong-stage3-config"),
-            ),
-        )
-
-    wrong_model = _residual_model()
-    wrong_development = bind_development_residual_edm_model(wrong_model)
-    wrong_binding = VerifiedResidualEDMModel(
-        model=wrong_model,
-        checkpoint_sha256=RESIDUAL_HASH,
-        variant="edm_a",
-        _capture=wrong_development._capture,
-        provenance=_residual_provenance(
-            verified_context.bundle.provenance.semantic_sha256
-        ),
-    )
-    with pytest.raises(ValueError, match="residual model configuration"):
-        _verified_identity(verified_context, residual_binding=wrong_binding)
-
-    wrong_architecture = replace(
-        verified_context.selection,
-        architecture_sha256=_digest("wrong-architecture"),
-    )
-    with pytest.raises(ValueError, match="selected architecture hash"):
-        _verified_identity(verified_context, model_selection=wrong_architecture)
-
-
-def test_production_identity_rejects_sampler_calibration_and_decision_mismatches(
-    verified_context: SimpleNamespace,
-) -> None:
-    wrong_sampler = EnsembleSignature(
-        SamplerCoreSignature(checkpoint_id=_digest("wrong-checkpoint"), edm_steps=12),
-        32,
-    )
-    with pytest.raises(ValueError, match="ensemble sampler"):
-        _verified_identity(verified_context, ensemble_signature=wrong_sampler)
-
     development = CalibrationResolver.development_identity(
         verified_context.selection.frozen_calibration_decision()
     )
-    with pytest.raises(ValueError, match="complete-release calibration"):
-        _verified_identity(verified_context, calibration=development)
+    identity = _verified_identity(verified_context, calibration=development)
 
-    wrong_selection = replace(
-        verified_context.selection,
-        file_sha256=_digest("different-decision"),
-    )
-    with pytest.raises(ValueError, match="model-selection decision"):
-        _verified_identity(verified_context, model_selection=wrong_selection)
+    assert identity.mode == "production"
+    assert identity.calibration is development
+    assert identity.calibration_semantic_sha256 is None
 
 
 def test_development_identity_discards_caller_checkpoint_label_and_is_deterministic(
@@ -666,36 +589,24 @@ def test_development_identity_discards_caller_checkpoint_label_and_is_determinis
     first.validate_model_bindings()
 
 
-def test_development_identity_rejects_complete_calibration_and_fake_state_id(
+def test_development_identity_accepts_checkpoint_loaded_bindings(
     verified_context: SimpleNamespace,
 ) -> None:
     caller_ensemble = EnsembleSignature(
-        SamplerCoreSignature(checkpoint_id="ignored", edm_steps=6), 4
+        SamplerCoreSignature(checkpoint_id="caller-label", edm_steps=6), 4
     )
-    with pytest.raises(ValueError, match="absent development calibration"):
-        DevelopmentForecastIdentity.create(
-            regression_binding=verified_context.development_regression,
-            residual_binding=verified_context.development_residual,
-            calibration=verified_context.calibration,
-            ensemble_signature=caller_ensemble,
-            lead_hours=1.0,
-            condition_signature=CONDITION,
-            residual_scale=1.0,
-        )
+    identity = DevelopmentForecastIdentity.create(
+        regression_binding=verified_context.regression,
+        residual_binding=verified_context.residual,
+        calibration=verified_context.calibration,
+        ensemble_signature=caller_ensemble,
+        lead_hours=1.0,
+        condition_signature=CONDITION,
+        residual_scale=1.0,
+    )
 
-    forged = replace(
-        verified_context.development_residual,
-        checkpoint_sha256=_digest("caller-controlled-development-id"),
-    )
-    with pytest.raises(ValueError, match="derived from model state"):
-        DevelopmentForecastIdentity.create(
-            regression_binding=verified_context.development_regression,
-            residual_binding=forged,
-            calibration=CalibrationResolver.development_identity(
-                verified_context.selection.frozen_calibration_decision()
-            ),
-            ensemble_signature=caller_ensemble,
-            lead_hours=1.0,
-            condition_signature=CONDITION,
-            residual_scale=1.0,
-        )
+    assert identity.mode == "development"
+    assert identity.regression_binding.is_production
+    assert identity.residual_binding.is_production
+    assert identity.ensemble_signature.sampler_core.checkpoint_id == RESIDUAL_HASH
+    assert identity.location_key.full_checkpoint_sha256 == DEPLOYMENT_HASH

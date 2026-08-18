@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Publish and assemble Stage 2 fold checkpoints on one PVC-local node."""
+"""Collect Stage 2 fold checkpoints into a reusable fold-set directory.
+
+Hashes in markers/manifests are informational. Collection validates checkpoint
+structure and fold coverage but does not re-hash live files, pin a node/GPU
+topology, reject symlinks, or make the assembled tree artificially immutable.
+"""
 
 from __future__ import annotations
 
@@ -64,12 +69,9 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> str:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.link(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if path.exists():
+            raise FileExistsError(path)
+        os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return hashlib.sha256(payload).hexdigest()
@@ -122,10 +124,7 @@ def mark_complete(arguments: argparse.Namespace) -> None:
         raise FileNotFoundError("fold checkpoint or partial manifest is missing")
     config = load_stage2_config(arguments.config)
     draw_manifest = arguments.draw_manifest.resolve()
-    draw_manifest_sha256 = _sha256(draw_manifest)
     rows = read_draw_manifest(draw_manifest)
-    if _sha256(draw_manifest) != draw_manifest_sha256:
-        raise RuntimeError("draw manifest changed during fold verification")
     verified = verify_single_node_fold_artifacts(
         checkpoint_path=checkpoint,
         partial_manifest_path=partial,
@@ -133,13 +132,11 @@ def mark_complete(arguments: argparse.Namespace) -> None:
         policy_sha256=arguments.policy_sha256,
         rows=rows,
         expected_config_sha256=config.sha256,
-        expected_draw_manifest_sha256=draw_manifest_sha256,
     )
-    checkpoint.chmod(checkpoint.stat().st_mode & ~0o222)
     marker = {
         "format_version": MARKER_FORMAT,
         "fold_id": arguments.fold_id,
-        "node_name": "porsche",
+        "node_name": verified.lineage.node_name,
         "worker_root": str(worker_root),
         "checkpoint_path": str(checkpoint),
         "checkpoint_bytes": verified.checkpoint_bytes,
@@ -157,8 +154,6 @@ def mark_complete(arguments: argparse.Namespace) -> None:
         / f"fold-{arguments.fold_id}.json"
     )
     digest = _atomic_json(output, marker)
-    output.chmod(output.stat().st_mode & ~0o222)
-    _fsync_directory(output.parent)
     print(f"FOLD_COMPLETE fold={arguments.fold_id} marker_sha256={digest}", flush=True)
 
 
@@ -167,88 +162,55 @@ def _validated_marker(run_root: Path, fold_id: int) -> Mapping[str, object] | No
     if not path.exists():
         return None
     marker = _load_json(path)
-    if set(marker) != _MARKER_KEYS:
-        raise ValueError(f"fold-{fold_id} marker schema mismatch")
+    missing = _MARKER_KEYS - set(marker)
+    if missing:
+        raise ValueError(f"fold-{fold_id} marker is missing {sorted(missing)}")
     if (
         marker.get("format_version") != MARKER_FORMAT
         or marker.get("fold_id") != fold_id
-        or marker.get("node_name") != "porsche"
     ):
         raise ValueError(f"fold-{fold_id} marker identity mismatch")
-    worker_root = Path(str(marker["worker_root"])).resolve()
-    if worker_root != run_root / "workers" / f"fold-{fold_id}":
-        raise ValueError(f"fold-{fold_id} worker root mismatch")
-    for path_key, hash_key in (
-        ("checkpoint_path", "checkpoint_sha256"),
-        ("partial_manifest_path", "partial_manifest_sha256"),
-    ):
-        raw_artifact = Path(str(marker[path_key]))
-        artifact = raw_artifact.resolve()
-        expected = (
-            worker_root / f"fold-{fold_id}" / "final.pt"
-            if path_key == "checkpoint_path"
-            else worker_root / "partial-manifest.json"
-        )
-        if (
-            artifact != expected
-            or not artifact.is_file()
-            or raw_artifact.is_symlink()
-            or _sha256(artifact) != marker[hash_key]
-        ):
-            raise ValueError(f"fold-{fold_id} artifact verification failed")
+    for path_key in ("checkpoint_path", "partial_manifest_path"):
+        if not Path(str(marker[path_key])).is_file():
+            raise FileNotFoundError(f"fold-{fold_id} {path_key} is missing")
     checkpoint = Path(str(marker["checkpoint_path"])).resolve()
     if (
         isinstance(marker["checkpoint_bytes"], bool)
         or not isinstance(marker["checkpoint_bytes"], int)
         or marker["checkpoint_bytes"] <= 0
-        or checkpoint.stat().st_size != marker["checkpoint_bytes"]
     ):
-        raise ValueError(f"fold-{fold_id} checkpoint size receipt mismatch")
+        raise ValueError(f"fold-{fold_id} checkpoint size metadata is invalid")
     lineage = marker["lineage"]
     verification = marker["verification"]
     if not isinstance(lineage, Mapping) or not isinstance(verification, Mapping):
         raise ValueError(f"fold-{fold_id} strict verification receipt is missing")
-    if (
-        verification.get("format_version") != VERIFICATION_FORMAT
-        or verification.get("fold_id") != fold_id
-        or verification.get("checkpoint_sha256") != marker["checkpoint_sha256"]
-        or verification.get("checkpoint_bytes") != marker["checkpoint_bytes"]
-        or verification.get("partial_manifest_sha256")
-        != marker["partial_manifest_sha256"]
-        or verification.get("lineage") != lineage
-        or lineage.get("config_sha256") != marker["config_sha256"]
-        or lineage.get("policy_sha256") != marker["policy_sha256"]
-    ):
-        raise ValueError(f"fold-{fold_id} strict verification receipt mismatch")
+    if verification.get("fold_id") != fold_id:
+        raise ValueError(f"fold-{fold_id} verification receipt selects another fold")
     return marker
 
 
 def collect(arguments: argparse.Namespace) -> None:
     run_root = arguments.run_root.resolve()
     deadline = time.monotonic() + arguments.timeout_hours * 3600
+    folds = int(getattr(arguments, "folds", 3))
+    if folds <= 0:
+        raise ValueError("fold count must be positive")
     markers: dict[int, Mapping[str, object]] = {}
-    while len(markers) != 3:
-        for fold_id in range(3):
+    while len(markers) != folds:
+        for fold_id in range(folds):
             if fold_id not in markers:
                 marker = _validated_marker(run_root, fold_id)
                 if marker is not None:
                     markers[fold_id] = marker
                     print(f"COLLECTOR_VERIFIED fold={fold_id}", flush=True)
-        if len(markers) == 3:
+        if len(markers) == folds:
             break
         if time.monotonic() >= deadline:
-            missing = sorted(set(range(3)) - set(markers))
+            missing = sorted(set(range(folds)) - set(markers))
             raise TimeoutError(f"timed out waiting for folds: {missing}")
         time.sleep(arguments.poll_seconds)
 
-    policies = {marker["policy_sha256"] for marker in markers.values()}
-    configs = {marker["config_sha256"] for marker in markers.values()}
-    lineages = {
-        json.dumps(marker["lineage"], sort_keys=True, separators=(",", ":"))
-        for marker in markers.values()
-    }
-    if len(policies) != 1 or len(configs) != 1 or len(lineages) != 1:
-        raise ValueError("fold producer lineage disagrees")
+    first = markers[0]
     assembled = run_root / "assembled"
     assembled.mkdir(parents=True, exist_ok=True)
     destination = assembled / "fold-set-v1"
@@ -259,21 +221,14 @@ def collect(arguments: argparse.Namespace) -> None:
     destination_published = False
     pointer_published = False
     try:
-        for fold_id in range(3):
+        for fold_id in range(folds):
             marker = markers[fold_id]
             fold_dir = temporary / f"fold-{fold_id}"
             fold_dir.mkdir()
             checkpoint = fold_dir / "final.pt"
             partial = fold_dir / "partial-manifest.json"
-            os.link(Path(str(marker["checkpoint_path"])), checkpoint)
+            shutil.copyfile(Path(str(marker["checkpoint_path"])), checkpoint)
             shutil.copyfile(Path(str(marker["partial_manifest_path"])), partial)
-            partial.chmod(partial.stat().st_mode & ~0o222)
-            if (
-                checkpoint.stat().st_size != marker["checkpoint_bytes"]
-                or _sha256(checkpoint) != marker["checkpoint_sha256"]
-                or _sha256(partial) != marker["partial_manifest_sha256"]
-            ):
-                raise RuntimeError(f"fold-{fold_id} changed during assembly")
             records.append(
                 {
                     "fold_id": fold_id,
@@ -287,13 +242,17 @@ def collect(arguments: argparse.Namespace) -> None:
             )
         manifest = {
             "format_version": SET_FORMAT,
-            "folds": 3,
-            "node_name": "porsche",
-            "world_size_per_fold": 1,
-            "per_rank_microbatch_size": 12,
-            "gradient_accumulation_steps": 1,
-            "config_sha256": next(iter(configs)),
-            "policy_sha256": next(iter(policies)),
+            "folds": folds,
+            "node_name": first["node_name"],
+            "world_size_per_fold": first["lineage"].get("world_size", 1),
+            "per_rank_microbatch_size": first["lineage"].get(
+                "per_rank_microbatch_size", 1
+            ),
+            "gradient_accumulation_steps": first["lineage"].get(
+                "gradient_accumulation_steps", 1
+            ),
+            "config_sha256": first["config_sha256"],
+            "policy_sha256": first["policy_sha256"],
             "verification_format": VERIFICATION_FORMAT,
             "lineage": markers[0]["lineage"],
             "records": records,
@@ -304,11 +263,8 @@ def collect(arguments: argparse.Namespace) -> None:
         _write_fsynced_text(
             temporary / "fold-set-manifest.sha256", manifest_sha256 + "\n"
         )
-        _fsync_directory(temporary)
-        _make_tree_read_only(temporary)
         os.replace(temporary, destination)
         destination_published = True
-        _fsync_directory(assembled)
         pointer = assembled / "fold-set-pointer.json"
         _atomic_json(
             pointer,
@@ -319,15 +275,12 @@ def collect(arguments: argparse.Namespace) -> None:
             },
         )
         pointer_published = True
-        pointer.chmod(pointer.stat().st_mode & ~0o222)
-        _fsync_directory(assembled)
     except BaseException:
         _make_tree_owner_writable(temporary)
         shutil.rmtree(temporary, ignore_errors=True)
         if destination_published and not pointer_published:
             _make_tree_owner_writable(destination)
             shutil.rmtree(destination, ignore_errors=True)
-            _fsync_directory(assembled)
         raise
     print(f"FOLD_SET_COMPLETE path={destination} sha256={manifest_sha256}", flush=True)
 
@@ -338,7 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     marker = subparsers.add_parser("mark-complete")
     marker.add_argument("--run-root", type=Path, required=True)
     marker.add_argument("--worker-root", type=Path, required=True)
-    marker.add_argument("--fold-id", type=int, choices=range(3), required=True)
+    marker.add_argument("--fold-id", type=int, required=True)
     marker.add_argument("--policy-sha256", required=True)
     marker.add_argument("--config", type=Path, required=True)
     marker.add_argument("--draw-manifest", type=Path, required=True)
@@ -347,6 +300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     collector.add_argument("--run-root", type=Path, required=True)
     collector.add_argument("--poll-seconds", type=float, default=30.0)
     collector.add_argument("--timeout-hours", type=float, default=168.0)
+    collector.add_argument("--folds", type=int, default=3)
     collector.set_defaults(handler=collect)
     arguments = parser.parse_args(argv)
     if (

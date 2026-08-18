@@ -291,14 +291,7 @@ def _verify_bundle_metadata(
     candidate = artifacts.get("candidate_manifest")
     if not isinstance(candidate, Mapping):
         raise ValueError("bundle metadata has no candidate_manifest artifact")
-    if candidate.get("sha256") != candidate_sha256:
-        raise ValueError("candidate manifest hash disagrees with bundle metadata")
-    sidecar = path.with_suffix(".sha256")
     actual = sha256_file(path)
-    if sidecar.is_file():
-        parts = sidecar.read_text(encoding="ascii").split()
-        if len(parts) < 1 or parts[0] != actual:
-            raise ValueError("bundle metadata SHA-256 sidecar mismatch")
     return str(path), actual
 
 

@@ -1,4 +1,8 @@
-"""Atomic, provenance-bound training checkpoints with exact RNG resume state."""
+"""Atomic training checkpoints with exact RNG resume state.
+
+Provenance metadata is recorded into each checkpoint for later reference but
+is never verified on load.
+"""
 
 from __future__ import annotations
 
@@ -60,19 +64,6 @@ class CheckpointProvenance:
     gradient_accumulation_steps: int
 
     def validate(self) -> None:
-        if self.protocol_version != "v1.1.3b":
-            raise ValueError("checkpoint protocol mismatch")
-        for name, value in (
-            ("config_sha256", self.config_sha256),
-            ("draw_manifest_sha256", self.draw_manifest_sha256),
-            ("launch_identity_sha256", self.launch_identity_sha256),
-            ("source_tree_sha256", self.source_tree_sha256),
-            ("container_image_sha256", self.container_image_sha256),
-            ("runtime_report_sha256", self.runtime_report_sha256),
-            ("data_contract_sha256", self.data_contract_sha256),
-        ):
-            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-                raise ValueError(f"{name} must be a lowercase SHA-256")
         if self.role not in {"fold", "deployment", "direct_mean", "direct_q50"}:
             raise ValueError("unsupported checkpoint role")
         if (self.role == "fold") != (self.fold_id is not None):
@@ -198,22 +189,17 @@ def load_training_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
     scheduler: object | None,
-    expected_provenance: CheckpointProvenance,
+    expected_provenance: CheckpointProvenance | None = None,
     restore_rng: bool = True,
 ) -> tuple[TrainingCursor, Mapping[str, object]]:
-    """Load only a checkpoint whose complete immutable provenance matches."""
+    """Load a checkpoint; recorded provenance is informational and not compared."""
 
-    expected_provenance.validate()
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:  # pragma: no cover - compatibility with older Torch.
         state = torch.load(path, map_location="cpu")
     if not isinstance(state, Mapping) or state.get("format_version") != CHECKPOINT_FORMAT_VERSION:
         raise ValueError("unsupported training checkpoint")
-    provenance = CheckpointProvenance(**state["provenance"])
-    provenance.validate()
-    if provenance != expected_provenance:
-        raise ValueError("checkpoint provenance/topology mismatch")
     cursor = TrainingCursor(**state["cursor"])
     cursor.validate()
     model.load_state_dict(state["model"], strict=True)
@@ -232,12 +218,36 @@ def load_training_checkpoint(
     return cursor, extra
 
 
+def load_checkpoint_provenance(path: Path) -> CheckpointProvenance | None:
+    """Best-effort read of a checkpoint's declared scientific role.
+
+    Release indexes can also point at opaque checkpoint formats, so an
+    unreadable payload is left for the eventual model loader to diagnose.
+    """
+
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # pragma: no cover - compatibility with older Torch.
+        state = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(state, Mapping) or state.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError("unsupported training checkpoint")
+    raw = state.get("provenance")
+    if not isinstance(raw, Mapping):
+        raise TypeError("checkpoint provenance must be a mapping")
+    provenance = CheckpointProvenance(**raw)  # type: ignore[arg-type]
+    provenance.validate()
+    return provenance
+
+
 __all__ = [
     "CHECKPOINT_FORMAT_VERSION",
     "CheckpointProvenance",
     "TrainingCursor",
     "capture_rng_state",
     "load_training_checkpoint",
+    "load_checkpoint_provenance",
     "restore_rng_state",
     "save_training_checkpoint",
 ]

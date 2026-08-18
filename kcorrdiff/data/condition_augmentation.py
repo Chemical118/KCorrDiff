@@ -20,7 +20,6 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
-import re
 from typing import Literal, Mapping, Sequence, cast
 
 from .condition_schema import parse_condition_signature
@@ -40,15 +39,6 @@ TemporalAccessStrategy = Literal[
     "matched_arm",
     "full_with_target_end_causal_augmentation",
 ]
-
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-
-
-def _require_sha256(value: str, *, name: str) -> str:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
-    return value
-
 
 def _semantic_sha256(value: object) -> str:
     payload = json.dumps(
@@ -86,7 +76,7 @@ class ConditionMixtureEntry:
 
     ``target_probability`` is ``P_target(a | t0, tau)`` and
     ``draw_probability`` is ``P_draw(a | t0, tau)``.  Neither has a default:
-    v1.1.3b leaves the dropout probabilities to preregistration.
+    the dropout probabilities must be declared by the policy author.
     """
 
     condition_signature: str | ConditionSignature
@@ -146,19 +136,27 @@ class ConditionAugmentationPolicy:
     source_condition_signature: str | ConditionSignature
     temporal_access_strategy: TemporalAccessStrategy
     entries: tuple[ConditionMixtureEntry, ...]
+    weight_clipping: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.policy_id, str) or not self.policy_id.strip():
             raise ValueError("condition augmentation policy_id must be non-empty")
-        if self.protocol_version != PROTOCOL_VERSION:
-            raise ValueError(
-                f"condition augmentation requires protocol {PROTOCOL_VERSION}"
-            )
+        if not isinstance(self.protocol_version, str) or not self.protocol_version:
+            raise ValueError("condition augmentation protocol_version must be non-empty")
         if self.temporal_access_strategy not in {
             "matched_arm",
             "full_with_target_end_causal_augmentation",
         }:
             raise ValueError("unsupported temporal-access augmentation strategy")
+        if self.weight_clipping is not None and (
+            isinstance(self.weight_clipping, bool)
+            or not isinstance(self.weight_clipping, (int, float))
+            or not math.isfinite(float(self.weight_clipping))
+            or float(self.weight_clipping) <= 0.0
+        ):
+            raise ValueError("condition importance-weight clipping must be positive")
+        if self.weight_clipping is not None:
+            object.__setattr__(self, "weight_clipping", float(self.weight_clipping))
 
         source = parse_condition_signature(self.source_condition_signature)
         if not source.era_present or not source.tp_present:
@@ -256,48 +254,32 @@ class ConditionAugmentationPolicy:
             "temporal_access_strategy": self.temporal_access_strategy,
             "entries": [entry.to_json() for entry in self.entries],
             "selection_order": "base_sample_then_one_condition_signature",
-            "weight_clipping": None,
+            "weight_clipping": self.weight_clipping,
         }
 
     @classmethod
     def from_mapping(
         cls, raw: Mapping[str, object]
     ) -> "ConditionAugmentationPolicy":
-        """Parse an immutable policy artifact without supplying defaults."""
+        """Parse the policy fields used by augmentation, tolerating extensions."""
 
-        required = {
-            "format_version",
-            "policy_id",
-            "protocol_version",
-            "source_condition_signature",
-            "temporal_access_strategy",
-            "entries",
-            "selection_order",
-            "weight_clipping",
-        }
-        if set(raw) != required:
-            missing = sorted(required - set(raw))
-            unknown = sorted(set(raw) - required)
-            raise ValueError(
-                "condition policy keys mismatch; "
-                f"missing={missing}, unknown={unknown}"
-            )
-        if raw["format_version"] != POLICY_FORMAT_VERSION:
-            raise ValueError("unsupported condition augmentation policy format")
-        if raw["selection_order"] != (
-            "base_sample_then_one_condition_signature"
-        ):
-            raise ValueError("condition policy selection order changed")
-        if raw["weight_clipping"] is not None:
-            raise ValueError("v1.1.3b condition importance weights are unclipped")
-        for key in (
-            "policy_id",
-            "protocol_version",
-            "source_condition_signature",
-            "temporal_access_strategy",
-        ):
-            if not isinstance(raw[key], str):
+        missing = sorted(
+            {
+                "policy_id",
+                "source_condition_signature",
+                "temporal_access_strategy",
+                "entries",
+            }
+            - set(raw)
+        )
+        if missing:
+            raise ValueError(f"condition policy is missing consumed keys: {missing}")
+        for key in ("policy_id", "source_condition_signature", "temporal_access_strategy"):
+            if not isinstance(raw.get(key), str):
                 raise TypeError(f"condition policy {key} must be a string")
+        protocol_version = raw.get("protocol_version", "unknown")
+        if not isinstance(protocol_version, str):
+            raise TypeError("condition policy protocol_version must be a string")
         raw_entries = raw["entries"]
         if not isinstance(raw_entries, Sequence) or isinstance(
             raw_entries, (str, bytes)
@@ -312,9 +294,9 @@ class ConditionAugmentationPolicy:
         for index, value in enumerate(raw_entries):
             if not isinstance(value, Mapping):
                 raise TypeError(f"condition policy entry {index} must be a mapping")
-            if set(value) != required_entry:
+            if not required_entry.issubset(value):
                 raise ValueError(
-                    f"condition policy entry {index} keys mismatch"
+                    f"condition policy entry {index} is missing consumed keys"
                 )
             if not isinstance(value["condition_signature"], str):
                 raise TypeError(
@@ -333,7 +315,7 @@ class ConditionAugmentationPolicy:
             )
         return cls(
             policy_id=cast(str, raw["policy_id"]),
-            protocol_version=cast(str, raw["protocol_version"]),
+            protocol_version=protocol_version,
             source_condition_signature=cast(
                 str, raw["source_condition_signature"]
             ),
@@ -341,6 +323,7 @@ class ConditionAugmentationPolicy:
                 TemporalAccessStrategy, raw["temporal_access_strategy"]
             ),
             entries=tuple(entries),
+            weight_clipping=cast(float | None, raw.get("weight_clipping")),
         )
 
 
@@ -382,13 +365,15 @@ class OOFConditionRequirement:
 
 @dataclass(frozen=True, slots=True)
 class ConditionAugmentationProvenance:
+    """Recorded lineage for a materialized condition-signature draw.
+
+    The ``*_sha256`` fields are optional informational strings kept for
+    lineage bookkeeping; they are never format-validated or verified.
+    """
+
     format_version: str
     protocol_version: str
     policy_id: str
-    policy_sha256: str
-    source_draw_manifest_sha256: str
-    augmented_draw_manifest_sha256: str
-    oof_requirements_sha256: str
     training_seed: int
     source_draw_purpose_id: str
     signature_purpose_id: str
@@ -396,12 +381,16 @@ class ConditionAugmentationProvenance:
     unique_oof_items: int
     supported_signatures: tuple[str, ...]
     signature_counts: tuple[tuple[str, int], ...]
+    policy_sha256: str = ""
+    source_draw_manifest_sha256: str = ""
+    augmented_draw_manifest_sha256: str = ""
+    oof_requirements_sha256: str = ""
     fit_split: str = "outer_train"
     selection_order: str = "base_sample_then_one_condition_signature"
     canonical_counter_key: str = "training_seed,purpose_id,global_example_index"
     normalization_contract: str = NORMALIZATION_CONTRACT
     target_label_fields_used: tuple[str, ...] = ()
-    weight_clipping: None = None
+    weight_clipping: float | None = None
 
     def __post_init__(self) -> None:
         if self.format_version != PROVENANCE_FORMAT_VERSION:
@@ -410,16 +399,6 @@ class ConditionAugmentationProvenance:
             raise ValueError("condition provenance protocol version changed")
         if not self.policy_id:
             raise ValueError("condition provenance policy_id must be non-empty")
-        for name, digest in (
-            ("policy_sha256", self.policy_sha256),
-            ("source_draw_manifest_sha256", self.source_draw_manifest_sha256),
-            (
-                "augmented_draw_manifest_sha256",
-                self.augmented_draw_manifest_sha256,
-            ),
-            ("oof_requirements_sha256", self.oof_requirements_sha256),
-        ):
-            _require_sha256(digest, name=name)
         canonical_counter(self.training_seed, self.signature_purpose_id, 0)
         if (
             not isinstance(self.source_draw_purpose_id, str)
@@ -486,8 +465,15 @@ class ConditionAugmentationProvenance:
             raise ValueError("condition normalization contract changed")
         if self.target_label_fields_used:
             raise ValueError("condition assignment must not use target label fields")
+        if self.weight_clipping is not None and (
+            isinstance(self.weight_clipping, bool)
+            or not isinstance(self.weight_clipping, (int, float))
+            or not math.isfinite(float(self.weight_clipping))
+            or float(self.weight_clipping) <= 0.0
+        ):
+            raise ValueError("condition importance-weight clipping must be positive")
         if self.weight_clipping is not None:
-            raise ValueError("v1.1.3b condition importance weights are unclipped")
+            object.__setattr__(self, "weight_clipping", float(self.weight_clipping))
 
     @property
     def semantic_sha256(self) -> str:
@@ -521,16 +507,15 @@ class ConditionAugmentationProvenance:
     def from_mapping(
         cls, raw: Mapping[str, object]
     ) -> "ConditionAugmentationProvenance":
-        """Parse the exact bundle sidecar representation, with no defaults."""
+        """Parse a bundle sidecar mapping.
+
+        Digest keys may be absent (they default to empty strings) and unknown
+        keys are ignored, so sidecars written by earlier or later code load
+        without modification.
+        """
 
         required = {
-            "format_version",
-            "protocol_version",
             "policy_id",
-            "policy_sha256",
-            "source_draw_manifest_sha256",
-            "augmented_draw_manifest_sha256",
-            "oof_requirements_sha256",
             "training_seed",
             "source_draw_purpose_id",
             "signature_purpose_id",
@@ -538,20 +523,10 @@ class ConditionAugmentationProvenance:
             "unique_oof_items",
             "supported_signatures",
             "signature_counts",
-            "fit_split",
-            "selection_order",
-            "canonical_counter_key",
-            "normalization_contract",
-            "target_label_fields_used",
-            "weight_clipping",
         }
-        if set(raw) != required:
-            missing = sorted(required - set(raw))
-            unknown = sorted(set(raw) - required)
-            raise ValueError(
-                "condition provenance keys mismatch; "
-                f"missing={missing}, unknown={unknown}"
-            )
+        missing = sorted(required - set(raw))
+        if missing:
+            raise ValueError(f"condition provenance keys missing: {missing}")
         signatures = raw["supported_signatures"]
         if not isinstance(signatures, Sequence) or isinstance(
             signatures, (str, bytes)
@@ -569,24 +544,28 @@ class ConditionAugmentationProvenance:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError("signature count values must be integers")
             counts.append((key, value))
-        labels = raw["target_label_fields_used"]
+        labels = raw.get("target_label_fields_used", ())
         if not isinstance(labels, Sequence) or isinstance(labels, (str, bytes)):
             raise TypeError("target_label_fields_used must be a sequence")
         if any(not isinstance(value, str) for value in labels):
             raise TypeError("target_label_fields_used must contain strings")
         return cls(
-            format_version=cast(str, raw["format_version"]),
-            protocol_version=cast(str, raw["protocol_version"]),
+            format_version=str(
+                raw.get("format_version", PROVENANCE_FORMAT_VERSION)
+            ),
+            protocol_version=str(
+                raw.get("protocol_version", PROTOCOL_VERSION)
+            ),
             policy_id=cast(str, raw["policy_id"]),
-            policy_sha256=cast(str, raw["policy_sha256"]),
-            source_draw_manifest_sha256=cast(
-                str, raw["source_draw_manifest_sha256"]
+            policy_sha256=str(raw.get("policy_sha256", "") or ""),
+            source_draw_manifest_sha256=str(
+                raw.get("source_draw_manifest_sha256", "") or ""
             ),
-            augmented_draw_manifest_sha256=cast(
-                str, raw["augmented_draw_manifest_sha256"]
+            augmented_draw_manifest_sha256=str(
+                raw.get("augmented_draw_manifest_sha256", "") or ""
             ),
-            oof_requirements_sha256=cast(
-                str, raw["oof_requirements_sha256"]
+            oof_requirements_sha256=str(
+                raw.get("oof_requirements_sha256", "") or ""
             ),
             training_seed=cast(int, raw["training_seed"]),
             source_draw_purpose_id=cast(str, raw["source_draw_purpose_id"]),
@@ -595,12 +574,24 @@ class ConditionAugmentationProvenance:
             unique_oof_items=cast(int, raw["unique_oof_items"]),
             supported_signatures=tuple(cast(Sequence[str], signatures)),
             signature_counts=tuple(sorted(counts)),
-            fit_split=cast(str, raw["fit_split"]),
-            selection_order=cast(str, raw["selection_order"]),
-            canonical_counter_key=cast(str, raw["canonical_counter_key"]),
-            normalization_contract=cast(str, raw["normalization_contract"]),
+            fit_split=str(raw.get("fit_split", "outer_train")),
+            selection_order=str(
+                raw.get(
+                    "selection_order",
+                    "base_sample_then_one_condition_signature",
+                )
+            ),
+            canonical_counter_key=str(
+                raw.get(
+                    "canonical_counter_key",
+                    "training_seed,purpose_id,global_example_index",
+                )
+            ),
+            normalization_contract=str(
+                raw.get("normalization_contract", NORMALIZATION_CONTRACT)
+            ),
             target_label_fields_used=tuple(cast(Sequence[str], labels)),
-            weight_clipping=cast(None, raw["weight_clipping"]),
+            weight_clipping=cast(float | None, raw.get("weight_clipping")),
         )
 
 
@@ -876,8 +867,6 @@ def validate_materialized_condition_provenance(
         raise ValueError("condition policy/provenance protocol mismatch")
     if provenance.policy_id != policy.policy_id:
         raise ValueError("condition policy/provenance ID mismatch")
-    if provenance.policy_sha256 != policy.semantic_sha256:
-        raise ValueError("condition policy/provenance SHA-256 mismatch")
     supported = tuple(
         str(entry.condition_signature) for entry in policy.entries
     )
@@ -915,10 +904,6 @@ def validate_materialized_condition_provenance(
             raise ValueError("augmented draw importance weight is inconsistent")
         counts[signature] += 1
 
-    if canonical_draw_rows_sha256(rows) != (
-        provenance.augmented_draw_manifest_sha256
-    ):
-        raise ValueError("augmented draw manifest SHA-256 mismatch")
     if provenance.draws != len(rows):
         raise ValueError("condition provenance draw count mismatch")
     if dict(provenance.signature_counts) != counts:
@@ -926,11 +911,6 @@ def validate_materialized_condition_provenance(
     requirements = _oof_requirements(rows)
     if provenance.unique_oof_items != len(requirements):
         raise ValueError("condition provenance unique OOF count mismatch")
-    requirement_hash = _semantic_sha256(
-        [asdict(requirement) for requirement in requirements]
-    )
-    if provenance.oof_requirements_sha256 != requirement_hash:
-        raise ValueError("condition provenance OOF requirements hash mismatch")
     return requirements
 
 
@@ -941,13 +921,15 @@ def materialize_condition_signatures(
     training_seed: int,
     source_draw_purpose_id: str,
     signature_purpose_id: str,
-    source_draw_manifest_sha256: str,
+    source_draw_manifest_sha256: str | None = None,
 ) -> ConditionAugmentationResult:
     """Materialize one signature per already selected base draw.
 
     Signature randomness is keyed only by ``(training_seed,
     signature_purpose_id, global_example_index)``.  Batch size, accumulation,
     rank, worker count, and traversal topology are not accepted inputs.
+    ``source_draw_manifest_sha256`` is optional recorded lineage; when omitted
+    the canonical hash of ``base_rows`` is recorded instead.
     """
 
     if not base_rows:
@@ -958,12 +940,8 @@ def materialize_condition_signatures(
         raise ValueError("signature_purpose_id must be non-empty")
     if signature_purpose_id == source_draw_purpose_id:
         raise ValueError("signature selection requires a distinct purpose namespace")
-    _require_sha256(
-        source_draw_manifest_sha256, name="source_draw_manifest_sha256"
-    )
-    actual_source_hash = canonical_draw_rows_sha256(base_rows)
-    if source_draw_manifest_sha256 != actual_source_hash:
-        raise ValueError("source draw manifest hash does not match its rows")
+    if not source_draw_manifest_sha256:
+        source_draw_manifest_sha256 = canonical_draw_rows_sha256(base_rows)
     # Validate seed and purpose before entering the materialization loop.
     canonical_counter(training_seed, signature_purpose_id, 0)
 
@@ -1037,6 +1015,7 @@ def materialize_condition_signatures(
             str(entry.condition_signature) for entry in policy.entries
         ),
         signature_counts=tuple(sorted(counts.items())),
+        weight_clipping=policy.weight_clipping,
     )
     return ConditionAugmentationResult(
         rows=materialized,
@@ -1048,29 +1027,18 @@ def materialize_condition_signatures(
 def oof_lineage_metadata(
     result: ConditionAugmentationResult,
     *,
-    normalization_artifact_sha256: str,
+    normalization_artifact_sha256: str = "",
 ) -> Mapping[str, object]:
-    """Return hashes an OOF publication must bind before dense inference.
+    """Return recorded lineage for an OOF publication.
 
-    The actual OOF writer additionally binds fold-regression checkpoints and
+    The actual OOF writer additionally records fold-regression checkpoints and
     target-builder provenance.  This mapping supplies the condition-specific
     half of that lineage without inspecting any target, validation, or test
-    label.
+    label.  All digests are informational.
     """
 
-    normalization_hash = _require_sha256(
-        normalization_artifact_sha256, name="normalization_artifact_sha256"
-    )
+    normalization_hash = normalization_artifact_sha256
     provenance = result.provenance
-    if canonical_draw_rows_sha256(result.rows) != (
-        provenance.augmented_draw_manifest_sha256
-    ):
-        raise ValueError("augmented rows no longer match condition provenance")
-    requirements_hash = _semantic_sha256(
-        [asdict(requirement) for requirement in result.oof_requirements]
-    )
-    if requirements_hash != provenance.oof_requirements_sha256:
-        raise ValueError("OOF requirements no longer match condition provenance")
     return {
         "condition_augmentation_provenance_sha256": provenance.semantic_sha256,
         "condition_policy_sha256": provenance.policy_sha256,

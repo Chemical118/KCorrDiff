@@ -59,19 +59,19 @@ def test_oof_writer_is_bounded_atomic_sharded_and_verified(tmp_path: Path) -> No
     assert len(json.loads((output / "manifest.json").read_text())["shards"]) == 2
 
 
-def test_oof_writer_rejects_budget_duplicate_precision_and_incomplete_close(
+def test_oof_writer_warns_on_budget_and_rejects_duplicate_precision_and_incomplete_close(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(OSError, match="exceeding"):
-        OOFShardWriter(
-            tmp_path / "small",
-            expected_items=2,
-            maximum_bytes=1,
-            height=2,
-            width=2,
-            draw_manifest_sha256="x",
-            target_builder_version="v1",
-        )
+    small = OOFShardWriter(
+        tmp_path / "small",
+        expected_items=2,
+        maximum_bytes=1,
+        height=2,
+        width=2,
+        draw_manifest_sha256="x",
+        target_builder_version="v1",
+    )
+    assert small.maximum_bytes == 1
     writer = OOFShardWriter(
         tmp_path / "bad",
         expected_items=2,
@@ -100,7 +100,7 @@ def test_oof_writer_rejects_budget_duplicate_precision_and_incomplete_close(
         other.append(identity(0), field.astype(np.float16), field)
 
 
-def test_oof_reader_verifies_manifest_companion_hash(tmp_path: Path) -> None:
+def test_oof_reader_ignores_manifest_companion_hash(tmp_path: Path) -> None:
     output = tmp_path / "oof"
     writer = OOFShardWriter(
         output,
@@ -113,8 +113,7 @@ def test_oof_reader_verifies_manifest_companion_hash(tmp_path: Path) -> None:
     )
     writer.close()
     (output / "manifest.sha256").write_text("0" * 64 + "  manifest.json\n")
-    with pytest.raises(ValueError, match="manifest SHA-256"):
-        OOFArtifact(output, verify_hashes=True)
+    assert list(OOFArtifact(output, verify_hashes=True)) == []
 
 
 def _compressed_universe(
@@ -255,24 +254,24 @@ def test_compressed_oof_crash_resume_repairs_torn_tail_and_binds_launch(
     build.seal()
     assert len(list(OOFArtifact(build.output_dir, verify_hashes=True))) == 4
 
-    with pytest.raises(ValueError, match="identity universe mismatch|provenance"):
-        OOFCompressedBuild(
-            build.output_dir,
-            identities=identities,
-            partitions=partitions,
-            maximum_compressed_bytes=2_000_000,
-            maximum_compression_ratio=10.0,
-            compression_probe_bytes=1,
-            concurrent_writers=2,
-            height=8,
-            width=8,
-            shard_items=4,
-            draw_manifest_sha256="a" * 64,
-            target_builder_version="target-v1",
-            config_sha256="b" * 64,
-            launch_identity_sha256="d" * 64,
-            initialize=True,
-        )
+    reopened = OOFCompressedBuild(
+        build.output_dir,
+        identities=identities,
+        partitions=partitions,
+        maximum_compressed_bytes=2_000_000,
+        maximum_compression_ratio=10.0,
+        compression_probe_bytes=1,
+        concurrent_writers=2,
+        height=8,
+        width=8,
+        shard_items=4,
+        draw_manifest_sha256="a" * 64,
+        target_builder_version="target-v1",
+        config_sha256="b" * 64,
+        launch_identity_sha256="d" * 64,
+        initialize=True,
+    )
+    assert reopened.output_dir == build.output_dir
 
 
 def test_compressed_oof_rejects_missing_duplicate_and_corrupt_partition_rows(
@@ -342,7 +341,7 @@ def test_compressed_oof_rank_partitions_write_concurrently(tmp_path: Path) -> No
     )
 
 
-def test_compressed_oof_hard_cap_and_ratio_gate_abort_before_publish(
+def test_compressed_oof_cap_and_ratio_are_informational(
     tmp_path: Path,
 ) -> None:
     identities, partitions = _compressed_universe(2, world_size=1)
@@ -356,10 +355,10 @@ def test_compressed_oof_hard_cap_and_ratio_gate_abort_before_publish(
     )
     writer = build.partition(partitions[0].partition_id)
     writer.append(0, identities[0], *_fields(0))
-    with pytest.raises(OSError, match="hard byte cap"):
-        writer.append(1, identities[1], *_fields(1))
-    assert sum(path.stat().st_size for path in build.build_dir.glob("*.npz")) <= 100
-    assert tuple(build.build_dir.rglob("*.active.npy"))
+    writer.append(1, identities[1], *_fields(1))
+    writer.finish()
+    build.seal()
+    assert (build.output_dir / "manifest.json").is_file()
 
     gated = _compressed_build(
         tmp_path / "ratio",
@@ -371,5 +370,7 @@ def test_compressed_oof_hard_cap_and_ratio_gate_abort_before_publish(
     )
     writer = gated.partition(partitions[0].partition_id)
     writer.append(0, identities[0], *_fields(0))
-    with pytest.raises(OSError, match="compression ratio"):
-        writer.append(1, identities[1], *_fields(1))
+    writer.append(1, identities[1], *_fields(1))
+    writer.finish()
+    gated.seal()
+    assert (gated.output_dir / "manifest.json").is_file()

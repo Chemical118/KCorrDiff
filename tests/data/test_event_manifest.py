@@ -218,7 +218,7 @@ def test_available_lead_mask_maps_bits_and_rejects_invalid_masks() -> None:
             )
 
 
-def test_cli_config_contracts_fail_closed_on_protocol_drift() -> None:
+def test_cli_config_contracts_validate_scientific_fields_without_pinning_clipping() -> None:
     manifest = {
         "leads_hours": list(LEADS_HOURS),
         "target_distribution": "event_conditioned_archive",
@@ -242,8 +242,9 @@ def test_cli_config_contracts_fail_closed_on_protocol_drift() -> None:
         )
     with pytest.raises(ValueError, match="eligible_items_uniform"):
         _validate_sampling_config({"target_policy": "block_uniform"})
-    with pytest.raises(ValueError, match="forbids"):
-        _validate_sampling_config({"weight_clipping": 10.0})
+    _validate_sampling_config({"weight_clipping": 10.0})
+    with pytest.raises(ValueError, match="finite and positive"):
+        _validate_sampling_config({"weight_clipping": 0.0})
 
 
 def _three_event_timestamps() -> tuple[datetime, ...]:
@@ -295,10 +296,18 @@ def test_bundle_is_atomic_hashed_folded_and_budgeted(tmp_path: Path) -> None:
         assert len(payload) == artifact["bytes"]
         assert hashlib.sha256(payload).hexdigest() == artifact["sha256"]
 
-    rejected = tmp_path / "rejected"
-    with pytest.raises(OSError, match="exceeding"):
-        write_event_training_bundle(
-            rejected,
+
+
+def test_exceeded_byte_budget_warns_but_still_publishes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rows, event_audit = build_event_pretrain_index(
+        _three_event_timestamps(), outer_interval()
+    )
+    output = tmp_path / "over-budget"
+    with caplog.at_level("WARNING", logger="kcorrdiff.data.sampling"):
+        result = write_event_training_bundle(
+            output,
             rows,
             event_audit,
             outer_interval(),
@@ -310,7 +319,31 @@ def test_bundle_is_atomic_hashed_folded_and_budgeted(tmp_path: Path) -> None:
             config_sha256="a" * 64,
             protocol_version="v1.1.3b",
         )
-    assert not rejected.exists()
+    assert output.exists()
+    assert result.oof_required_bytes > 1
+    assert any("exceeding" in record.getMessage() for record in caplog.records)
+
+
+def test_bundle_builds_without_any_byte_budget(tmp_path: Path) -> None:
+    rows, event_audit = build_event_pretrain_index(
+        _three_event_timestamps(), outer_interval()
+    )
+    output = tmp_path / "no-budget"
+    result = write_event_training_bundle(
+        output,
+        rows,
+        event_audit,
+        outer_interval(),
+        draw_count=4,
+        draw_policy="uniform",
+        seed=17,
+        purpose_id="regression",
+        config_sha256="a" * 64,
+        protocol_version="v1.1.3b",
+    )
+    assert result.draws == 4
+    metadata = json.loads((output / "bundle-metadata.json").read_text())
+    assert metadata["oof_preflight"]["maximum_bytes"] is None
 
 
 def test_bundle_materializes_sample_first_condition_signatures(tmp_path: Path) -> None:

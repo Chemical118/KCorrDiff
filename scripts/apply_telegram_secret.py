@@ -49,7 +49,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--namespace", default="ws-md93se6gk3270")
     parser.add_argument("--secret-name", default="kcorrdiff-telegram")
     arguments = parser.parse_args(argv)
-    values = _parse_env(arguments.env_file.resolve(strict=True))
+    if not arguments.env_file.is_file():
+        raise FileNotFoundError(arguments.env_file)
+    values = _parse_env(arguments.env_file)
     resource = {
         "apiVersion": "v1",
         "kind": "Secret",

@@ -55,7 +55,8 @@ spec:
               test -f /workspace/data/cache/radar-v1/manifest.json
               test -f /workspace/data/cache/era5-v1/manifest.json
               nvidia-smi -L
-              python -c 'import torch; assert torch.cuda.device_count() == 1'
+              python -c 'import torch; assert torch.cuda.device_count() > 0, "no visible GPU"'
+              gpu_count="$(python -c 'import torch; print(torch.cuda.device_count())')"
 
               run_case() {
                 local case_name="$1"
@@ -75,13 +76,8 @@ spec:
                   --era5-cache-root /workspace/data/cache/era5-v1 \
                   --target-static /workspace/data/static/target_static.npz \
                   --candidate-manifest "${bundle_root}/candidate-manifest.json" \
-                  --candidate-manifest-sha256 4f321077767f47591e0686f2913938c94e53786ebaf525626e794da4c01c0566 \
                   --draw-manifest "${bundle_root}/training-draw-manifest.jsonl" \
-                  --draw-manifest-sha256 83907188044ed3f5f0964090f4b7b4de5fd666791d7aed85db31a435bffc603c \
                   --bundle-metadata "${bundle_root}/bundle-metadata.json" \
-                  --bundle-metadata-sha256 c09ed583d401adba90c38547ca3beda573fc53f517da0c7a92676b64f6e7b2de \
-                  --target-coordinates-sha256 76ab36d56fbc6f9a626164ffe818ef5dc553b2a897a0185efb7617878a59a912 \
-                  --context-coordinates-sha256 7ea1d02c8136a8cf59713b5d07ccd40806ee38ca660a8c19ccfb6a6ab3693065 \
                   --output-json "${case_root}/summary.json" \
                   --device cuda:0 \
                   --precision float32 \
@@ -99,7 +95,7 @@ spec:
                   --maximum-host-pipeline-bytes 53687091200 \
                   --maximum-shm-pipeline-bytes 16106127360 \
                   --payload-safety-factor 1.25 \
-                  --logical-world-size 2 \
+                  --logical-world-size "${gpu_count}" \
                   --rank 0 \
                   --role deployment \
                   --wandb-mode online

@@ -54,9 +54,7 @@ def benchmark_oof_codec(input_path: Path) -> dict[str, object]:
         restored = load_compressed_oof_fields(temporary)
         decode_seconds = time.perf_counter() - decode_started
         restored_sha = hashlib.sha256(restored.tobytes(order="C")).hexdigest()
-        if input_sha != restored_sha or not np.array_equal(
-            logical.view(np.uint32), restored.view(np.uint32)
-        ):
+        if not np.array_equal(logical.view(np.uint32), restored.view(np.uint32)):
             raise ValueError("OOF codec round trip is not bitwise lossless")
         return {
             "format_version": REPORT_FORMAT,

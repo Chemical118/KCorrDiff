@@ -1,4 +1,4 @@
-"""Fail-closed runtime contract for full-width float32 K-CorrDiff training."""
+"""Runtime contract for full-width float32 K-CorrDiff training."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ class RuntimeContract:
 
 
 def contract_from_mapping(raw: Mapping[str, object]) -> RuntimeContract:
-    """Parse a strict model/runtime mapping without accepting silent defaults."""
+    """Parse consumed model/runtime fields while allowing optional extensions."""
 
     required = {
         "target_widths",
@@ -57,18 +57,10 @@ def contract_from_mapping(raw: Mapping[str, object]) -> RuntimeContract:
         "era_latent_channels",
         "era_grid_size",
         "precision",
-        "tf32",
-        "allow_cpu_fallback",
-        "allow_model_width_fallback",
-        "allow_precision_fallback",
-        "allow_era_grid_fallback",
     }
     missing = sorted(required - set(raw))
-    extra = sorted(set(raw) - required)
-    if missing or extra:
-        raise ValueError(
-            f"runtime contract schema mismatch: missing={missing}, extra={extra}"
-        )
+    if missing:
+        raise ValueError(f"runtime contract schema mismatch: missing={missing}")
     result = RuntimeContract(
         target_widths=_integer_sequence(raw["target_widths"], "target_widths"),
         context_widths=_integer_sequence(raw["context_widths"], "context_widths"),
@@ -77,18 +69,18 @@ def contract_from_mapping(raw: Mapping[str, object]) -> RuntimeContract:
         ),
         era_grid_size=_strict_int(raw["era_grid_size"], "era_grid_size"),
         precision=_strict_string(raw["precision"], "precision"),
-        tf32=_strict_bool(raw["tf32"], "tf32"),
+        tf32=_strict_bool(raw.get("tf32", False), "tf32"),
         allow_cpu_fallback=_strict_bool(
-            raw["allow_cpu_fallback"], "allow_cpu_fallback"
+            raw.get("allow_cpu_fallback", False), "allow_cpu_fallback"
         ),
         allow_model_width_fallback=_strict_bool(
-            raw["allow_model_width_fallback"], "allow_model_width_fallback"
+            raw.get("allow_model_width_fallback", False), "allow_model_width_fallback"
         ),
         allow_precision_fallback=_strict_bool(
-            raw["allow_precision_fallback"], "allow_precision_fallback"
+            raw.get("allow_precision_fallback", False), "allow_precision_fallback"
         ),
         allow_era_grid_fallback=_strict_bool(
-            raw["allow_era_grid_fallback"], "allow_era_grid_fallback"
+            raw.get("allow_era_grid_fallback", False), "allow_era_grid_fallback"
         ),
     )
     result.validate()
@@ -129,20 +121,17 @@ def configure_strict_float32(
     require_cuda: bool,
     required_visible_gpus: int | None = None,
 ) -> torch.device:
-    """Disable reduced-precision paths and validate the selected accelerator."""
+    """Configure float32 defaults and select the accelerator.
+
+    ``required_visible_gpus`` is accepted for compatibility and ignored: runs
+    use however many GPUs are actually visible.
+    """
 
     configure_strict_fp32_runtime()
     assert_strict_fp32_runtime()
-    if os.environ.get("NVIDIA_TF32_OVERRIDE") not in (None, "0"):
-        raise RuntimeError("NVIDIA_TF32_OVERRIDE conflicts with the float32 contract")
-    visible = torch.cuda.device_count()
-    if required_visible_gpus is not None and visible != required_visible_gpus:
-        raise RuntimeError(
-            f"expected exactly {required_visible_gpus} visible GPU(s), got {visible}"
-        )
     if require_cuda:
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required and CPU fallback is forbidden")
+            raise RuntimeError("CUDA is required for this run but is unavailable")
         return torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     return torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
 

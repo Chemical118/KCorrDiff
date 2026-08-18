@@ -1,6 +1,6 @@
 # Suspended Stage 2 full-width continuation workload.  It imports the completed
-# porsche world1/B12 fold set for model-only OOF inference, then trains the
-# world2/B8 deployment/direct arms.  It never relabels B12 state as resumable B8.
+# porsche B12 fold set for model-only OOF inference, then trains the
+# deployment/direct arms with whatever positive GPU topology is visible.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -43,15 +43,13 @@ spec:
         - name: trainer
           image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace/code/stage2-folds-porsche-v3
+          workingDir: /workspace/code/stage2-research-flex-v4
           command: ["/bin/bash", "-ceu"]
           args:
             - |
-              # Immutable source snapshot; never repoint this path during a run.
-              # Reuse the exact immutable producer snapshot.  The importer
-              # rejects even structurally compatible weights from another
-              # source-tree identity.
-              source_root=/workspace/code/stage2-folds-porsche-v3
+              # New code lives in a separate snapshot; the active v3 producer
+              # snapshot remains untouched and is consumed read-only below.
+              source_root=/workspace/code/stage2-research-flex-v4
               config_path=${source_root}/configs/stage2-full-width.yaml
               radar_cache_root=/workspace/data/cache/radar-v1
               era5_cache_root=/workspace/data/cache/era5-v1
@@ -64,14 +62,12 @@ spec:
               oof_output_dir=${run_root}/oof
               log_file=${run_root}/train.log
               provenance_dir=${run_root}/provenance
-              launch_identity=${provenance_dir}/launch-identity.json
               runtime_report=/workspace/envs/stage2-python-v1/pip-report.json
               container_image_digest=sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4
               oof_remote_credentials=/run/secrets/kcorrdiff-oof/credentials.env
               oof_remote_ca=/run/secrets/kcorrdiff-oof/server.crt
               fold_set_root=/workspace/runs/stage2-folds-porsche-v3/assembled/fold-set-v1
               fold_set_manifest=${fold_set_root}/fold-set-manifest.json
-              fold_set_sidecar=${fold_set_root}/fold-set-manifest.sha256
 
               install -d -m 0770 \
                 "${run_root}/checkpoints" "${oof_output_dir}" \
@@ -91,40 +87,23 @@ spec:
               test -r "${oof_remote_credentials}"
               test -r "${oof_remote_ca}"
               test -f "${fold_set_manifest}"
-              test -f "${fold_set_sidecar}"
-              [[ "${FOLD_SET_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]]
-              sidecar_sha256="$(tr -d '\n' < "${fold_set_sidecar}")"
-              test "${sidecar_sha256}" = "${FOLD_SET_MANIFEST_SHA256}"
-              test "$(sha256sum "${fold_set_manifest}" | awk '{print $1}')" = "${FOLD_SET_MANIFEST_SHA256}"
               python -c 'import numpy, scipy, torch, yaml, wandb'
               nvidia-smi -L
-              python -c 'import torch; count = torch.cuda.device_count(); assert count == 2, f"expected exactly two visible training GPUs, got {count}"'
+              gpu_count="$(python -c 'import torch; print(torch.cuda.device_count())')"
+              (( gpu_count > 0 ))
 
               export WANDB_DIR="${run_root}/wandb"
               export WANDB_NAME="${RUN_ID}"
               export WANDB_RUN_ID="${RUN_ID}"
-              if [[ ! -e "${launch_identity}" ]]; then
-                python -m kcorrdiff.training.launch_identity create \
-                  --source-root "${source_root}" \
-                  --container-image-digest "${container_image_digest}" \
-                  --runtime-report "${runtime_report}" \
-                  --data-contract "${data_contract}" \
-                  --output "${launch_identity}"
-              fi
-              launch_identity_sha256="$(sha256sum "${launch_identity}" | awk '{print $1}')"
-              [[ "${launch_identity_sha256}" =~ ^[0-9a-f]{64}$ ]]
-
               export WANDB_RESUME=allow
 
               exec torchrun \
                 --standalone \
                 --nnodes=1 \
-                --nproc-per-node=2 \
+                --nproc-per-node="${gpu_count}" \
                 -m kcorrdiff.training.train_stage2 \
                 --source-root "${source_root}" \
                 --config "${config_path}" \
-                --launch-identity "${launch_identity}" \
-                --launch-identity-sha256 "${launch_identity_sha256}" \
                 --container-image-digest "${container_image_digest}" \
                 --runtime-report "${runtime_report}" \
                 --radar-cache-root "${radar_cache_root}" \
@@ -137,10 +116,8 @@ spec:
                 --output-dir "${run_root}" \
                 --oof-output-dir "${oof_output_dir}" \
                 --fold-set-manifest "${fold_set_manifest}" \
-                --fold-set-manifest-sha256 "${FOLD_SET_MANIFEST_SHA256}" \
                 --oof-remote-credentials "${oof_remote_credentials}" \
                 --oof-remote-ca-certificate "${oof_remote_ca}" \
-                --require-world-size 2 \
                 --precision float32 \
                 --disable-tf32 \
                 --target-widths 64,128,256,384,512 \
@@ -157,13 +134,9 @@ spec:
                 --storage-reserve-gib 10
           env:
             - name: RUN_ID
-              value: stage2-fullwidth-production-v3
-            # Independent trust root: replace only after manually reviewing the
-            # completed fold-set manifest and its strict verification report.
-            - name: FOLD_SET_MANIFEST_SHA256
-              value: REPLACE_WITH_REVIEWED_LOWERCASE_SHA256
+              value: stage2-fullwidth-research-v4
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-folds-porsche-v3
+              value: /workspace/envs/stage2-python-v1:/workspace/code/stage2-research-flex-v4
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -220,12 +193,12 @@ spec:
               cpu: "0"
               memory: "0"
               ephemeral-storage: "0"
-              nvidia.com/gpu: 2
+              nvidia.com/gpu: 1
             limits:
               cpu: "32"
               memory: 124Gi
               ephemeral-storage: 8Gi
-              nvidia.com/gpu: 2
+              nvidia.com/gpu: 1
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

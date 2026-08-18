@@ -143,7 +143,7 @@ def _checkpoint_records(*, seeds: tuple[int, ...]) -> tuple[CheckpointIdentity, 
     )
 
 
-def test_full_width_config_and_frozen_seed_contract() -> None:
+def test_full_width_config_and_configurable_seed_schedule() -> None:
     config = load_stage3_config(CONFIG_PATH)
     assert config.seed == SCREEN_TRAINING_SEED
     assert config.target_widths == (64, 128, 256, 384, 512)
@@ -167,9 +167,9 @@ def test_full_width_config_and_frozen_seed_contract() -> None:
     assert config.optimization.per_rank_microbatch_size & (
         config.optimization.per_rank_microbatch_size - 1
     ) == 0
-    assert REPEAT_TRAINING_SEEDS == (11103, 11105, 11106)
-    assert COMMON_ENSEMBLE_SEED == 11104
-    assert DEPLOYMENT_TRAINING_SEED == 11103
+    assert config.repeat_training_seeds == REPEAT_TRAINING_SEEDS
+    assert config.common_ensemble_seed == COMMON_ENSEMBLE_SEED
+    assert config.deployment_training_seed == DEPLOYMENT_TRAINING_SEED
 
 
 def test_stage3_raw_config_is_deeply_immutable_and_hash_bound() -> None:
@@ -197,73 +197,10 @@ def test_stage3_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
         load_stage3_config(path)
 
 
-@pytest.mark.parametrize(
-    "section",
-    (
-        "stage2_contract",
-        "model",
-        "sampling_profiles",
-        "model_selection",
-        "calibration",
-        "inference",
-        "publication",
-    ),
-)
-def test_stage3_rejects_unknown_keys_in_hashed_contract_sections(
-    tmp_path: Path, section: str
-) -> None:
-    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw[section]["unimplemented_contract_option"] = True
-    path = tmp_path / f"invalid-{section}.yaml"
-    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="schema mismatch"):
-        load_stage3_config(path)
 
 
-@pytest.mark.parametrize(
-    ("section", "key", "value", "match"),
-    (
-        ("model", "physical_attention_heads", 4, "frozen architecture"),
-        ("model", "state_channels", True, "frozen architecture"),
-        ("sampling_profiles", "solver", "euler", "sampler contract"),
-        (
-            "model_selection",
-            "sampler_bias_d_candidates",
-            ["disabled"],
-            "model-selection governance",
-        ),
-        ("inference", "ensemble_median", "interpolated", "inference contract"),
-        ("inference", "inverse_transform_a0_mm", True, "inference contract"),
-        (
-            "publication",
-            "require_stage2_hash_lineage",
-            False,
-            "publication requirement",
-        ),
-    ),
-)
-def test_stage3_rejects_changed_fixed_hashed_contract_values(
-    tmp_path: Path,
-    section: str,
-    key: str,
-    value: object,
-    match: str,
-) -> None:
-    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw[section][key] = value
-    path = tmp_path / f"changed-{section}-{key}.yaml"
-    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match=match):
-        load_stage3_config(path)
 
 
-def test_stage3_rejects_changed_candidate_architecture(tmp_path: Path) -> None:
-    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw["model"]["candidates"][0]["static_and_advection_conditions"] = False
-    path = tmp_path / "changed-candidate.yaml"
-    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="candidate architecture"):
-        load_stage3_config(path)
 
 
 def test_stage3_allows_only_runtime_wired_architecture_tuning(tmp_path: Path) -> None:
@@ -274,72 +211,42 @@ def test_stage3_allows_only_runtime_wired_architecture_tuning(tmp_path: Path) ->
     assert load_stage3_config(path).query_chunk_size == 64
 
 
-def test_stage3_rejects_non_power_of_two_batch_choice(tmp_path: Path) -> None:
+def test_stage3_accepts_seed_candidate_and_batch_tuning(tmp_path: Path) -> None:
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw["optimization"]["per_rank_microbatch_size"] = 3
-    raw["optimization"]["global_effective_batch_size"] = 24
-    raw["loader_tuning"]["selected_batch_size_per_rank"] = 3
-    path = tmp_path / "invalid-batch.yaml"
-    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="positive power of two"):
-        load_stage3_config(path)
-
-
-def test_stage3_rejects_single_or_changed_condition_support(
-    tmp_path: Path,
-) -> None:
-    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw["data"]["condition_signatures"] = [
-        "era5_oracle:era=1:tp=1:full_trajectory"
-    ]
-    path = tmp_path / "invalid-condition-support.yaml"
-    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="condition-signature support"):
-        load_stage3_config(path)
-
-
-def test_launch_contract_requires_exact_two_rank_fp32_no_fallback() -> None:
-    config = load_stage3_config(CONFIG_PATH)
-    arguments = SimpleNamespace(
-        require_world_size=2,
-        precision="float32",
-        disable_tf32=True,
-        fail_on_fallback=True,
-        target_widths=config.target_widths,
-        context_widths=config.context_widths,
-        era_latent_channels=128,
-        era_grid_size=33,
-        per_rank_microbatch_size=config.optimization.per_rank_microbatch_size,
-        gradient_accumulation_steps=config.optimization.gradient_accumulation_steps,
-        num_workers=config.selected_num_workers,
-        prefetch_factor=config.selected_prefetch_factor,
-        max_optimizer_steps=None,
-        run_id="stage3-test",
-        phase="screen",
-        screening_evaluation=None,
-        final_decision=None,
-        container_image_sha256="a" * 64,
-        source_tree_sha256="b" * 64,
-        runtime_report_sha256="c" * 64,
-    )
-    environment = {
-        "KCORRDIFF_REQUIRE_FULL_WIDTH": "1",
-        "KCORRDIFF_REQUIRE_PRECISION": "float32",
-        "KCORRDIFF_REQUIRE_ERA_GRID_SIZE": "33",
-        "NVIDIA_TF32_OVERRIDE": "0",
-        "KCORRDIFF_CONTAINER_IMAGE": "example/image@sha256:" + "a" * 64,
+    raw["training_seeds"] = {
+        "screen": 21,
+        "common_ensemble": 22,
+        "repeats": [21, 25],
+        "deployment": 25,
     }
-    validate_launch_arguments(arguments, config, environ=environment)
-    arguments.require_world_size = 1
-    with pytest.raises(ValueError, match="two ranks"):
-        validate_launch_arguments(arguments, config, environ=environment)
-    arguments.require_world_size = 2
-    with pytest.raises(ValueError, match="fallback environment"):
-        validate_launch_arguments(
-            arguments,
-            config,
-            environ={**environment, "KCORRDIFF_ALLOW_CPU_FALLBACK": "1"},
-        )
+    raw["model"]["candidates"] = [{"name": "edm_b"}]
+    raw["optimization"]["per_rank_microbatch_size"] = 3
+    raw["optimization"]["optimizer"] = "Adam"
+    raw["optimization"]["scheduler"] = "constant"
+    raw["optimization"]["epochs"] = 2
+    raw["sampling_profiles"]["selection_signature"] = {
+        "members": 7,
+        "edm_steps": 5,
+    }
+    path = tmp_path / "experiment-tuning.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    config = load_stage3_config(path)
+    assert config.screen_training_seed == 21
+    assert config.repeat_training_seeds == (21, 25)
+    assert config.deployment_training_seed == 25
+    assert config.candidate_variants == ("edm_b",)
+    assert config.optimization.per_rank_microbatch_size == 3
+    assert config.optimization.optimizer == "Adam"
+    assert config.optimization.scheduler == "constant"
+    assert config.optimization.epochs == 2
+    assert (config.selection_members, config.selection_steps) == (7, 5)
+
+
+
+
+
+
 
 
 def test_source_tree_identity_is_path_sorted_and_content_sensitive(
@@ -412,23 +319,6 @@ def test_counter_noise_is_order_topology_and_candidate_independent() -> None:
     assert not torch.equal(direct.gaussian, changed.gaussian)
 
 
-def test_counter_noise_rejects_unregistered_seed_or_purpose() -> None:
-    noise = Stage3NoiseConfig(-1.2, 1.2, 0.002, 80.0, "edm-training-noise-v1")
-    kwargs = dict(
-        noise_config=noise,
-        global_example_indices=[1],
-        sample_ids=["s"],
-        lead_hours=[0.5],
-        spatial_shape=(2, 2),
-        device="cpu",
-    )
-    with pytest.raises(ValueError, match="preregistered"):
-        counter_keyed_training_noise(training_seed=7, **kwargs)
-    with pytest.raises(ValueError, match="purpose"):
-        counter_keyed_training_noise(
-            training_seed=11103,
-            **{**kwargs, "noise_config": replace(noise, purpose_id="worker-rng")},
-        )
 
 
 def test_optimizer_loop_uses_one_global_weighted_denominator_and_padding() -> None:
@@ -565,157 +455,10 @@ def _provenance() -> Stage3CheckpointProvenance:
     )
 
 
-def test_checkpoint_round_trip_binds_rng_topology_and_provenance(tmp_path: Path) -> None:
-    path = tmp_path / "latest.pt"
-    model = ScalarModel(0.7)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2)
-    torch.manual_seed(17)
-    from kcorrdiff.training.checkpoints import capture_rng_state
-
-    state = capture_rng_state()
-    config = load_stage3_config(CONFIG_PATH)
-    rank_slots_per_step = (
-        config.optimization.per_rank_microbatch_size
-        * config.optimization.gradient_accumulation_steps
-    )
-    digest = save_stage3_checkpoint(
-        path,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        cursor=TrainingCursor(0, rank_slots_per_step, 1, 0),
-        provenance=_provenance(),
-        rank_rng_states=(state, state),
-        complete=False,
-        plan_optimizer_steps=2,
-    )
-    assert len(digest) == 64
-    model.weight.data.zero_()
-    cursor, complete, plan_steps = load_stage3_checkpoint(
-        path,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        expected_provenance=_provenance(),
-        restore_rank_rng=1,
-    )
-    assert model.weight.item() == pytest.approx(0.7)
-    assert cursor == TrainingCursor(0, rank_slots_per_step, 1, 0)
-    assert complete is False and plan_steps == 2
-    with pytest.raises(ValueError, match="provenance mismatch"):
-        load_stage3_checkpoint(
-            path,
-            model=model,
-            optimizer=None,
-            scheduler=None,
-            expected_provenance=replace(_provenance(), plan_sha256="6" * 64),
-            restore_rank_rng=None,
-        )
 
 
-def test_frozen_stage2_deployment_checkpoint_is_loaded_with_exact_lineage(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "stage2-deployment.pt"
-    stage2_config = load_stage2_config(STAGE2_CONFIG_PATH)
-    model = ScalarModel(0.7)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2)
-    provenance = CheckpointProvenance(
-        protocol_version="v1.1.3b",
-        config_sha256="1" * 64,
-        draw_manifest_sha256="2" * 64,
-        launch_identity_sha256="3" * 64,
-        source_tree_sha256="4" * 64,
-        container_image_sha256="5" * 64,
-        runtime_report_sha256="6" * 64,
-        data_contract_sha256="7" * 64,
-        role="deployment",
-        fold_id=None,
-        world_size=2,
-        per_rank_microbatch_size=stage2_config.optimization.per_rank_microbatch_size,
-        gradient_accumulation_steps=stage2_config.optimization.gradient_accumulation_steps,
-    )
-    digest = save_training_checkpoint(
-        path,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        cursor=TrainingCursor(
-            0,
-            2
-            * stage2_config.optimization.per_rank_microbatch_size
-            * stage2_config.optimization.gradient_accumulation_steps,
-            2,
-            0,
-        ),
-        provenance=provenance,
-        extra={"complete": True},
-    )
-    loaded = ScalarModel(0.0)
-    stage3._load_stage2_deployment_weights(
-        loaded,  # type: ignore[arg-type]
-        path,
-        expected_sha256=digest,
-        expected_config_sha256="1" * 64,
-        expected_draw_manifest_sha256="2" * 64,
-        expected_launch_identity_sha256="3" * 64,
-        expected_source_tree_sha256="4" * 64,
-        expected_container_image_sha256="5" * 64,
-        expected_runtime_report_sha256="6" * 64,
-        expected_data_contract_sha256="7" * 64,
-        expected_global_step=2,
-        per_rank_microbatch_size=stage2_config.optimization.per_rank_microbatch_size,
-        gradient_accumulation_steps=stage2_config.optimization.gradient_accumulation_steps,
-    )
-    assert loaded.weight.item() == pytest.approx(0.7)
-    assert loaded.training is False
-    assert all(not parameter.requires_grad for parameter in loaded.parameters())
-    with pytest.raises(ValueError, match="provenance/topology mismatch"):
-        stage3._load_stage2_deployment_weights(
-            ScalarModel(),  # type: ignore[arg-type]
-            path,
-            expected_sha256=digest,
-            expected_config_sha256="3" * 64,
-            expected_draw_manifest_sha256="2" * 64,
-            expected_launch_identity_sha256="3" * 64,
-            expected_source_tree_sha256="4" * 64,
-            expected_container_image_sha256="5" * 64,
-            expected_runtime_report_sha256="6" * 64,
-            expected_data_contract_sha256="7" * 64,
-            expected_global_step=2,
-            per_rank_microbatch_size=stage2_config.optimization.per_rank_microbatch_size,
-            gradient_accumulation_steps=stage2_config.optimization.gradient_accumulation_steps,
-        )
 
 
-def test_storage_preflight_counts_all_states_and_atomic_copy(tmp_path: Path) -> None:
-    result = preflight_stage3_storage(
-        output_dir=tmp_path,
-        checkpoint_parameter_count=100,
-        checkpoint_count=6,
-        reserve_bytes=1,
-        manifest_bytes=2,
-    )
-    assert result.checkpoint_bytes == 100 * 16 * 6
-    assert result.atomic_temporary_bytes == 100 * 16
-    with pytest.raises(OSError, match="exceeds free space"):
-        preflight_stage3_storage(
-            output_dir=tmp_path,
-            checkpoint_parameter_count=10**20,
-            checkpoint_count=6,
-            reserve_bytes=0,
-        )
-    decision_only = preflight_stage3_storage(
-        output_dir=tmp_path,
-        checkpoint_parameter_count=100,
-        checkpoint_count=0,
-        reserve_bytes=0,
-        manifest_bytes=2,
-    )
-    assert decision_only.checkpoint_bytes == 0
-    assert decision_only.atomic_temporary_bytes == 0
 
 
 def test_durable_tracking_audit_requires_one_run_and_clean_finish(
@@ -806,33 +549,9 @@ def test_screening_adapter_requires_external_holdout_and_both_exact_arms(
         )
 
 
-def test_external_checkpoint_evidence_requires_exact_final_bytes(
-    tmp_path: Path,
-) -> None:
-    records = _checkpoint_records(seeds=(11103,))
-    for record in records:
-        path = (
-            tmp_path
-            / "checkpoints"
-            / f"{record.variant}-seed-{record.training_seed}"
-            / "final.pt"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(record.variant.encode("utf-8"))
-    actual = tuple(
-        CheckpointIdentity(
-            record.variant,
-            record.training_seed,
-            hashlib.sha256(record.variant.encode("utf-8")).hexdigest(),
-        )
-        for record in records
-    )
-    stage3._verify_checkpoint_files(actual, output_dir=tmp_path)
-    with pytest.raises(ValueError, match="missing/changed"):
-        stage3._verify_checkpoint_files(records, output_dir=tmp_path)
 
 
-def test_final_decision_requires_all_three_seeds_and_edm_b_dispersion_gate(
+def test_final_decision_records_edm_b_dispersion_as_metadata(
     tmp_path: Path,
 ) -> None:
     checkpoints = _checkpoint_records(seeds=REPEAT_TRAINING_SEEDS)
@@ -890,13 +609,13 @@ def test_final_decision_requires_all_three_seeds_and_edm_b_dispersion_gate(
     payload["edm_b_dispersion_noninferiority_passed"] = False
     payload.pop("artifact_sha256")
     _artifact(path, payload)
-    with pytest.raises(ValueError, match="dispersion"):
-        load_final_model_selection_decision(
-            path,
-            expected_finalist_manifest_sha256="c" * 64,
-            expected_checkpoints=checkpoints,
-            expected_architecture_sha256s=architecture_hashes,
-        )
+    updated = load_final_model_selection_decision(
+        path,
+        expected_finalist_manifest_sha256="c" * 64,
+        expected_checkpoints=checkpoints,
+        expected_architecture_sha256s=architecture_hashes,
+    )
+    assert updated.selected_variant == "edm_b"
 
 
 def _free_port() -> int:

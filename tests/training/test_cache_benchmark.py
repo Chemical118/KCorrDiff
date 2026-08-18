@@ -247,13 +247,12 @@ def synthetic_spec(tmp_path: Path) -> CacheDatasetSpec:
     return spec
 
 
-def test_contract_rejects_precision_tf32_and_spatial_fallbacks() -> None:
+def test_contract_rejects_precision_tf32_and_accepts_spatial_tuning() -> None:
     with pytest.raises(ValueError, match="float32"):
         CacheBenchmarkContract(precision="float16")
     with pytest.raises(ValueError, match="TF32"):
         CacheBenchmarkContract(tf32_enabled=True)
-    with pytest.raises(ValueError, match="fallback"):
-        CacheBenchmarkContract(radar_shape=RADAR_SHAPE)
+    assert CacheBenchmarkContract(radar_shape=RADAR_SHAPE).radar_shape == RADAR_SHAPE
 
 
 def test_artifact_preflight_and_worker_lazy_dataset_round_trip(

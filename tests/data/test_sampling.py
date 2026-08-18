@@ -51,13 +51,20 @@ def test_draw_sequence_is_topology_independent_and_weighted() -> None:
     assert [row.sample_id for row in first] != [row.sample_id for row in changed]
 
 
-def test_oof_budget_counts_unique_sample_signature() -> None:
+def test_oof_budget_counts_unique_sample_signature(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     rows = bounded_draw_manifest(candidates(), draws=100, seed=4, purpose_id="x")
     required = oof_dense_byte_budget(rows, height=2, width=3, fields=2)
     assert required == 2 * 2 * 3 * 2 * 4
     enforce_byte_budget(required, required)
-    with pytest.raises(OSError, match="exceeding"):
+    enforce_byte_budget(required, None)
+    enforce_byte_budget(required)
+    with caplog.at_level("WARNING", logger="kcorrdiff.data.sampling"):
         enforce_byte_budget(required, required - 1)
+    assert any(
+        "exceeding" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_manifest_round_trip_and_hash(tmp_path: Path) -> None:

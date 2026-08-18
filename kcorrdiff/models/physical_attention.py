@@ -78,8 +78,8 @@ class PhysicalCrossAttention(nn.Module):
         super().__init__()
         if min(target_channels, source_channels, condition_dim) <= 0:
             raise ValueError("feature and condition dimensions must be positive")
-        if attention_dim != ATTENTION_DIM or heads != ATTENTION_HEADS:
-            raise ValueError("v1.1.3b L3/L4 attention requires D=256 and 8 heads")
+        if attention_dim <= 0 or heads <= 0 or attention_dim % heads:
+            raise ValueError("attention_dim must be positive and divisible by heads")
         if fourier_frequencies <= 0 or geometry_hidden_dim <= 0:
             raise ValueError("geometry embedding dimensions must be positive")
         if query_chunk_size <= 0:

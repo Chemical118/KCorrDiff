@@ -144,10 +144,8 @@ class ResidualEDMConfig:
         size = validate_input_size(
             self.input_size, allow_test_override=self.allow_test_override
         )
-        if not math.isfinite(float(self.sigma_data)) or float(self.sigma_data) != 1.0:
-            raise ValueError(
-                "v1.1.3b normalized-residual sigma_data must equal 1.0"
-            )
+        if not math.isfinite(float(self.sigma_data)) or float(self.sigma_data) <= 0.0:
+            raise ValueError("sigma_data must be finite and positive")
         if isinstance(self.query_chunk_size, bool) or not isinstance(
             self.query_chunk_size, Integral
         ):

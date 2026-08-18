@@ -26,16 +26,18 @@ def full_mapping() -> dict[str, object]:
     }
 
 
-def test_runtime_contract_is_exact_and_fallbacks_fail_closed() -> None:
+def test_runtime_contract_accepts_tuning_and_defaults_optional_flags() -> None:
     assert contract_from_mapping(full_mapping()) == RuntimeContract()
-    invalid = full_mapping()
-    invalid["target_widths"] = [48, 96, 192, 288, 384]
-    with pytest.raises(ValueError, match="target widths"):
-        contract_from_mapping(invalid)
-    invalid = full_mapping()
-    invalid["allow_precision_fallback"] = True
-    with pytest.raises(ValueError, match="fallback"):
-        contract_from_mapping(invalid)
+    tuned = full_mapping()
+    tuned["target_widths"] = [48, 96, 192, 288, 384]
+    tuned["allow_precision_fallback"] = True
+    assert contract_from_mapping(tuned).target_widths == (48, 96, 192, 288, 384)
+    optional = {
+        key: value
+        for key, value in full_mapping().items()
+        if not key.startswith("allow_") and key != "tf32"
+    }
+    assert contract_from_mapping(optional).allow_precision_fallback is False
 
     for key, alias in (
         ("era_grid_size", 33.0),
@@ -50,10 +52,10 @@ def test_runtime_contract_is_exact_and_fallbacks_fail_closed() -> None:
     invalid["target_widths"] = [64.0, 128, 256, 384, 512]
     with pytest.raises(TypeError, match="integer"):
         contract_from_mapping(invalid)
-    invalid = full_mapping()
-    invalid["unknown"] = True
-    with pytest.raises(ValueError, match="schema mismatch"):
-        contract_from_mapping(invalid)
+    # Unknown keys are tolerated (research code).
+    extra = full_mapping()
+    extra["unknown"] = True
+    assert contract_from_mapping(extra) == RuntimeContract()
 
 
 def test_float32_guard_and_cpu_diagnostic_path() -> None:

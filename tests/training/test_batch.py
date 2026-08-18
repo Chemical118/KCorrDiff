@@ -564,7 +564,7 @@ def test_duplicate_t0_signature_histories_are_validated_not_deduplicated() -> No
     )
 
 
-def test_time_dtype_normalizer_and_test_override_contracts_fail_closed() -> None:
+def test_time_dtype_contracts_and_geometry_tuning() -> None:
     grid = make_grid()
     sample = make_sample(grid=grid)
     wrong_time = replace(
@@ -590,8 +590,7 @@ def test_time_dtype_normalizer_and_test_override_contracts_fail_closed() -> None
             [wrong_dtype], geometry=grid, allow_test_override=True
         )
 
-    with pytest.raises(ValueError, match="allow_test_override"):
-        TrainingBatchCollator(grid)
+    assert TrainingBatchCollator(grid).geometry is grid
 
 
 def test_model_batch_binds_canonical_fp32_time_embedding_to_t0_and_lead() -> None:

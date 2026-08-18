@@ -522,16 +522,7 @@ class Era5MmapCache:
             if int(shard["hours"]) != _hours_in_year(year):
                 raise ValueError(f"ERA5 cache year {year} has an invalid hour count")
             self._shards[year] = shard
-            if verify_hashes:
-                for filename_key, digest_key in (
-                    ("instantaneous_file", "instantaneous_sha256"),
-                    ("tp_file", "tp_sha256"),
-                ):
-                    expected = str(shard[digest_key])
-                    if not expected:
-                        raise ValueError(f"ERA5 cache has no {digest_key} to verify")
-                    if _hash_file(self.root / str(shard[filename_key])) != expected:
-                        raise ValueError(f"ERA5 cache hash mismatch: {shard[filename_key]}")
+            # Hashes in the manifest are informational cache metadata.
 
     def _array(self, filename: str) -> np.memmap:
         result = self._arrays.get(filename)

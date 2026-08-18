@@ -130,9 +130,7 @@ class EraEncoder(nn.Module):
         super().__init__()
         if condition_dim <= 0:
             raise ValueError("condition_dim must be positive")
-        if output_channels != ERA_OUTPUT_CHANNELS:
-            raise ValueError("v1.1.3b ERA output must contain exactly 128 channels")
-        if stem_channels <= 0 or spatial_blocks < 0:
+        if output_channels <= 0 or stem_channels <= 0 or spatial_blocks < 0:
             raise ValueError("stem width must be positive and block count non-negative")
         if temporal_heads <= 0 or output_channels % temporal_heads:
             raise ValueError("output_channels must be divisible by temporal_heads")

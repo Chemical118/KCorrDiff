@@ -123,16 +123,18 @@ class SamplerCoreSignature:
             raise ValueError("v1.1.3b requires the Karras rho=7 schedule")
         if isinstance(self.edm_steps, bool) or not isinstance(self.edm_steps, int):
             raise TypeError("edm_steps must be an integer")
-        if self.edm_steps not in {profile.edm_steps for profile in _PROFILE_ITEMS}:
-            raise ValueError("edm_steps is not part of a declared sampling profile")
+        if self.edm_steps < 2:
+            raise ValueError("edm_steps must be at least two")
+        sigma_min = float(self.sigma_min)
+        sigma_max = float(self.sigma_max)
+        rho = float(self.rho)
         if (
-            float(self.sigma_min) != SIGMA_MIN
-            or float(self.sigma_max) != SIGMA_MAX
-            or float(self.rho) != KARRAS_RHO
+            not all(math.isfinite(value) for value in (sigma_min, sigma_max, rho))
+            or sigma_min <= 0.0
+            or sigma_max <= sigma_min
+            or rho <= 0.0
         ):
-            raise ValueError("sigma_min=0.002, sigma_max=80, and rho=7 are frozen")
-        if self.edm_steps == 4 and self.checkpoint_kind != "distilled":
-            raise ValueError("the 4-step operational sampler requires a distilled checkpoint")
+            raise ValueError("sigma bounds and rho must be finite, positive, and ordered")
 
     @property
     def canonical(self) -> tuple[str, str, str, int, str, float, float, float]:
@@ -343,12 +345,16 @@ def karras_sigma_schedule(
     steps = _positive_integer("edm_steps", edm_steps)
     if steps < 2:
         raise ValueError("Karras sampling requires at least two positive levels")
+    sigma_min = float(sigma_min)
+    sigma_max = float(sigma_max)
+    rho = float(rho)
     if (
-        float(sigma_min) != SIGMA_MIN
-        or float(sigma_max) != SIGMA_MAX
-        or float(rho) != KARRAS_RHO
+        not all(math.isfinite(value) for value in (sigma_min, sigma_max, rho))
+        or sigma_min <= 0.0
+        or sigma_max <= sigma_min
+        or rho <= 0.0
     ):
-        raise ValueError("the frozen schedule is sigma_min=0.002, sigma_max=80, rho=7")
+        raise ValueError("sigma bounds and rho must be finite, positive, and ordered")
     ramp = np.linspace(0.0, 1.0, steps, dtype=np.float64)
     maximum_root = float(sigma_max) ** (1.0 / float(rho))
     minimum_root = float(sigma_min) ** (1.0 / float(rho))

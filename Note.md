@@ -1,5 +1,10 @@
 # K-CorrDiff 구현 기록
 
+> 이 문서는 시점별 실험 결정을 보존한 구현 기록이다. 아래의 고정 hash, GPU 수,
+> batch grid, preregistration 표현은 현재 실행 게이트가 아니다. 현재 코드는
+> `AGENTS.md`에 따라 hash를 메타데이터/cache key로만 기록하고, 양의 runtime
+> topology와 설정 가능한 실험 파라미터를 허용한다.
+
 이 저장소는 `docs/k_corrdiff_architecture_v1_1_3b.md`의 전체 구조를
 `CPrecNet event-conditioned pretraining + ERA5 full-trajectory oracle` 연구 트랙으로
 구현한다. CPrecNet archive에는 연속 dry timeline과 동적 pixel validity가 없으므로,

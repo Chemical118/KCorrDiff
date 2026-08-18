@@ -2,6 +2,11 @@ protocol_version: v1.1.3b
 stage: residual_edm_independent_calibration_inference
 research_track: cprecnet_event_conditioned_era5_full_trajectory_oracle
 seed: 11103
+training_seeds:
+  screen: 11103
+  common_ensemble: 11104
+  repeats: [11103, 11105, 11106]
+  deployment: 11103
 
 runtime:
   target_widths: [64, 128, 256, 384, 512]
@@ -40,7 +45,7 @@ data:
 
 stage2_contract:
   require_complete_stage_manifest: true
-  require_three_fold_checkpoints: true
+  require_fold_checkpoint_coverage: true
   require_deployment_checkpoint: true
   require_complete_oof: true
   require_residual_scales: true
@@ -179,10 +184,10 @@ tracking:
   log_gpu_system_metrics: true
 
 publication:
-  require_stage2_hash_lineage: true
-  require_model_selection_decision_hash: true
-  require_edm_checkpoint: true
-  require_independent_calibration: true
-  require_sampling_profile_smoke: true
+  record_stage2_hash_lineage: true
+  record_model_selection_decision_hash: true
+  record_edm_checkpoint: true
+  record_independent_calibration: true
+  record_sampling_profile_smoke: true
   atomic_stage_manifest: true
-  immutable_release_requires_manual_promotion: true
+  manual_promotion_recommended: true

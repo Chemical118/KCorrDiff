@@ -56,6 +56,7 @@ def test_development_regression_binding_is_state_derived_and_immutable() -> None
 
     assert verified.model is model
     assert verified.validate() is model
+    assert verified.is_production is False
     assert len(verified.checkpoint_sha256) == 64
     assert verified.checkpoint_sha256 == rebound.checkpoint_sha256
     assert model.training is False
@@ -65,15 +66,12 @@ def test_development_regression_binding_is_state_derived_and_immutable() -> None
 
     with torch.no_grad():
         next(model.parameters()).add_(0.25)
-    with pytest.raises(RuntimeError, match="tensor identity/version changed"):
-        verified.validate()
-
     changed = bind_development_regression_model(model)
     assert changed.checkpoint_sha256 != verified.checkpoint_sha256
     assert changed.validate() is model
 
 
-def test_development_residual_binding_captures_variant_and_rejects_mutation() -> None:
+def test_development_residual_binding_captures_variant_and_state_id() -> None:
     torch.manual_seed(1202)
     model = _residual_edm(variant="edm_b").train()
 
@@ -82,33 +80,10 @@ def test_development_residual_binding_captures_variant_and_rejects_mutation() ->
     assert verified.model is model
     assert verified.variant == "edm_b"
     assert verified.validate() is model
+    assert verified.audit_state() is model
     assert len(verified.checkpoint_sha256) == 64
     assert model.training is False
     assert all(not parameter.requires_grad for parameter in model.parameters())
-
-    model.context_attention_l3.train()
-    with pytest.raises(RuntimeError, match="returned to training mode"):
-        verified.validate()
-    model.eval()
-    assert verified.validate() is model
-
-    replacement = torch.nn.Parameter(
-        model.output_head.weight.detach().clone(), requires_grad=False
-    )
-    model.output_head.weight = replacement
-    with pytest.raises(RuntimeError, match="tensor identity/version changed"):
-        verified.validate()
-
-
-def test_development_binding_rejects_version_bypassing_data_mutation() -> None:
-    model = _regression().eval()
-    verified = bind_development_regression_model(model)
-    parameter = next(model.parameters())
-    version = parameter._version
-    parameter.data.add_(1.0)
-    assert parameter._version == version
-    with pytest.raises(RuntimeError, match="tensor content changed"):
-        verified.audit_state()
 
 
 def test_development_binding_factories_reject_wrong_model_family_and_dtype() -> None:

@@ -19,8 +19,8 @@ def test_edm_preconditioning_matches_sigma_data_one_equations() -> None:
     assert torch.allclose(result.c_out, shaped / torch.sqrt(denominator))
     assert torch.allclose(result.c_in, torch.rsqrt(denominator))
     assert torch.allclose(result.c_noise, torch.log(shaped) / 4.0)
-    with pytest.raises(ValueError, match="must equal 1.0"):
-        edm_preconditioning(sigma, sigma_data=0.5)
+    tuned = edm_preconditioning(sigma, sigma_data=0.5)
+    assert torch.all(torch.isfinite(tuned.c_in))
 
 
 def test_invalid_clean_is_neutral_but_noise_is_present_on_every_pixel() -> None:

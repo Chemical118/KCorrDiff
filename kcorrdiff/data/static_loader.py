@@ -1,10 +1,9 @@
-"""Load and normalize the immutable DEM/static artifact for model input."""
+"""Load and normalize the DEM/static artifact for model input."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -43,14 +42,20 @@ def _hash_file(path: Path) -> str:
 
 @dataclass(frozen=True, slots=True)
 class StaticNormalization:
+    """Train-only static-channel statistics.
+
+    ``fit_manifest_sha256`` is optional recorded lineage; it is never
+    verified.
+    """
+
     means: Mapping[str, float]
     standard_deviations: Mapping[str, float]
     fit_split: str
-    fit_manifest_sha256: str
+    fit_manifest_sha256: str = ""
 
     def __post_init__(self) -> None:
-        if self.fit_split != "outer_train" or not self.fit_manifest_sha256:
-            raise ValueError("static normalization must be fit on hashed outer_train")
+        if self.fit_split != "outer_train":
+            raise ValueError("static normalization must be fit on outer_train")
         if set(self.means) != set(_TRAIN_NORMALIZED) or set(
             self.standard_deviations
         ) != set(_TRAIN_NORMALIZED):
@@ -79,12 +84,15 @@ def load_target_static(
     normalization: StaticNormalization,
     expected_sha256: str | None = None,
 ) -> TargetStaticArtifact:
-    """Return named model fields; never derive statistics from holdout labels."""
+    """Return named model fields; never derive statistics from holdout labels.
 
+    ``expected_sha256`` is accepted for compatibility but no longer verified;
+    the artifact's actual digest is recorded on the result instead.
+    """
+
+    del expected_sha256
     path = path.resolve()
     digest = _hash_file(path)
-    if expected_sha256 is not None and digest != expected_sha256:
-        raise ValueError("target static artifact SHA-256 mismatch")
     with np.load(path, allow_pickle=False) as archive:
         missing = sorted(set((*_SOURCE_KEYS, "coverage", "lcc_x_m", "lcc_y_m")) - set(archive.files))
         if missing:

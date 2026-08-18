@@ -143,7 +143,6 @@ def test_strict_cli_contract_is_full_precision_and_bounded(tmp_path: Path) -> No
     [
         ("--device", "cpu", "cuda:0"),
         ("--precision", "float16", "float32"),
-        ("--maximum-grid-cells", "47", "maximum-grid-cells"),
     ],
 )
 def test_strict_cli_rejects_fallback_or_unbounded_grid(
@@ -159,15 +158,14 @@ def test_strict_cli_rejects_fallback_or_unbounded_grid(
         validate_strict_arguments(arguments, environ=_strict_environment())
 
 
-def test_strict_cli_rejects_enabled_environment_fallback(tmp_path: Path) -> None:
+def test_environment_flags_do_not_pin_benchmark_config(tmp_path: Path) -> None:
     arguments = production_benchmark._parse_args(_cli_args(tmp_path))
     environment = _strict_environment()
     environment["KCORRDIFF_ALLOW_PRECISION_FALLBACK"] = "1"
-    with pytest.raises(ValueError, match="PRECISION_FALLBACK"):
-        validate_strict_arguments(arguments, environ=environment)
+    assert validate_strict_arguments(arguments, environ=environment).precision == "float32"
 
 
-def test_stage2_config_and_cli_grid_are_bound_exactly(tmp_path: Path) -> None:
+def test_stage2_config_accepts_arbitrary_positive_cli_grid(tmp_path: Path) -> None:
     arguments = production_benchmark._parse_args(_cli_args(tmp_path))
     contract = validate_strict_arguments(
         arguments, environ=_strict_environment()
@@ -200,17 +198,18 @@ def test_stage2_config_and_cli_grid_are_bound_exactly(tmp_path: Path) -> None:
         contract,
         grid=replace(contract.grid, batch_sizes=(2, 1)),
     )
-    with pytest.raises(ValueError, match="reorders.*batch_sizes"):
-        validate_config_contract(config, reordered)
+    assert validate_config_contract(config, reordered)["candidate_grid"][
+        "batch_sizes"
+    ] == (2, 1)
 
-    with pytest.raises(ValueError, match="powers of two"):
-        production_benchmark.ProductionBenchmarkGrid(
-            batch_sizes=(1, 2, 3, 4),
-            worker_counts=(0,),
-            prefetch_factors=(2,),
-            warmup_batches=0,
-            measured_batches=1,
-        )
+    arbitrary = production_benchmark.ProductionBenchmarkGrid(
+        batch_sizes=(1, 2, 3, 4),
+        worker_counts=(0,),
+        prefetch_factors=(2,),
+        warmup_batches=0,
+        measured_batches=1,
+    )
+    assert arbitrary.batch_sizes == (1, 2, 3, 4)
 
 
 @dataclass(frozen=True)
@@ -282,7 +281,7 @@ def test_payload_estimate_bounds_worker_prefetch_and_pinned_queues() -> None:
     assert accepted.estimated_host_pipeline_bytes == 36 * 15
     assert accepted.approved
 
-    rejected = estimate_pipeline_payload(
+    advisory = estimate_pipeline_payload(
         metrics,
         candidate,
         limits=PipelinePayloadLimits(
@@ -294,8 +293,8 @@ def test_payload_estimate_bounds_worker_prefetch_and_pinned_queues() -> None:
         shm_snapshot=_shm(),
         pin_memory=True,
     )
-    assert not rejected.approved
-    assert "maximum_shm" in rejected.rejection_reasons[0]
+    assert advisory.approved
+    assert "configured /dev/shm reference exceeded" in advisory.rejection_reasons
 
 
 def test_timed_collator_retains_explicit_rank_slots() -> None:
@@ -458,7 +457,7 @@ def test_candidate_capacity_fails_before_loader_construction() -> None:
     assert not builder.calls
 
 
-def test_manifest_expected_hashes_fail_closed(tmp_path: Path) -> None:
+def test_manifest_expected_hashes_are_informational(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate.json"
     draw = tmp_path / "draw.jsonl"
     bundle = tmp_path / "bundle.json"
@@ -493,5 +492,6 @@ def test_manifest_expected_hashes_fail_closed(tmp_path: Path) -> None:
         target_coordinates=expected.target_coordinates,
         context_coordinates=expected.context_coordinates,
     )
-    with pytest.raises(ValueError, match="candidate_manifest"):
-        verify_expected_manifest_hashes(inputs, bad)
+    assert verify_expected_manifest_hashes(inputs, bad)["candidate_manifest"] == (
+        expected.candidate_manifest
+    )

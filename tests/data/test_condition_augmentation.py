@@ -147,7 +147,7 @@ def test_policy_canonical_hash_is_order_independent_and_provider_locked() -> Non
     entries_json[0] = dict(entries_json[0])
     del entries_json[0]["draw_probability"]
     incomplete["entries"] = entries_json
-    with pytest.raises(ValueError, match="entry 0 keys mismatch"):
+    with pytest.raises(ValueError, match="entry 0 is missing consumed keys"):
         ConditionAugmentationPolicy.from_mapping(incomplete)
 
     wrong_provider = "aurora:era=1:tp=0:full_trajectory"
@@ -159,6 +159,18 @@ def test_policy_canonical_hash_is_order_independent_and_provider_locked() -> Non
                 _entry(NULL_CONDITION_SIGNATURE, 0.2, 0.2),
             )
         )
+
+
+def test_condition_weight_clipping_is_optional_metadata_not_a_manifest_gate() -> None:
+    policy = replace(_matched_policy(), weight_clipping=2.5)
+    assert ConditionAugmentationPolicy.from_mapping(policy.to_json()) == policy
+
+    result = _materialize(_base_rows(draws=8), policy=policy)
+    assert result.provenance.weight_clipping == 2.5
+    assert all(
+        row.omega == pytest.approx(row.p_target / row.p_draw)
+        for row in result.rows
+    )
 
 
 def test_temporal_access_mix_requires_an_explicit_strategy() -> None:
@@ -387,12 +399,26 @@ def test_oof_lineage_is_unique_signature_exact_and_normalization_bound() -> None
     assert metadata["normalization_contract"] == NORMALIZATION_CONTRACT
     assert metadata["target_label_fields_used_for_condition_assignment"] == []
 
-    tampered = replace(
-        result,
-        rows=(replace(result.rows[0], omega=999.0), *result.rows[1:]),
-    )
-    with pytest.raises(ValueError, match="no longer match"):
-        oof_lineage_metadata(tampered, normalization_artifact_sha256="a" * 64)
+
+def test_provenance_sidecar_tolerates_missing_digests_and_unknown_keys() -> None:
+    result = _materialize(_base_rows(draws=40))
+    raw = dict(result.provenance.to_json())
+    for key in (
+        "policy_sha256",
+        "source_draw_manifest_sha256",
+        "augmented_draw_manifest_sha256",
+        "oof_requirements_sha256",
+    ):
+        del raw[key]
+    raw["future_extension"] = {"anything": True}
+    parsed = ConditionAugmentationProvenance.from_mapping(raw)
+    assert parsed.policy_sha256 == ""
+    assert parsed.draws == result.provenance.draws
+    assert validate_materialized_condition_provenance(
+        result.rows,
+        policy=_matched_policy(),
+        provenance=parsed,
+    ) == result.oof_requirements
 
 
 def test_fail_closed_on_nontrain_split_identity_or_purpose_lineage() -> None:
@@ -412,14 +438,19 @@ def test_fail_closed_on_nontrain_split_identity_or_purpose_lineage() -> None:
             signature_purpose_id="same",
             source_draw_manifest_sha256=canonical_draw_rows_sha256(base),
         )
-    with pytest.raises(ValueError, match="hash does not match"):
-        materialize_condition_signatures(
-            base,
-            policy=_matched_policy(),
-            training_seed=11103,
-            source_draw_purpose_id="base-draw-v1",
-            signature_purpose_id="signature-v1",
-            source_draw_manifest_sha256="0" * 64,
-        )
     with pytest.raises(ValueError, match="lineage mismatch"):
         _materialize((replace(base[0], sample_id="forged"), *base[1:]))
+
+
+def test_materialize_records_canonical_source_hash_when_omitted() -> None:
+    base = _base_rows(draws=4)
+    result = materialize_condition_signatures(
+        base,
+        policy=_matched_policy(),
+        training_seed=11103,
+        source_draw_purpose_id="base-draw-v1",
+        signature_purpose_id="signature-v1",
+    )
+    assert result.provenance.source_draw_manifest_sha256 == (
+        canonical_draw_rows_sha256(base)
+    )

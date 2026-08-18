@@ -19,6 +19,7 @@ class RegressionLossConfig:
     lambda_mean: float = 0.05
     mean_warmup_steps: int = 2_000
     detach_probability_in_mean: bool = False
+    importance_weight_clipping: float | None = None
 
     def validate(self) -> None:
         values = (
@@ -30,6 +31,11 @@ class RegressionLossConfig:
             raise ValueError("loss coefficients must be finite and non-negative")
         if self.mean_warmup_steps < 0:
             raise ValueError("mean_warmup_steps cannot be negative")
+        if self.importance_weight_clipping is not None and (
+            not math.isfinite(self.importance_weight_clipping)
+            or self.importance_weight_clipping <= 0.0
+        ):
+            raise ValueError("importance_weight_clipping must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +89,7 @@ def accumulation_window_denominators(
     *,
     device: torch.device | str,
     reduce_sum: DetachedSumReducer | None = None,
+    maximum_importance_weight: float | None = None,
 ) -> GlobalLossDenominators:
     """Compute weighted masses before forward passes in an accumulation window.
 
@@ -108,7 +115,10 @@ def accumulation_window_denominators(
             raise TypeError("omega must be float32 [B]")
         if validity.shape != wet.shape or validity.ndim != 4:
             raise ValueError("target masks must share [B,1,H,W]")
-        weights = omega.to(device=selected, dtype=torch.float64)[:, None, None, None]
+        weights = _bounded_importance_weight(
+            omega.to(device=selected, dtype=torch.float64),
+            maximum=maximum_importance_weight,
+        )[:, None, None, None]
         valid_on_device = validity.to(device=selected)
         wet_on_device = wet.to(device=selected) & valid_on_device
         local[0] += (weights * valid_on_device).sum()
@@ -189,7 +199,12 @@ def distributed_hurdle_loss_contribution(
     z_wet = math.log1p(A_WET_MM / A0_MM)
     if bool((wet_amount < z_wet - 1.0e-6).any()):
         raise ValueError("wet_amount violates z_wet + softplus support")
-    weights = _spatial_weight(omega, valid, dtype=torch.float32)
+    weights = _spatial_weight(
+        omega,
+        valid,
+        dtype=torch.float32,
+        maximum_importance_weight=config.importance_weight_clipping,
+    )
     wet_mask = target_wet & valid
     wet_weights = weights * wet_mask.to(torch.float32)
     occurrence_values = functional.binary_cross_entropy_with_logits(
@@ -248,6 +263,7 @@ def distributed_direct_loss_contribution(
     omega: torch.Tensor,
     denominators: GlobalLossDenominators,
     reduce_sum: DetachedSumReducer | None = None,
+    maximum_importance_weight: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact rank-local contribution for direct physical mean or q50."""
 
@@ -261,7 +277,12 @@ def distributed_direct_loss_contribution(
         raise TypeError("direct target validity must be boolean")
     if bool((prediction_mm < 0.0).any()):
         raise ValueError("physical prediction cannot be negative")
-    weights = _spatial_weight(omega, target_validity, dtype=torch.float32)
+    weights = _spatial_weight(
+        omega,
+        target_validity,
+        dtype=torch.float32,
+        maximum_importance_weight=maximum_importance_weight,
+    )
     if statistic == "mean":
         values = (prediction_mm - target_mm).square()
     else:
@@ -284,6 +305,7 @@ def _spatial_weight(
     mask: torch.Tensor,
     *,
     dtype: torch.dtype,
+    maximum_importance_weight: float | None = None,
 ) -> torch.Tensor:
     if omega.ndim == 1:
         omega = omega[:, None, None, None]
@@ -293,7 +315,23 @@ def _spatial_weight(
         raise ValueError("omega must have shape [B], [B,H,W], or [B,1,H,W]")
     if not torch.isfinite(omega).all() or bool((omega <= 0).any()):
         raise ValueError("importance weights must be finite and strictly positive")
-    return omega.to(device=mask.device, dtype=dtype) * mask.to(dtype=dtype)
+    selected = _bounded_importance_weight(
+        omega.to(device=mask.device, dtype=dtype),
+        maximum=maximum_importance_weight,
+    )
+    return selected * mask.to(dtype=dtype)
+
+
+def _bounded_importance_weight(
+    omega: torch.Tensor,
+    *,
+    maximum: float | None,
+) -> torch.Tensor:
+    if maximum is None:
+        return omega
+    if not math.isfinite(maximum) or maximum <= 0.0:
+        raise ValueError("maximum importance weight must be finite and positive")
+    return omega.clamp_max(maximum)
 
 
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -349,7 +387,12 @@ def hurdle_regression_loss(
 
     valid = target_validity.bool()
     wet = target_wet.bool() & valid
-    weights = _spatial_weight(omega, valid, dtype=occurrence_logits.dtype)
+    weights = _spatial_weight(
+        omega,
+        valid,
+        dtype=occurrence_logits.dtype,
+        maximum_importance_weight=config.importance_weight_clipping,
+    )
     wet_weights = weights * wet.to(weights.dtype)
     occurrence_values = functional.binary_cross_entropy_with_logits(
         occurrence_logits,
@@ -386,6 +429,8 @@ def direct_physical_mean_loss(
     target_mm: torch.Tensor,
     target_validity: torch.Tensor,
     omega: torch.Tensor,
+    *,
+    maximum_importance_weight: float | None = None,
 ) -> torch.Tensor:
     """MSE whose population optimum is the physical conditional mean."""
 
@@ -393,7 +438,12 @@ def direct_physical_mean_loss(
         raise ValueError("direct-mean tensors must have identical shapes")
     if bool((prediction_mm < 0).any()):
         raise ValueError("physical accumulation prediction cannot be negative")
-    weights = _spatial_weight(omega, target_validity.bool(), dtype=prediction_mm.dtype)
+    weights = _spatial_weight(
+        omega,
+        target_validity.bool(),
+        dtype=prediction_mm.dtype,
+        maximum_importance_weight=maximum_importance_weight,
+    )
     result, _ = _weighted_mean((prediction_mm - target_mm).square(), weights)
     return result
 
@@ -405,6 +455,7 @@ def direct_physical_quantile_loss(
     omega: torch.Tensor,
     *,
     quantile: float = 0.5,
+    maximum_importance_weight: float | None = None,
 ) -> torch.Tensor:
     """Weighted pinball loss for the explicit direct q50 comparison arm."""
 
@@ -414,7 +465,12 @@ def direct_physical_quantile_loss(
         raise ValueError("direct-quantile tensors must have identical shapes")
     error = target_mm - prediction_mm
     pinball = torch.maximum(quantile * error, (quantile - 1.0) * error)
-    weights = _spatial_weight(omega, target_validity.bool(), dtype=prediction_mm.dtype)
+    weights = _spatial_weight(
+        omega,
+        target_validity.bool(),
+        dtype=prediction_mm.dtype,
+        maximum_importance_weight=maximum_importance_weight,
+    )
     result, _ = _weighted_mean(pinball, weights)
     return result
 

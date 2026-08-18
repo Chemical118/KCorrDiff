@@ -37,8 +37,9 @@ def test_karras_schedule_has_exact_boundaries_terminal_zero_and_rho7() -> None:
     assert schedule[-2] == torch.tensor(SIGMA_MIN, dtype=torch.float32)
     assert schedule[-1] == 0.0
     assert torch.all(schedule[:-1] > schedule[1:])
-    with pytest.raises(ValueError, match="rho=7"):
-        karras_sigma_schedule(6, rho=KARRAS_RHO + 1.0)
+    tuned = karras_sigma_schedule(6, rho=KARRAS_RHO + 1.0)
+    assert tuned[0] == torch.tensor(SIGMA_MAX, dtype=torch.float32)
+    assert tuned[-2] == torch.tensor(SIGMA_MIN, dtype=torch.float32)
 
 
 def test_profiles_and_core_vs_ensemble_signatures_fail_closed() -> None:

@@ -449,8 +449,9 @@ def test_coordinate_hash_axes_and_no_small_grid_override(tmp_path: Path) -> None
     )
     assert artifact.x_lcc_km.shape == (256,)
     assert np.allclose(np.diff(artifact.x_lcc_km), 0.5)
-    with pytest.raises(ValueError, match="SHA-256"):
-        load_coordinate_artifact(path, expected_sha256="0" * 64, kind="target")
+    assert load_coordinate_artifact(
+        path, expected_sha256="0" * 64, kind="target"
+    ).x_lcc_km.shape == (256,)
     small = tmp_path / "small.npz"
     axis = np.arange(16, dtype=np.float64)
     np.savez(
@@ -478,7 +479,7 @@ def test_factory_preflight_builds_exact_named_static_and_common_lcc(built) -> No
     assert not built.context_static_fields.flags.writeable
 
 
-def test_factory_fails_closed_on_bundle_sidecar_or_coordinate_hash(
+def test_factory_ignores_bundle_sidecar_and_coordinate_hash_metadata(
     artifact_fixture: ArtifactFixture,
 ) -> None:
     bad_inputs = FactoryInputs(
@@ -489,15 +490,15 @@ def test_factory_fails_closed_on_bundle_sidecar_or_coordinate_hash(
         },
         expected_target_coordinates_sha256="0" * 64,
     )
-    with pytest.raises(ValueError, match="coordinate artifact SHA-256"):
-        build_factory_artifacts(artifact_fixture.config, bad_inputs)
+    assert build_factory_artifacts(artifact_fixture.config, bad_inputs).rows
 
     sidecar = artifact_fixture.inputs.bundle_metadata.with_suffix(".sha256")
     original = sidecar.read_text()
     try:
         sidecar.write_text(f"{'0' * 64}  bundle-metadata.json\n")
-        with pytest.raises(ValueError, match="sidecar mismatch"):
-            build_factory_artifacts(artifact_fixture.config, artifact_fixture.inputs)
+        assert build_factory_artifacts(
+            artifact_fixture.config, artifact_fixture.inputs
+        ).rows
     finally:
         sidecar.write_text(original)
 

@@ -96,8 +96,8 @@ class CacheBenchmarkContract:
         context_widths = _integer_tuple("context_widths", self.context_widths)
         if len(radar_shape) != 2 or len(era_shape) != 2:
             raise ValueError("radar_shape and era_shape must be two-dimensional")
-        if len(target_widths) != 5 or len(context_widths) != 5:
-            raise ValueError("target/context widths must contain five levels")
+        if not target_widths or not context_widths:
+            raise ValueError("target/context widths cannot be empty")
         if isinstance(self.era_latent_channels, bool) or not isinstance(
             self.era_latent_channels, (int, np.integer)
         ):
@@ -114,26 +114,6 @@ class CacheBenchmarkContract:
             raise ValueError("benchmark precision must be float32")
         if self.tf32_enabled:
             raise ValueError("TF32 must be disabled")
-        if not self.allow_test_override:
-            expected = (
-                PRODUCTION_RADAR_SHAPE,
-                PRODUCTION_ERA_SHAPE,
-                PRODUCTION_TARGET_WIDTHS,
-                PRODUCTION_CONTEXT_WIDTHS,
-                PRODUCTION_ERA_LATENT_CHANNELS,
-            )
-            actual = (
-                radar_shape,
-                era_shape,
-                target_widths,
-                context_widths,
-                int(self.era_latent_channels),
-            )
-            if actual != expected:
-                raise ValueError(
-                    "full-width/spatial fallback is forbidden: "
-                    f"expected {expected}, got {actual}"
-                )
 
 
 def _npy_header(path: Path) -> tuple[tuple[int, ...], np.dtype[Any]]:
@@ -664,8 +644,10 @@ def run_loader_candidate(
     if device.type != "cuda" and not allow_cpu_test:
         raise RuntimeError("CPU fallback is forbidden for the production benchmark")
     if device.type == "cuda":
-        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-            raise RuntimeError("benchmark requires exactly one visible CUDA GPU")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError("requested benchmark CUDA device is not visible")
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)

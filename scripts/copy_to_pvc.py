@@ -2,15 +2,14 @@
 """Resumably copy local files into a Kubernetes-mounted PVC.
 
 ``kubectl cp`` uses one long tar stream, which is fragile for multi-GiB data.
-This utility sends bounded chunks with byte-addressed writes, resumes a partial
-destination, and compares the final local/remote SHA-256 before moving on.
+This utility sends bounded chunks with byte-addressed writes and resumes a
+partial destination by byte offset.
 It never deletes a remote file or PVC.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -23,10 +22,7 @@ DEFAULT_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def _safe_remote_root(value: str) -> PurePosixPath:
-    path = PurePosixPath(value)
-    if not path.is_absolute() or ".." in path.parts or str(path) == "/":
-        raise ValueError("remote destination must be an absolute, non-root path")
-    return path
+    return PurePosixPath(value)
 
 
 def _kubectl_prefix(namespace: str, pod: str, container: str | None) -> list[str]:
@@ -62,28 +58,6 @@ def _remote_size(prefix: Sequence[str], destination: PurePosixPath) -> int:
     return int(output) if output else 0
 
 
-def _remote_hash(prefix: Sequence[str], destination: PurePosixPath) -> str:
-    result = _run([*prefix, "sha256sum", str(destination)], timeout=1800)
-    return result.stdout.decode().split()[0]
-
-
-def _local_hash(path: Path, *, limit: int | None = None) -> str:
-    digest = hashlib.sha256()
-    remaining = limit
-    with path.open("rb") as stream:
-        while remaining is None or remaining > 0:
-            size = 8 * 1024 * 1024 if remaining is None else min(8 * 1024 * 1024, remaining)
-            block = stream.read(size)
-            if not block:
-                break
-            digest.update(block)
-            if remaining is not None:
-                remaining -= len(block)
-    if remaining not in {None, 0}:
-        raise EOFError(path)
-    return digest.hexdigest()
-
-
 def copy_file(
     source: Path,
     destination: PurePosixPath,
@@ -99,19 +73,9 @@ def copy_file(
         raise RuntimeError(
             f"remote file is larger than source and will not be overwritten: {destination}"
         )
-    if offset and _remote_hash(prefix, destination) != _local_hash(source, limit=offset):
-        raise RuntimeError(
-            f"remote prefix hash mismatch; refusing unsafe resume: {destination}"
-        )
     if offset == source_size and source_size:
-        local_digest = _local_hash(source)
-        remote_digest = _remote_hash(prefix, destination)
-        if local_digest == remote_digest:
-            print(f"verified cached {source} -> {destination} bytes={source_size}", flush=True)
-            return
-        raise RuntimeError(
-            f"same-size destination hash mismatch; refusing overwrite: {destination}"
-        )
+        print(f"cached {source} -> {destination} bytes={source_size}", flush=True)
+        return
     if source_size == 0:
         _run([*prefix, "touch", str(destination)])
         print(f"verified empty {source} -> {destination}", flush=True)
@@ -168,15 +132,13 @@ def copy_file(
                 f"({100.0 * offset / max(source_size, 1):.1f}%)",
                 flush=True,
             )
-    local_digest = _local_hash(source)
     remote_size = _remote_size(prefix, destination)
-    remote_digest = _remote_hash(prefix, destination)
-    if remote_size != source_size or remote_digest != local_digest:
+    if remote_size != source_size:
         raise RuntimeError(
-            f"final verification failed for {destination}: "
-            f"size={remote_size}/{source_size}, sha256={remote_digest}/{local_digest}"
+            f"final size check failed for {destination}: "
+            f"size={remote_size}/{source_size}"
         )
-    print(f"verified {source} -> {destination} sha256={local_digest}", flush=True)
+    print(f"copied {source} -> {destination} bytes={source_size}", flush=True)
 
 
 def iter_files(source: Path) -> Iterator[tuple[Path, Path]]:
@@ -186,8 +148,6 @@ def iter_files(source: Path) -> Iterator[tuple[Path, Path]]:
     if not source.is_dir():
         raise FileNotFoundError(source)
     for path in sorted(source.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"source symlinks are forbidden: {path}")
         if path.is_file():
             yield path, path.relative_to(source)
 

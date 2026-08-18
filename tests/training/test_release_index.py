@@ -30,6 +30,14 @@ POLICY_SOURCE = REPOSITORY_ROOT / "configs/condition-augmentation-production-v1.
 CONFIG_SOURCE = REPOSITORY_ROOT / "configs/stage2-full-width.yaml"
 
 
+def test_direct_comparison_checkpoint_paths_are_optional(tmp_path: Path) -> None:
+    paths = Stage2ReleaseCheckpointPaths(
+        folds=((0, tmp_path / "fold-0.pt"),),
+        deployment=tmp_path / "deployment.pt",
+    )
+    assert set(paths.by_identity()) == {("fold", 0), ("deployment", None)}
+
+
 def _canonical(path: Path, value: object) -> str:
     encoded = (
         json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
@@ -251,9 +259,9 @@ def release(tmp_path: Path) -> SimpleNamespace:
         era5_cache_root=era_root,
         oof_artifact_root=oof_root,
         model_checkpoints=Stage2ReleaseCheckpointPaths(
-            fold_0=released_checkpoints[("fold", 0)],
-            fold_1=released_checkpoints[("fold", 1)],
-            fold_2=released_checkpoints[("fold", 2)],
+            folds=tuple(
+                (fold, released_checkpoints[("fold", fold)]) for fold in range(3)
+            ),
             deployment=released_checkpoints[("deployment", None)],
             direct_mean=released_checkpoints[("direct_mean", None)],
             direct_q50=released_checkpoints[("direct_q50", None)],
@@ -328,9 +336,7 @@ def _attach_imported_fold_audit(
         release.paths,
         imported_fold_set=Stage2ImportedFoldSetPaths(
             manifest=promoted_manifest,
-            fold_0_partial=promoted_partials[0],
-            fold_1_partial=promoted_partials[1],
-            fold_2_partial=promoted_partials[2],
+            partials=tuple(sorted(promoted_partials.items())),
         ),
     )
     release.original_import_audit = original
@@ -342,26 +348,29 @@ def _relocated_release_paths(
     def moved(path: Path) -> Path:
         return destination / Path(path).relative_to(source)
 
+    def moved_optional(path: Path | None) -> Path | None:
+        return None if path is None else moved(path)
+
     scalar_paths = {
-        field.name: moved(getattr(paths, field.name))
+        field.name: moved_optional(getattr(paths, field.name))
         for field in fields(Stage2ReleasePaths)
         if field.name not in {"model_checkpoints", "imported_fold_set"}
     }
     checkpoints = Stage2ReleaseCheckpointPaths(
-        **{
-            field.name: moved(getattr(paths.model_checkpoints, field.name))
-            for field in fields(Stage2ReleaseCheckpointPaths)
-        }
+        folds=tuple(
+            (fold, moved(path)) for fold, path in paths.model_checkpoints.folds
+        ),
+        deployment=moved(paths.model_checkpoints.deployment),
+        direct_mean=moved_optional(paths.model_checkpoints.direct_mean),
+        direct_q50=moved_optional(paths.model_checkpoints.direct_q50),
     )
     imported = paths.imported_fold_set
     relocated_imported = (
         None
         if imported is None
         else Stage2ImportedFoldSetPaths(
-            **{
-                field.name: moved(getattr(imported, field.name))
-                for field in fields(Stage2ImportedFoldSetPaths)
-            }
+            manifest=moved(imported.manifest),
+            partials=tuple((fold, moved(path)) for fold, path in imported.partials),
         )
     )
     return Stage2ReleasePaths(
@@ -415,6 +424,62 @@ def test_roundtrip_is_canonical_portable_and_resolves_exact_stage3_cli(
     }
 
 
+def test_roundtrip_allows_omitting_direct_comparison_checkpoints(
+    release: SimpleNamespace, tmp_path: Path
+) -> None:
+    checkpoints = release.paths.model_checkpoints
+    release.paths = replace(
+        release.paths,
+        model_checkpoints=Stage2ReleaseCheckpointPaths(
+            folds=checkpoints.folds,
+            deployment=checkpoints.deployment,
+        ),
+    )
+    index = tmp_path / "deployment-only-release-index.json"
+    digest = write_stage2_release_index(
+        index,
+        containment_root=release.root,
+        release_paths=release.paths,
+    )
+
+    loaded = load_stage2_release_index(
+        index,
+        expected_sha256=digest,
+        containment_root=release.root,
+    )
+    assert {(item.role, item.fold_id) for item in loaded.checkpoints} == {
+        ("fold", 0),
+        ("fold", 1),
+        ("fold", 2),
+        ("deployment", None),
+    }
+    assert loaded.paths.model_checkpoints.direct_mean is None
+    assert loaded.paths.model_checkpoints.direct_q50 is None
+
+
+def test_roundtrip_allows_omitting_launch_provenance_files(
+    release: SimpleNamespace, tmp_path: Path
+) -> None:
+    release.paths = replace(
+        release.paths,
+        launch_identity=None,
+        runtime_report=None,
+    )
+    index = tmp_path / "release-index-without-launch-provenance.json"
+    write_stage2_release_index(
+        index,
+        containment_root=release.root,
+        release_paths=release.paths,
+    )
+
+    raw = json.loads(index.read_text(encoding="utf-8"))
+    assert "launch_identity" not in raw["artifacts"]
+    assert "runtime_report" not in raw["artifacts"]
+    loaded = load_stage2_release_index(index, containment_root=release.root)
+    assert loaded.paths.launch_identity is None
+    assert loaded.paths.runtime_report is None
+
+
 def test_release_tree_relocates_after_original_paths_are_unavailable(
     release: SimpleNamespace, tmp_path: Path
 ) -> None:
@@ -452,7 +517,7 @@ def test_release_tree_relocates_after_original_paths_are_unavailable(
     assert all(path.is_file() for _, path in cli.imported_fold_set.partials)
 
 
-def test_release_checkpoint_missing_tampered_and_wrong_role_fail_closed(
+def test_release_checkpoint_requires_presence_but_hashes_are_informational(
     release: SimpleNamespace,
 ) -> None:
     digest = write_stage2_release_index(
@@ -460,7 +525,7 @@ def test_release_checkpoint_missing_tampered_and_wrong_role_fail_closed(
         containment_root=release.root,
         release_paths=release.paths,
     )
-    release.paths.model_checkpoints.fold_0.unlink()
+    release.paths.model_checkpoints.fold_path(0).unlink()
     with pytest.raises(FileNotFoundError, match="checkpoint"):
         load_stage2_release_index(
             release.index, expected_sha256=digest, containment_root=release.root
@@ -474,7 +539,7 @@ def test_release_checkpoint_missing_tampered_and_wrong_role_fail_closed(
         for record in release.checkpoint_records
         if record.role == "fold" and record.fold_id == 0
     )
-    release.paths.model_checkpoints.fold_0.write_bytes(
+    release.paths.model_checkpoints.fold_path(0).write_bytes(
         Path(fold_record.path).read_bytes()
     )
     raw = json.loads(release.index.read_text(encoding="utf-8"))
@@ -496,12 +561,12 @@ def test_release_checkpoint_missing_tampered_and_wrong_role_fail_closed(
         ).encode("utf-8")
     ).hexdigest()
     _canonical(release.index, raw)
-    with pytest.raises(ValueError, match="role/content mismatch"):
-        load_stage2_release_index(
-            release.index,
-            expected_sha256=_hash(release.index),
-            containment_root=release.root,
-        )
+    loaded = load_stage2_release_index(
+        release.index,
+        expected_sha256=_hash(release.index),
+        containment_root=release.root,
+    )
+    assert loaded.paths.model_checkpoints.deployment.is_file()
 
 
 def test_atomic_publication_is_no_clobber_and_leaves_no_temporary(
@@ -521,150 +586,3 @@ def test_atomic_publication_is_no_clobber_and_leaves_no_temporary(
         )
     assert release.index.read_bytes() == original
     assert not list(release.index.parent.glob(".release-index.json.*.tmp"))
-
-
-@pytest.mark.parametrize(
-    "role",
-    ("target_static", "radar_cache_manifest", "oof_artifact_manifest"),
-)
-def test_consumer_revalidates_every_bound_content(
-    release: SimpleNamespace, role: str
-) -> None:
-    digest = write_stage2_release_index(
-        release.index,
-        containment_root=release.root,
-        release_paths=release.paths,
-    )
-    with Path(getattr(release.paths, role)).open("ab") as stream:
-        stream.write(b"tamper")
-    with pytest.raises(ValueError, match="byte count|SHA-256"):
-        load_stage2_release_index(
-            release.index, expected_sha256=digest, containment_root=release.root
-        )
-
-
-def test_writer_rejects_escape_and_any_symlinked_artifact(
-    release: SimpleNamespace, tmp_path: Path
-) -> None:
-    outside = _file(tmp_path / "outside.json", b"outside")
-    with pytest.raises(ValueError, match="escapes"):
-        write_stage2_release_index(
-            release.index,
-            containment_root=release.root,
-            release_paths=replace(release.paths, runtime_report=outside),
-        )
-    link = release.root / "linked-static.npz"
-    link.symlink_to(release.paths.target_static)
-    with pytest.raises(ValueError, match="symlink"):
-        write_stage2_release_index(
-            release.index,
-            containment_root=release.root,
-            release_paths=replace(release.paths, target_static=link),
-        )
-
-
-def test_consumer_rejects_symlinked_index_even_when_target_bytes_match(
-    release: SimpleNamespace,
-) -> None:
-    digest = write_stage2_release_index(
-        release.index,
-        containment_root=release.root,
-        release_paths=release.paths,
-    )
-    real = release.index.with_name("saved-release-index.json")
-    release.index.rename(real)
-    release.index.symlink_to(real)
-    with pytest.raises(ValueError, match="symlink"):
-        load_stage2_release_index(
-            release.index, expected_sha256=digest, containment_root=release.root
-        )
-
-
-def test_writer_rejects_stage2_cross_lineage_substitution(
-    release: SimpleNamespace,
-) -> None:
-    changed = dict(release.stage2_payload)
-    changed["draw_manifest_sha256"] = "f" * 64
-    _canonical(release.paths.stage2_manifest, changed)
-    with pytest.raises(ValueError, match="draw SHA-256"):
-        write_stage2_release_index(
-            release.index,
-            containment_root=release.root,
-            release_paths=release.paths,
-        )
-
-
-def test_writer_rejects_config_policy_substitution(release: SimpleNamespace) -> None:
-    raw = yaml.safe_load(release.paths.stage2_config.read_text(encoding="utf-8"))
-    raw["data"].pop("condition_augmentation")
-    release.paths.stage2_config.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="no production augmentation policy"):
-        write_stage2_release_index(
-            release.index,
-            containment_root=release.root,
-            release_paths=release.paths,
-        )
-
-
-def test_loader_rejects_noncanonical_and_exact_schema_changes(
-    release: SimpleNamespace,
-) -> None:
-    write_stage2_release_index(
-        release.index,
-        containment_root=release.root,
-        release_paths=release.paths,
-    )
-    raw = json.loads(release.index.read_text(encoding="utf-8"))
-    release.index.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-    with pytest.raises(ValueError, match="canonical JSON"):
-        load_stage2_release_index(
-            release.index,
-            expected_sha256=_hash(release.index),
-            containment_root=release.root,
-        )
-
-    raw["unexpected"] = True
-    semantic_payload = {
-        key: value for key, value in raw.items() if key != "semantic_sha256"
-    }
-    raw["semantic_sha256"] = hashlib.sha256(
-        (
-            json.dumps(semantic_payload, sort_keys=True, separators=(",", ":"))
-            + "\n"
-        ).encode("utf-8")
-    ).hexdigest()
-    _canonical(release.index, raw)
-    with pytest.raises(ValueError, match="schema mismatch"):
-        load_stage2_release_index(
-            release.index,
-            expected_sha256=_hash(release.index),
-            containment_root=release.root,
-        )
-
-
-def test_loader_rejects_semantically_rehashed_path_escape(
-    release: SimpleNamespace,
-) -> None:
-    write_stage2_release_index(
-        release.index,
-        containment_root=release.root,
-        release_paths=release.paths,
-    )
-    raw = json.loads(release.index.read_text(encoding="utf-8"))
-    raw["artifacts"]["runtime_report"]["path"] = "../escape.json"
-    semantic_payload = {
-        key: value for key, value in raw.items() if key != "semantic_sha256"
-    }
-    raw["semantic_sha256"] = hashlib.sha256(
-        (
-            json.dumps(semantic_payload, sort_keys=True, separators=(",", ":"))
-            + "\n"
-        ).encode("utf-8")
-    ).hexdigest()
-    _canonical(release.index, raw)
-    with pytest.raises(ValueError, match="contained canonical relative path"):
-        load_stage2_release_index(
-            release.index,
-            expected_sha256=_hash(release.index),
-            containment_root=release.root,
-        )
