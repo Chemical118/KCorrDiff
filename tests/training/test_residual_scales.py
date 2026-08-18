@@ -121,6 +121,50 @@ def test_scale_multiplicity_replays_duplicate_training_draw_rows() -> None:
         )
 
 
+def test_batched_residual_update_matches_sample_updates() -> None:
+    targets = np.asarray(
+        [[[1.0, 2.0], [3.0, 4.0]], [[2.0, 1.0], [0.0, 3.0]]],
+        dtype=np.float32,
+    )
+    means = np.asarray(
+        [[[0.5, 1.0], [2.0, 3.0]], [[1.0, 1.0], [0.0, 1.0]]],
+        dtype=np.float32,
+    )
+    validity = np.asarray(
+        [[[True, True], [False, True]], [[True, False], [True, True]]]
+    )
+    weights = np.asarray([2.0, 0.5], dtype=np.float64)
+    multiplicities = np.asarray([3, 2], dtype=np.int64)
+    sequential = ResidualScaleAccumulator(
+        minimum_independent_blocks=1, minimum_block_ess=1.0
+    )
+    batched = ResidualScaleAccumulator(
+        minimum_independent_blocks=1, minimum_block_ess=1.0
+    )
+    for index in range(2):
+        sequential.update(
+            lead_hours=0.5 + 0.5 * index,
+            condition_signature=CONDITION,
+            block_id=f"block-{index}",
+            target_z=targets[index],
+            mu_z_oof=means[index],
+            target_validity=validity[index],
+            omega=float(weights[index]),
+            multiplicity=int(multiplicities[index]),
+        )
+    batched.update_batch(
+        lead_hours=np.asarray([0.5, 1.0]),
+        condition_signatures=(CONDITION, CONDITION),
+        block_ids=("block-0", "block-1"),
+        target_z=targets,
+        mu_z_oof=means,
+        target_validity=validity,
+        omega=weights,
+        multiplicities=multiplicities,
+    )
+    assert batched.merge_state() == sequential.merge_state()
+
+
 def test_scale_pooling_uses_full_cell_then_fallbacks_deterministically() -> None:
     tp_absent = "era5_oracle:era=1:tp=0:full_trajectory"
     accumulator = ResidualScaleAccumulator(

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -91,6 +92,7 @@ from kcorrdiff.training.launch_identity import (
 from kcorrdiff.training.oof import (
     OOFArtifact,
     OOFCompressedBuild,
+    OOFCompressedPartitionWriter,
     OOFIdentity,
     OOFPartitionSpec,
     compressed_oof_storage_plan,
@@ -1805,6 +1807,83 @@ def _shutdown_dataloader(loader: DataLoader[object]) -> None:
         loader._iterator = None  # type: ignore[attr-defined]
 
 
+@dataclass(frozen=True, slots=True)
+class _OOFBatchPostprocessPayload:
+    artifact_indices: tuple[int, ...]
+    identities: tuple[OOFIdentity, ...]
+    sealed: tuple[bool, ...]
+    probabilities: np.ndarray | None
+    means: np.ndarray | None
+    target_z: np.ndarray
+    target_validity: np.ndarray
+    omega: np.ndarray
+    lead_hours: np.ndarray
+    condition_signatures: tuple[str, ...]
+    block_ids: tuple[str, ...]
+    multiplicities: np.ndarray
+
+
+def _postprocess_oof_batch(
+    writer: OOFCompressedPartitionWriter,
+    accumulator: ResidualScaleAccumulator,
+    payload: _OOFBatchPostprocessPayload,
+) -> int:
+    """Write one CPU-resident OOF batch and reduce residual statistics."""
+
+    batch_size = len(payload.artifact_indices)
+    if not (
+        len(payload.identities)
+        == len(payload.sealed)
+        == len(payload.condition_signatures)
+        == len(payload.block_ids)
+        == batch_size
+    ):
+        raise ValueError("OOF postprocess metadata length mismatch")
+    expected_dense = (batch_size, writer.build.height, writer.build.width)
+    if payload.target_z.shape != expected_dense or payload.target_validity.shape != expected_dense:
+        raise ValueError("OOF postprocess target batch shape mismatch")
+    if payload.omega.shape != (batch_size,) or payload.multiplicities.shape != (
+        batch_size,
+    ):
+        raise ValueError("OOF postprocess weight batch shape mismatch")
+    if payload.lead_hours.shape != (batch_size,):
+        raise ValueError("OOF postprocess lead batch shape mismatch")
+    if not all(payload.sealed):
+        if payload.probabilities is None or payload.means is None:
+            raise ValueError("unsealed OOF rows require model outputs")
+        if payload.probabilities.shape != expected_dense or payload.means.shape != expected_dense:
+            raise ValueError("OOF postprocess model output shape mismatch")
+
+    means = np.empty(expected_dense, dtype=np.float32)
+    for index, artifact_index in enumerate(payload.artifact_indices):
+        identity = payload.identities[index]
+        if payload.sealed[index]:
+            _, mean = writer.sealed_fields(artifact_index)
+            writer.skip_sealed(artifact_index, identity)
+            means[index] = mean
+        else:
+            assert payload.probabilities is not None and payload.means is not None
+            mean = payload.means[index]
+            writer.append(
+                artifact_index,
+                identity,
+                payload.probabilities[index],
+                mean,
+            )
+            means[index] = mean
+    accumulator.update_batch(
+        lead_hours=payload.lead_hours,
+        condition_signatures=payload.condition_signatures,
+        block_ids=payload.block_ids,
+        target_z=payload.target_z,
+        mu_z_oof=means,
+        target_validity=payload.target_validity,
+        omega=payload.omega,
+        multiplicities=payload.multiplicities,
+    )
+    return batch_size
+
+
 def infer_oof_rank_partials(
     *,
     config: Stage2Config,
@@ -2008,6 +2087,11 @@ def infer_oof_rank_partials(
         )
         sealed_items = writer.sealed_items
         selected_offset = 0
+        postprocess_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="oof-batch-postprocess",
+        )
+        postprocess_futures: list[Future[int]] = []
         try:
             with torch.no_grad():
                 for rank_batch in loader:
@@ -2019,8 +2103,17 @@ def infer_oof_rank_partials(
                     sample_ids = training.model.provenance.sample_ids
                     output = None
                     if selected_offset + len(sample_ids) > sealed_items:
-                        batch = training.to(runtime.device, non_blocking=True)
-                        output = model(batch.model)
+                        model_batch = training.model.to(
+                            runtime.device, non_blocking=True
+                        )
+                        output = model(model_batch)
+                    artifact_indices: list[int] = []
+                    identities: list[OOFIdentity] = []
+                    sealed: list[bool] = []
+                    leads: list[float] = []
+                    signatures: list[str] = []
+                    block_ids: list[str] = []
+                    batch_multiplicities: list[int] = []
                     for batch_index, sample_id in enumerate(sample_ids):
                         if selected_offset >= len(compressed_selected):
                             raise ValueError("OOF loader produced an extra sample")
@@ -2050,55 +2143,83 @@ def infer_oof_rank_partials(
                             row.lead_hours,
                             row.condition_signature,
                         )
-                        if selected_offset < sealed_items:
-                            _, mu_z_oof = writer.sealed_fields(artifact_index)
-                            writer.skip_sealed(
-                                artifact_index, layout.identities[artifact_index]
-                            )
-                        else:
-                            if output is None:
-                                raise AssertionError(
-                                    "OOF model output is missing for an unsealed row"
-                                )
-                            probability = (
-                                output.probability_wet[batch_index, 0]
-                                .detach()
-                                .cpu()
-                                .numpy()
-                                .astype(np.float32, copy=False)
-                            )
-                            mu_z_oof = (
-                                output.mu_z[batch_index, 0]
-                                .detach()
-                                .cpu()
-                                .numpy()
-                                .astype(np.float32, copy=False)
-                            )
-                            writer.append(
-                                artifact_index,
-                                layout.identities[artifact_index],
-                                probability,
-                                mu_z_oof,
-                            )
-                        accumulator.update(
-                            lead_hours=row.lead_hours,
-                            condition_signature=row.condition_signature,
-                            block_id=row.block_id,
-                            target_z=training.labels.target_z[batch_index, 0]
-                            .detach()
-                            .numpy(),
-                            mu_z_oof=mu_z_oof,
-                            target_validity=training.labels.target_validity[
-                                batch_index, 0
-                            ]
-                            .detach()
-                            .numpy(),
-                            omega=float(training.labels.omega[batch_index].item()),
-                            multiplicity=multiplicities[key],
-                        )
+                        artifact_indices.append(artifact_index)
+                        identities.append(layout.identities[artifact_index])
+                        sealed.append(selected_offset < sealed_items)
+                        leads.append(row.lead_hours)
+                        signatures.append(row.condition_signature)
+                        block_ids.append(row.block_id)
+                        batch_multiplicities.append(multiplicities[key])
                         selected_offset += 1
+                    probability_values: np.ndarray | None = None
+                    mean_values: np.ndarray | None = None
+                    if output is not None:
+                        probability_values = np.ascontiguousarray(
+                            output.probability_wet[:, 0]
+                            .detach()
+                            .cpu()
+                            .numpy(),
+                            dtype=np.float32,
+                        )
+                        mean_values = np.ascontiguousarray(
+                            output.mu_z[:, 0].detach().cpu().numpy(),
+                            dtype=np.float32,
+                        )
+                    payload = _OOFBatchPostprocessPayload(
+                        artifact_indices=tuple(artifact_indices),
+                        identities=tuple(identities),
+                        sealed=tuple(sealed),
+                        probabilities=probability_values,
+                        means=mean_values,
+                        target_z=np.array(
+                            training.labels.target_z[:, 0].detach().numpy(),
+                            dtype=np.float32,
+                            copy=True,
+                            order="C",
+                        ),
+                        target_validity=np.array(
+                            training.labels.target_validity[:, 0].detach().numpy(),
+                            copy=True,
+                            order="C",
+                        ),
+                        omega=np.array(
+                            training.labels.omega.detach().numpy(),
+                            dtype=np.float64,
+                            copy=True,
+                        ),
+                        lead_hours=np.asarray(leads, dtype=np.float64),
+                        condition_signatures=tuple(signatures),
+                        block_ids=tuple(block_ids),
+                        multiplicities=np.asarray(
+                            batch_multiplicities, dtype=np.int64
+                        ),
+                    )
+                    postprocess_futures.append(
+                        postprocess_executor.submit(
+                            _postprocess_oof_batch,
+                            writer,
+                            accumulator,
+                            payload,
+                        )
+                    )
+                    if len(postprocess_futures) > 2:
+                        postprocess_futures.pop(0).result()
+        except BaseException:
+            postprocess_executor.shutdown(wait=True, cancel_futures=False)
+            try:
+                writer.abort()
+            except BaseException:
+                _LOGGER.exception("OOF writer abort failed after inference error")
+            raise
         finally:
             _shutdown_dataloader(loader)
+        postprocess_executor.shutdown(wait=True, cancel_futures=False)
+        try:
+            for future in postprocess_futures:
+                future.result()
+        except BaseException:
+            writer.abort()
+            raise
         if selected_offset != len(compressed_selected):
             writer.abort()
             raise ValueError("OOF loader stopped before its declared partition ended")

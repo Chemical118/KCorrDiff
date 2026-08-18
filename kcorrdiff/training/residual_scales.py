@@ -164,14 +164,35 @@ class ResidualScaleAccumulator:
         residual = target[validity] - prediction[validity]
         square_sum = float(omega * multiplicity * np.dot(residual, residual))
         weight_mass = float(omega * multiplicity * residual.size)
+        self._accumulate_sufficient(
+            lead_hours=float(lead_hours),
+            canonical_signature=canonical_signature,
+            block_id=block_id,
+            square_sum=square_sum,
+            weight_mass=weight_mass,
+            valid_pixels=int(multiplicity * residual.size),
+            items=multiplicity,
+        )
+
+    def _accumulate_sufficient(
+        self,
+        *,
+        lead_hours: float,
+        canonical_signature: str,
+        block_id: str,
+        square_sum: float,
+        weight_mass: float,
+        valid_pixels: int,
+        items: int,
+    ) -> None:
         if not math.isfinite(square_sum) or not math.isfinite(weight_mass):
             raise OverflowError("residual-scale sufficient statistics overflowed float64")
-        for key in self._pool_keys(float(lead_hours), canonical_signature):
+        for key in self._pool_keys(lead_hours, canonical_signature):
             moments = self._moments.setdefault(key, _Moments())
             moments.weighted_square_sum += square_sum
             moments.weight_sum += weight_mass
-            moments.valid_pixels += int(multiplicity * residual.size)
-            moments.items += multiplicity
+            moments.valid_pixels += valid_pixels
+            moments.items += items
             if weight_mass > 0.0:
                 assert moments.block_masses is not None
                 moments.block_masses[block_id] = (
@@ -188,6 +209,87 @@ class ResidualScaleAccumulator:
                 raise OverflowError(
                     "pooled residual-scale sufficient statistics overflowed float64"
                 )
+
+    def update_batch(
+        self,
+        *,
+        lead_hours: ArrayLike,
+        condition_signatures: list[str] | tuple[str, ...],
+        block_ids: list[str] | tuple[str, ...],
+        target_z: ArrayLike,
+        mu_z_oof: ArrayLike,
+        target_validity: ArrayLike,
+        omega: ArrayLike,
+        multiplicities: ArrayLike,
+    ) -> None:
+        """Vectorize dense residual reduction before updating sparse cells."""
+
+        target = np.asarray(target_z, dtype=np.float64)
+        prediction = np.asarray(mu_z_oof, dtype=np.float64)
+        validity = np.asarray(target_validity)
+        weights = np.asarray(omega, dtype=np.float64)
+        counts = np.asarray(multiplicities)
+        leads = np.asarray(lead_hours, dtype=np.float64)
+        if target.ndim < 2 or target.shape != prediction.shape or target.shape != validity.shape:
+            raise ValueError("batched residual scale arrays must share [batch, ...] shape")
+        batch_size = target.shape[0]
+        if (
+            weights.shape != (batch_size,)
+            or counts.shape != (batch_size,)
+            or leads.shape != (batch_size,)
+            or len(condition_signatures) != batch_size
+            or len(block_ids) != batch_size
+        ):
+            raise ValueError("batched residual scale metadata length mismatch")
+        if validity.dtype != np.bool_:
+            if not np.issubdtype(validity.dtype, np.number) or not np.all(
+                (validity == 0) | (validity == 1)
+            ):
+                raise ValueError("target_validity must be boolean or 0/1")
+            validity = validity.astype(np.bool_)
+        if not np.all(np.isfinite(target[validity])) or not np.all(
+            np.isfinite(prediction[validity])
+        ):
+            raise ValueError("valid residual-scale values must be finite")
+        residual = target - prediction
+        residual[~validity] = 0.0
+        axes = tuple(range(1, residual.ndim))
+        np.square(residual, out=residual)
+        square_sums = np.sum(residual, axis=axes, dtype=np.float64)
+        valid_counts = np.count_nonzero(validity, axis=axes)
+        for index in range(batch_size):
+            lead = float(leads[index])
+            if lead not in tuple(value / 2 for value in range(1, 13)):
+                raise ValueError("scale lead must be one of the official 12 leads")
+            signature = parse_condition_signature(condition_signatures[index]).key
+            block_id = block_ids[index]
+            if not isinstance(block_id, str) or not block_id or block_id.strip() != block_id:
+                raise ValueError(
+                    "residual scale update requires a canonical non-empty block_id"
+                )
+            weight = float(weights[index])
+            multiplicity = counts[index]
+            if not math.isfinite(weight) or weight <= 0.0:
+                raise ValueError("omega must be finite and positive")
+            if (
+                isinstance(multiplicity, (bool, np.bool_))
+                or not np.issubdtype(type(multiplicity), np.integer)
+                or int(multiplicity) <= 0
+            ):
+                raise ValueError(
+                    "residual scale multiplicity must be a positive integer"
+                )
+            item_count = int(multiplicity)
+            pixel_count = int(valid_counts[index])
+            self._accumulate_sufficient(
+                lead_hours=lead,
+                canonical_signature=signature,
+                block_id=block_id,
+                square_sum=float(weight * item_count * square_sums[index]),
+                weight_mass=float(weight * item_count * pixel_count),
+                valid_pixels=item_count * pixel_count,
+                items=item_count,
+            )
 
     def result(self) -> dict[str, object]:
         if not self._moments:

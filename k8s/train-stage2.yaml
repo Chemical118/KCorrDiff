@@ -41,7 +41,7 @@ spec:
         - name: trainer
           image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace/code/kcorrdiff-rsync-oof-clean-v7
+          workingDir: /workspace/code/kcorrdiff-rsync-oof-queued-v8
           command: ["/bin/bash", "-ceu"]
           args:
             - |
@@ -53,7 +53,7 @@ spec:
 
               # New code lives in a separate snapshot; the active v3 producer
               # snapshot remains untouched and is consumed read-only below.
-              source_root=/workspace/code/kcorrdiff-rsync-oof-clean-v7
+              source_root=/workspace/code/kcorrdiff-rsync-oof-queued-v8
               config_path=${source_root}/configs/stage2-full-width.yaml
               radar_cache_root=/workspace/data/cache/radar-v1
               era5_cache_root=/workspace/data/cache/era5-v1
@@ -143,7 +143,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-clean-v7
+              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-queued-v8
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
