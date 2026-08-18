@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 import math
-from typing import Literal, Protocol, Sequence, runtime_checkable
+from typing import Literal, Protocol, Sequence, TypeVar, runtime_checkable
 
 import numpy as np
 import torch
@@ -66,6 +66,8 @@ from kcorrdiff.models.target_encoder import (
 
 
 EraValueSpace = Literal["physical_raw", "explicitly_normalized"]
+
+_ValidatedDataclass = TypeVar("_ValidatedDataclass")
 
 _FUTURE_MODEL_FIELDS = frozenset(
     {
@@ -1120,6 +1122,258 @@ class TrainingBatch:
         )
 
 
+def _concatenate_rows(values: Sequence[Tensor]) -> Tensor:
+    """Concatenate worker-built row tensors while retaining pinned memory."""
+
+    tensors = tuple(values)
+    if not tensors:
+        raise ValueError("cannot concatenate an empty tensor sequence")
+    if len(tensors) == 1:
+        return tensors[0]
+    first = tensors[0]
+    if any(
+        value.dtype != first.dtype
+        or value.device != first.device
+        or value.shape[1:] != first.shape[1:]
+        for value in tensors[1:]
+    ):
+        raise ValueError("worker sub-batch tensor contracts disagree")
+    shape = (sum(int(value.shape[0]) for value in tensors), *first.shape[1:])
+    pinned = first.device.type == "cpu" and all(value.is_pinned() for value in tensors)
+    result = torch.empty(
+        shape,
+        dtype=first.dtype,
+        device=first.device,
+        pin_memory=pinned,
+    )
+    offset = 0
+    for value in tensors:
+        stop = offset + int(value.shape[0])
+        result[offset:stop].copy_(value)
+        offset = stop
+    return result
+
+
+def _from_validated_fields(
+    cls: type[_ValidatedDataclass], /, **values: object
+) -> _ValidatedDataclass:
+    """Build a joined dataclass whose component rows were already validated.
+
+    This is deliberately private to the worker-sub-batch join path. It avoids
+    running value-wide ``isfinite``/range scans for a second time while still
+    requiring every declared field and rejecting unknown fields.
+    """
+
+    expected = {field.name for field in fields(cls)}
+    supplied = set(values)
+    if supplied != expected:
+        missing = sorted(expected - supplied)
+        extra = sorted(supplied - expected)
+        raise TypeError(
+            f"validated {cls.__name__} fields disagree: missing={missing}, extra={extra}"
+        )
+    instance = object.__new__(cls)
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
+    return instance
+
+
+def concatenate_training_batches(
+    batches: Sequence[TrainingBatch],
+) -> TrainingBatch:
+    """Assemble ordered DataLoader sub-batches into one model batch.
+
+    Workers perform expensive sample loading and collation on smaller chunks;
+    this function only joins their already materialized row tensors. Static
+    physical geometry is batch-independent and is therefore reused directly.
+    """
+
+    values = tuple(batches)
+    if not values:
+        raise ValueError("cannot concatenate an empty TrainingBatch sequence")
+    if len(values) == 1:
+        return values[0]
+    models = tuple(value.model for value in values)
+    labels = tuple(value.labels for value in values)
+    targets = tuple(model.condition_bank.target for model in models)
+    contexts = tuple(model.condition_bank.context for model in models)
+    eras = tuple(model.era for model in models)
+    advect = tuple(model.advection for model in models)
+
+    reference_era = eras[0]
+    if any(
+        (
+            value.channel_names,
+            value.value_space,
+            value.normalization_artifact_id,
+        )
+        != (
+            reference_era.channel_names,
+            reference_era.value_space,
+            reference_era.normalization_artifact_id,
+        )
+        for value in eras[1:]
+    ):
+        raise ValueError("OOF sub-batches disagree on ERA representation")
+    alias_context = advect[0].context_channels_alias_condition_bank
+    if any(
+        value.context_channels_alias_condition_bank != alias_context
+        for value in advect[1:]
+    ):
+        raise ValueError("OOF sub-batches disagree on context aliasing")
+
+    context_dynamic = _concatenate_rows(
+        tuple(value.dynamic_fields for value in contexts)
+    )
+    target_inputs = _from_validated_fields(
+        TargetEncoderInputs,
+        radar_history=_concatenate_rows(tuple(value.radar_history for value in targets)),
+        history_validity=_concatenate_rows(
+            tuple(value.history_validity for value in targets)
+        ),
+        static_fields=_concatenate_rows(tuple(value.static_fields for value in targets)),
+        static_coverage=_concatenate_rows(
+            tuple(value.static_coverage for value in targets)
+        ),
+        static_channel_names=targets[0].static_channel_names,
+    )
+    context_inputs = _from_validated_fields(
+        ContextEncoderInputs,
+        dynamic_fields=context_dynamic,
+        detail_validity=_concatenate_rows(
+            tuple(value.detail_validity for value in contexts)
+        ),
+        static_fields=_concatenate_rows(tuple(value.static_fields for value in contexts)),
+        dynamic_channel_names=contexts[0].dynamic_channel_names,
+        static_channel_names=contexts[0].static_channel_names,
+    )
+    era_inputs = _from_validated_fields(
+        EraModelInputs,
+        values=_concatenate_rows(tuple(value.values for value in eras)),
+        delta_hours=_concatenate_rows(tuple(value.delta_hours for value in eras)),
+        tp_interval_center_delta_hours=_concatenate_rows(
+            tuple(value.tp_interval_center_delta_hours for value in eras)
+        ),
+        data_valid_inst=_concatenate_rows(
+            tuple(value.data_valid_inst for value in eras)
+        ),
+        tp_valid=_concatenate_rows(tuple(value.tp_valid for value in eras)),
+        trajectory_window_mask=_concatenate_rows(
+            tuple(value.trajectory_window_mask for value in eras)
+        ),
+        temporal_access_mask=_concatenate_rows(
+            tuple(value.temporal_access_mask for value in eras)
+        ),
+        era_present=_concatenate_rows(tuple(value.era_present for value in eras)),
+        tp_present=_concatenate_rows(tuple(value.tp_present for value in eras)),
+        valid_times_utc=sum((value.valid_times_utc for value in eras), ()),
+        tp_intervals_utc=sum((value.tp_intervals_utc for value in eras), ()),
+        condition_signatures=sum((value.condition_signatures for value in eras), ()),
+        provenance=sum((value.provenance for value in eras), ()),
+        channel_names=reference_era.channel_names,
+        value_space=reference_era.value_space,
+        normalization_artifact_id=reference_era.normalization_artifact_id,
+    )
+    causal_values = tuple(value.causal for value in advect)
+    causal = _from_validated_fields(
+        CausalAdvectionInput,
+        t0_utc=sum((tuple(value.t0_utc) for value in causal_values), ()),
+        history_times_utc=sum(
+            (tuple(value.history_times_utc) for value in causal_values), ()
+        ),
+        target_rate_mm_per_hour=_concatenate_rows(
+            tuple(value.target_rate_mm_per_hour for value in causal_values)
+        ),
+        target_valid=_concatenate_rows(tuple(value.target_valid for value in causal_values)),
+        context_rate_mm_per_hour=(
+            context_dynamic[:, :, 0]
+            if alias_context
+            else _concatenate_rows(
+                tuple(value.context_rate_mm_per_hour for value in causal_values)
+            )
+        ),
+        context_valid_fraction=(
+            context_dynamic[:, :, 3]
+            if alias_context
+            else _concatenate_rows(
+                tuple(value.context_valid_fraction for value in causal_values)
+            )
+        ),
+        context_interpolation_confidence=(
+            context_dynamic[:, :, 4]
+            if alias_context
+            else _concatenate_rows(
+                tuple(
+                    value.context_interpolation_confidence for value in causal_values
+                )
+            )
+        ),
+    )
+    provenance_values = tuple(model.provenance for model in models)
+    t0_utc = sum((value.t0_utc for value in provenance_values), ())
+    signatures = sum((value.condition_signatures for value in provenance_values), ())
+    groups: dict[tuple[datetime, str], list[int]] = {}
+    for index, key in enumerate(zip(t0_utc, signatures, strict=True)):
+        groups.setdefault(key, []).append(index)
+    provenance = BatchProvenance(
+        sample_ids=sum((value.sample_ids for value in provenance_values), ()),
+        block_ids=sum((value.block_ids for value in provenance_values), ()),
+        fold_ids=sum((value.fold_ids for value in provenance_values), ()),
+        t0_utc=t0_utc,
+        history_times_utc=sum(
+            (value.history_times_utc for value in provenance_values), ()
+        ),
+        condition_signatures=signatures,
+        duplicate_condition_groups=tuple(
+            tuple(indices) for indices in groups.values() if len(indices) > 1
+        ),
+        explicit_history_copies=all(
+            value.explicit_history_copies for value in provenance_values
+        ),
+    )
+    model = _from_validated_fields(
+        RegressionModelBatch,
+        condition_bank=_from_validated_fields(
+            ConditionBankInputs,
+            target=target_inputs,
+            context=context_inputs,
+        ),
+        embedding=_from_validated_fields(
+            ConditionEmbeddingInputs,
+            lead_hours=_concatenate_rows(
+                tuple(value.embedding.lead_hours for value in models)
+            ),
+            verification_cyclic=_concatenate_rows(
+                tuple(value.embedding.verification_cyclic for value in models)
+            ),
+        ),
+        era=era_inputs,
+        advection=_from_validated_fields(
+            AdvectionModelInputs,
+            causal=causal,
+            geometry=advect[0].geometry,
+            lead_indices=_concatenate_rows(tuple(value.lead_indices for value in advect)),
+            context_channels_alias_condition_bank=alias_context,
+        ),
+        geometry=models[0].geometry,
+        provenance=provenance,
+    )
+    loss = _from_validated_fields(
+        LossOnlyLabels,
+        target_z=_concatenate_rows(tuple(value.target_z for value in labels)),
+        target_wet=_concatenate_rows(tuple(value.target_wet for value in labels)),
+        raw_target_mm=_concatenate_rows(tuple(value.raw_target_mm for value in labels)),
+        model_target_mm=_concatenate_rows(
+            tuple(value.model_target_mm for value in labels)
+        ),
+        target_validity=_concatenate_rows(
+            tuple(value.target_validity for value in labels)
+        ),
+        omega=_concatenate_rows(tuple(value.omega for value in labels)),
+    )
+    return TrainingBatch(model=model, labels=loss)
+
+
 def _same_array(left: np.ndarray, right: np.ndarray) -> bool:
     return left.shape == right.shape and np.array_equal(left, right)
 
@@ -1169,7 +1423,29 @@ def _validate_duplicate_conditions(samples: Sequence[TrainingSample]) -> tuple[t
     return duplicates
 
 
-def _validate_sample(sample: TrainingSample, spec: PhysicalGridSpec) -> None:
+def _expected_target_coordinates(
+    spec: PhysicalGridSpec,
+) -> tuple[np.ndarray, np.ndarray]:
+    center_x, center_y = spec.target_center_lcc_km
+    x_grid, y_grid = np.meshgrid(
+        spec.target_x_lcc_km, spec.target_y_lcc_km, indexing="xy"
+    )
+    return normalize_lcc_coordinates(
+        x_grid,
+        y_grid,
+        target_center_x_km=center_x,
+        target_center_y_km=center_y,
+        scale_km=DEFAULT_COORDINATE_SCALE_KM,
+    )
+
+
+def _validate_sample(
+    sample: TrainingSample,
+    spec: PhysicalGridSpec,
+    *,
+    expected_coordinates: tuple[np.ndarray, np.ndarray] | None = None,
+    validate_static_coordinates: bool = True,
+) -> None:
     conditions = sample.conditions
     size = spec.input_size
     if conditions.t0_utc.tzinfo is None or conditions.t0_utc.utcoffset() is None:
@@ -1195,23 +1471,16 @@ def _validate_sample(sample: TrainingSample, spec: PhysicalGridSpec) -> None:
     if conditions.static.context.source_dx_km.shape != (size, size):
         raise ValueError("context static fields must match the model grid")
 
-    center_x, center_y = spec.target_center_lcc_km
-    x_grid, y_grid = np.meshgrid(
-        spec.target_x_lcc_km, spec.target_y_lcc_km, indexing="xy"
-    )
-    expected_x, expected_y = normalize_lcc_coordinates(
-        x_grid,
-        y_grid,
-        target_center_x_km=center_x,
-        target_center_y_km=center_y,
-        scale_km=DEFAULT_COORDINATE_SCALE_KM,
-    )
-    if not np.allclose(
-        conditions.static.target.channel("x_lcc_shared"), expected_x, rtol=0.0, atol=2.0e-5
-    ) or not np.allclose(
-        conditions.static.target.channel("y_lcc_shared"), expected_y, rtol=0.0, atol=2.0e-5
-    ):
-        raise ValueError("target static coordinates disagree with actual LCC axes")
+    if validate_static_coordinates:
+        if expected_coordinates is None:
+            expected_coordinates = _expected_target_coordinates(spec)
+        expected_x, expected_y = expected_coordinates
+        if not np.allclose(
+            conditions.static.target.channel("x_lcc_shared"), expected_x, rtol=0.0, atol=2.0e-5
+        ) or not np.allclose(
+            conditions.static.target.channel("y_lcc_shared"), expected_y, rtol=0.0, atol=2.0e-5
+        ):
+            raise ValueError("target static coordinates disagree with actual LCC axes")
 
     context = conditions.context
     context_arrays = (
@@ -1280,6 +1549,7 @@ class TrainingBatchCollator:
         self.device = torch.device(device)
         self.validate_duplicate_histories = bool(validate_duplicate_histories)
         self.allow_test_override = bool(allow_test_override)
+        self._expected_coordinates: tuple[np.ndarray, np.ndarray] | None = None
 
     def __call__(self, samples: Sequence[TrainingSample]) -> TrainingBatch:
         values = tuple(samples)
@@ -1287,8 +1557,24 @@ class TrainingBatchCollator:
             raise ValueError("cannot collate an empty TrainingSample batch")
         if any(not isinstance(sample, TrainingSample) for sample in values):
             raise TypeError("TrainingBatchCollator accepts only TrainingSample objects")
+        if self._expected_coordinates is None:
+            self._expected_coordinates = _expected_target_coordinates(self.geometry)
+        # One identical static object yields one coordinate check per batch;
+        # identity implies the allclose verdict cannot differ between samples.
+        validated_statics: list[object] = []
         for sample in values:
-            _validate_sample(sample, self.geometry)
+            static = sample.conditions.static
+            first_of_its_static = all(
+                existing is not static for existing in validated_statics
+            )
+            _validate_sample(
+                sample,
+                self.geometry,
+                expected_coordinates=self._expected_coordinates,
+                validate_static_coordinates=first_of_its_static,
+            )
+            if first_of_its_static:
+                validated_statics.append(static)
         duplicate_groups = (
             _validate_duplicate_conditions(values)
             if self.validate_duplicate_histories
@@ -1334,11 +1620,16 @@ class TrainingBatchCollator:
             target_center_x_km=center_x,
             target_center_y_km=center_y,
         )
+        # ``conditions`` keeps every owner alive for the duration of this call,
+        # so id() keys cannot be recycled; samples sharing one static object
+        # share one assembled plane stack instead of rebuilding it.
+        static_row_by_id: dict[int, np.ndarray] = {}
         context_static_rows = []
         for condition in conditions:
             static = condition.static.context
-            context_static_rows.append(
-                np.stack(
+            row = static_row_by_id.get(id(static))
+            if row is None:
+                row = np.stack(
                     (
                         context_x_shared,
                         context_y_shared,
@@ -1349,7 +1640,8 @@ class TrainingBatchCollator:
                     ),
                     axis=0,
                 ).astype(np.float32, copy=False)
-            )
+                static_row_by_id[id(static)] = row
+            context_static_rows.append(row)
         context_static_np = np.stack(context_static_rows, axis=0)
 
         raw_era_np = np.stack([condition.era5.values for condition in conditions], axis=0).astype(
@@ -1561,4 +1853,5 @@ __all__ = [
     "TrainingBatch",
     "TrainingBatchCollator",
     "collate_training_samples",
+    "concatenate_training_batches",
 ]

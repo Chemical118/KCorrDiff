@@ -41,7 +41,7 @@ spec:
         - name: trainer
           image: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace/code/kcorrdiff-rsync-oof-uploadq50-v9
+          workingDir: /workspace/code/kcorrdiff-rsync-oof-subbatch8-fastjoin-v11
           command: ["/bin/bash", "-ceu"]
           args:
             - |
@@ -53,7 +53,7 @@ spec:
 
               # New code lives in a separate snapshot; the active v3 producer
               # snapshot remains untouched and is consumed read-only below.
-              source_root=/workspace/code/kcorrdiff-rsync-oof-uploadq50-v9
+              source_root=/workspace/code/kcorrdiff-rsync-oof-subbatch8-fastjoin-v11
               config_path=${source_root}/configs/stage2-full-width.yaml
               radar_cache_root=/workspace/data/cache/radar-v1
               era5_cache_root=/workspace/data/cache/era5-v1
@@ -128,7 +128,7 @@ spec:
                 --era-grid-size 33 \
                 --per-rank-microbatch-size 64 \
                 --gradient-accumulation-steps 1 \
-                --num-workers 12 \
+                --num-workers 32 \
                 --prefetch-factor 2 \
                 --fail-on-fallback \
                 --wandb-mode online \
@@ -143,7 +143,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: PYTHONPATH
-              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-uploadq50-v9
+              value: /workspace/envs/stage2-python-v1:/workspace/code/kcorrdiff-rsync-oof-subbatch8-fastjoin-v11
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE

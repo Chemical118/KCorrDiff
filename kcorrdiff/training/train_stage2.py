@@ -48,7 +48,11 @@ from kcorrdiff.models.regression_system import (
     RegressionSystem,
     RegressionSystemConfig,
 )
-from kcorrdiff.training.batch import TrainingBatch, TrainingBatchCollator
+from kcorrdiff.training.batch import (
+    TrainingBatch,
+    TrainingBatchCollator,
+    concatenate_training_batches,
+)
 from kcorrdiff.training.checkpoints import (
     CheckpointProvenance,
     TrainingCursor,
@@ -1499,6 +1503,7 @@ def _oof_rank_loader(
     global_indices: Sequence[int],
     num_workers: int,
     prefetch_factor: int,
+    loader_batch_size: int = 8,
 ) -> DataLoader[RankLocalBatch]:
     if len(row_indices) != len(global_indices):
         raise ValueError("OOF row/global index lengths differ")
@@ -1534,12 +1539,57 @@ def _oof_rank_loader(
     )
     return DataLoader(
         dataset,
-        batch_size=factory.config.optimization.per_rank_microbatch_size,
+        batch_size=loader_batch_size,
         shuffle=False,
         drop_last=False,
         collate_fn=RankSlotCollator(collator),
         **options,
     )
+
+
+def _concatenate_oof_loss_weights(values: Sequence[RankLocalBatch]) -> Tensor:
+    return torch.cat(tuple(value.loss_weights for value in values), dim=0)
+
+
+def _assemble_oof_model_batches(
+    loader: Iterable[RankLocalBatch], *, model_batch_size: int
+) -> Iterator[RankLocalBatch]:
+    """Join ordered worker sub-batches without changing the GPU batch size."""
+
+    if model_batch_size <= 0:
+        raise ValueError("OOF model batch size must be positive")
+    pending: list[RankLocalBatch] = []
+    pending_items = 0
+    for value in loader:
+        if value.training is None or not isinstance(value.training, TrainingBatch):
+            raise TypeError("OOF loader sub-batches must contain TrainingBatch")
+        pending.append(value)
+        pending_items += value.training.model.batch_size
+        if pending_items > model_batch_size:
+            raise ValueError("OOF loader sub-batches crossed a model batch boundary")
+        if pending_items < model_batch_size:
+            continue
+        training_batches = tuple(
+            item.training for item in pending if isinstance(item.training, TrainingBatch)
+        )
+        yield RankLocalBatch(
+            training=concatenate_training_batches(training_batches),
+            slots=sum((item.slots for item in pending), ()),
+            active_slot_indices=tuple(range(pending_items)),
+            loss_weights=_concatenate_oof_loss_weights(pending),
+        )
+        pending = []
+        pending_items = 0
+    if pending:
+        training_batches = tuple(
+            item.training for item in pending if isinstance(item.training, TrainingBatch)
+        )
+        yield RankLocalBatch(
+            training=concatenate_training_batches(training_batches),
+            slots=sum((item.slots for item in pending), ()),
+            active_slot_indices=tuple(range(pending_items)),
+            loss_weights=_concatenate_oof_loss_weights(pending),
+        )
 
 
 def _draw_multiplicities(
@@ -2094,7 +2144,12 @@ def infer_oof_rank_partials(
         postprocess_futures: list[Future[int]] = []
         try:
             with torch.no_grad():
-                for rank_batch in loader:
+                for rank_batch in _assemble_oof_model_batches(
+                    loader,
+                    model_batch_size=(
+                        factory.config.optimization.per_rank_microbatch_size
+                    ),
+                ):
                     if rank_batch.training is None:
                         raise AssertionError("OOF loaders never contain padding")
                     if not isinstance(rank_batch.training, TrainingBatch):

@@ -7,7 +7,7 @@ the label structure, never among model conditions.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterator, Mapping, Sequence
@@ -29,6 +29,12 @@ from .context_regrid import ContextRegridOperator, DetailMode
 from .era5_reader import Era5MmapCache
 from .sampling import DrawRow
 from .time_features import build_verification_time_features
+
+
+# Draw plans repeat one t0 across leads/signatures; regridded context depends
+# only on t0 (histories and regrid parameters are fixed per dataset), so a few
+# retained entries deduplicate the per-sample regrid without growing memory.
+_CONTEXT_CACHE_ENTRIES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +116,7 @@ class KCorrDiffDataset(Dataset[TrainingSample]):
         )
         self.strict_era5_instantaneous = bool(strict_era5_instantaneous)
         self.radar_timezone = radar_timezone
+        self._context_cache: OrderedDict[str, ContextRadarConditions] = OrderedDict()
         if context_detail_mode not in ("local_max", "nearest"):
             raise ValueError("context_detail_mode must be 'local_max' or 'nearest'")
         if (
@@ -214,13 +221,20 @@ class KCorrDiffDataset(Dataset[TrainingSample]):
                 "in [0, 1]"
             )
 
-        raw_context_history = self.cache.read_many("condition", history_keys)
-        context = build_context_radar_conditions(
-            raw_context_history,
-            operator=self.context_regrid_operator,
-            detail_mode=self.context_detail_mode,
-            wet_threshold_mm_per_hour=self.context_wet_threshold_mm_per_hour,
-        )
+        context = self._context_cache.get(row.t0_utc)
+        if context is None:
+            raw_context_history = self.cache.read_many("condition", history_keys)
+            context = build_context_radar_conditions(
+                raw_context_history,
+                operator=self.context_regrid_operator,
+                detail_mode=self.context_detail_mode,
+                wet_threshold_mm_per_hour=self.context_wet_threshold_mm_per_hour,
+            )
+            self._context_cache[row.t0_utc] = context
+            while len(self._context_cache) > _CONTEXT_CACHE_ENTRIES:
+                self._context_cache.popitem(last=False)
+        else:
+            self._context_cache.move_to_end(row.t0_utc)
         signature = parse_condition_signature(row.condition_signature)
         era_window = self.era5_cache.read_window(
             t0,

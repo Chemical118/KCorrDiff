@@ -14,6 +14,7 @@ the K-CorrDiff v1.1.3b data contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Literal
 
 import numpy as np
@@ -213,6 +214,32 @@ def _apply_separable(
     return np.asarray(weights_x @ intermediate.T, dtype=np.float64).T
 
 
+def _support_shift_offsets(
+    supports: tuple[np.ndarray, ...],
+) -> tuple[np.ndarray, ...] | None:
+    """Per-shift gather indices for contiguous supports, or None.
+
+    Element ``shift`` holds, for every destination row, the index of that
+    row's ``min(shift, support size - 1)``-th support member, so an
+    elementwise-maximum sweep over all shifts visits every support member of
+    every row.  Area integration yields contiguous supports; None (an empty
+    or non-contiguous support) keeps callers on the per-row path.
+    """
+
+    if not supports or any(support.size == 0 for support in supports):
+        return None
+    for support in supports:
+        if not np.array_equal(
+            support, np.arange(support[0], support[0] + support.size)
+        ):
+            return None
+    sizes = np.asarray([support.size for support in supports], dtype=np.intp)
+    starts = np.asarray([support[0] for support in supports], dtype=np.intp)
+    return tuple(
+        starts + np.minimum(shift, sizes - 1) for shift in range(int(sizes.max()))
+    )
+
+
 @dataclass(frozen=True)
 class ContextRegridResult:
     """Dynamic and confidence channels on the uniform context grid."""
@@ -272,6 +299,29 @@ class ContextRegridOperator:
     def W_y(self) -> csr_matrix:
         return self.weights_y
 
+    @cached_property
+    def _all_valid_fraction(self) -> np.ndarray:
+        """Regridded basis mass of an entirely valid frame; read-only.
+
+        The array is shared across every all-valid ``regrid`` call, so it must
+        never be mutated in place.
+        """
+
+        ones = np.ones(self.source_shape, dtype=np.float64)
+        fraction = np.clip(
+            _apply_separable(ones, self.weights_y, self.weights_x), 0.0, 1.0
+        )
+        fraction.setflags(write=False)
+        return fraction
+
+    @cached_property
+    def _x_support_offsets(self) -> tuple[np.ndarray, ...] | None:
+        return _support_shift_offsets(self._x_supports)
+
+    @cached_property
+    def _y_support_offsets(self) -> tuple[np.ndarray, ...] | None:
+        return _support_shift_offsets(self._y_supports)
+
     def apply_linear(self, field: npt.ArrayLike) -> np.ndarray:
         """Apply ``W_y @ field @ W_x.T`` without validity renormalization."""
 
@@ -292,18 +342,28 @@ class ContextRegridOperator:
         fill_value: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         masked = np.where(valid, values, -np.inf)
-        along_x = np.empty(
-            (self.source_y_km.size, self.destination_x_km.size),
-            dtype=np.float64,
-        )
-        for destination_x, source_indices in enumerate(self._x_supports):
-            along_x[:, destination_x] = np.max(masked[:, source_indices], axis=1)
-
-        detail = np.empty(self.destination_shape, dtype=np.float64)
-        for destination_y, source_indices in enumerate(self._y_supports):
-            detail[destination_y, :] = np.max(
-                along_x[source_indices, :], axis=0
+        x_offsets = self._x_support_offsets
+        y_offsets = self._y_support_offsets
+        if x_offsets is not None and y_offsets is not None:
+            along_x = np.take(masked, x_offsets[0], axis=1)
+            for offsets in x_offsets[1:]:
+                np.maximum(along_x, np.take(masked, offsets, axis=1), out=along_x)
+            detail = np.take(along_x, y_offsets[0], axis=0)
+            for offsets in y_offsets[1:]:
+                np.maximum(detail, np.take(along_x, offsets, axis=0), out=detail)
+        else:
+            along_x = np.empty(
+                (self.source_y_km.size, self.destination_x_km.size),
+                dtype=np.float64,
             )
+            for destination_x, source_indices in enumerate(self._x_supports):
+                along_x[:, destination_x] = np.max(masked[:, source_indices], axis=1)
+
+            detail = np.empty(self.destination_shape, dtype=np.float64)
+            for destination_y, source_indices in enumerate(self._y_supports):
+                detail[destination_y, :] = np.max(
+                    along_x[source_indices, :], axis=0
+                )
         detail_valid = np.isfinite(detail)
         return np.where(detail_valid, detail, fill_value), detail_valid
 
@@ -353,7 +413,8 @@ class ContextRegridOperator:
                     f"got {supplied_validity.shape}"
                 )
             valid = supplied_validity.astype(bool, copy=False) & np.isfinite(values)
-        if np.any(values[valid] < 0.0):
+        all_valid = bool(valid.all())
+        if np.any((values if all_valid else values[valid]) < 0.0):
             raise ValueError("valid linear rain rates must be non-negative")
         if detail_mode not in ("local_max", "nearest"):
             raise ValueError("detail_mode must be 'local_max' or 'nearest'")
@@ -366,13 +427,16 @@ class ContextRegridOperator:
         if not np.isfinite(fill_value):
             raise ValueError("fill_value must be finite")
 
-        safe_values = np.where(valid, values, 0.0)
-        valid_fraction = _apply_separable(
-            valid.astype(np.float64), self.weights_y, self.weights_x
-        )
-        # Roundoff at the endpoint extrapolation must not create impossible
-        # validity values such as 1 + 2e-16.
-        valid_fraction = np.clip(valid_fraction, 0.0, 1.0)
+        safe_values = values if all_valid else np.where(valid, values, 0.0)
+        if all_valid:
+            valid_fraction = self._all_valid_fraction
+        else:
+            valid_fraction = _apply_separable(
+                valid.astype(np.float64), self.weights_y, self.weights_x
+            )
+            # Roundoff at the endpoint extrapolation must not create impossible
+            # validity values such as 1 + 2e-16.
+            valid_fraction = np.clip(valid_fraction, 0.0, 1.0)
         numerator = _apply_separable(safe_values, self.weights_y, self.weights_x)
         has_valid_mean = valid_fraction > minimum_valid_fraction
         mean_rate = np.full(self.destination_shape, fill_value, dtype=np.float64)

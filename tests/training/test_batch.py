@@ -34,6 +34,7 @@ from kcorrdiff.training.batch import (
     TrainingBatch,
     TrainingBatchCollator,
     collate_training_samples,
+    concatenate_training_batches,
 )
 from kcorrdiff.training.data_factory import RankLocalBatch
 from kcorrdiff.training.plan import DrawSlot
@@ -608,6 +609,86 @@ def test_model_batch_binds_canonical_fp32_time_embedding_to_t0_and_lead() -> Non
     original.embedding.verification_cyclic.zero_()
     with pytest.raises(ValueError, match="canonical FP32 t0/lead"):
         original.validate()
+
+
+def test_worker_sub_batches_concatenate_to_the_direct_batch() -> None:
+    grid = make_grid()
+    samples = tuple(
+        make_sample(grid=grid, sample_id=f"sample-{index}", lead_hours=lead)
+        for index, lead in enumerate((0.5, 1.0, 1.5, 2.0))
+    )
+    collator = TrainingBatchCollator(grid, allow_test_override=True)
+    direct = collator(samples)
+    joined = concatenate_training_batches(
+        (collator(samples[:2]), collator(samples[2:]))
+    )
+
+    direct_model = direct.model
+    joined_model = joined.model
+    tensor_pairs = (
+        (
+            direct_model.condition_bank.target.radar_history,
+            joined_model.condition_bank.target.radar_history,
+        ),
+        (
+            direct_model.condition_bank.context.dynamic_fields,
+            joined_model.condition_bank.context.dynamic_fields,
+        ),
+        (direct_model.embedding.lead_hours, joined_model.embedding.lead_hours),
+        (direct_model.era.values, joined_model.era.values),
+        (
+            direct_model.advection.causal.target_rate_mm_per_hour,
+            joined_model.advection.causal.target_rate_mm_per_hour,
+        ),
+        (direct.labels.target_z, joined.labels.target_z),
+        (direct.labels.target_validity, joined.labels.target_validity),
+        (direct.labels.omega, joined.labels.omega),
+    )
+    for expected, actual in tensor_pairs:
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    assert joined_model.provenance == direct_model.provenance
+    assert joined_model.era.valid_times_utc == direct_model.era.valid_times_utc
+    assert joined_model.era.tp_intervals_utc == direct_model.era.tp_intervals_utc
+    assert joined_model.advection.context_channels_alias_condition_bank
+    assert (
+        joined_model.advection.causal.context_rate_mm_per_hour.data_ptr()
+        == joined_model.condition_bank.context.dynamic_fields[:, :, 0].data_ptr()
+    )
+
+
+def test_worker_sub_batch_join_does_not_repeat_value_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = make_grid()
+    samples = tuple(
+        make_sample(grid=grid, sample_id=f"sample-{index}", lead_hours=lead)
+        for index, lead in enumerate((0.5, 1.0, 1.5, 2.0))
+    )
+    collator = TrainingBatchCollator(grid, allow_test_override=True)
+    chunks = (collator(samples[:2]), collator(samples[2:]))
+    model = chunks[0].model
+    validated_types = {
+        type(model.condition_bank),
+        type(model.condition_bank.target),
+        type(model.condition_bank.context),
+        type(model.embedding),
+        type(model.era),
+        type(model.advection),
+        type(model.advection.causal),
+        type(model),
+        type(chunks[0].labels),
+    }
+
+    def repeated_validation(_self: object) -> None:
+        raise AssertionError("joined sub-batches repeated full value validation")
+
+    for validated_type in validated_types:
+        monkeypatch.setattr(validated_type, "__post_init__", repeated_validation)
+    joined = concatenate_training_batches(chunks)
+    assert joined.model.batch_size == 4
+    assert joined.model.provenance.sample_ids == tuple(
+        sample.sample_id for sample in samples
+    )
 
 
 def test_production_geometry_golden_spacing_and_orientation() -> None:

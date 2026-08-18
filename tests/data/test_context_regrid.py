@@ -129,6 +129,53 @@ def test_negative_valid_linear_rain_rate_is_rejected() -> None:
         operator.regrid(rate)
 
 
+def test_local_max_matches_bruteforce_support_maximum() -> None:
+    source_x = np.array([0.0, 1.0, 2.0, 4.0, 6.0])
+    source_y = np.array([0.0, 1.0, 3.0, 4.0, 6.0])
+    operator = build_context_regrid_operator(
+        source_x, source_y, destination_shape=(7, 7)
+    )
+    rng = np.random.default_rng(11103)
+    rate = rng.uniform(0.0, 30.0, size=operator.source_shape)
+    valid = np.ones(operator.source_shape, dtype=bool)
+    valid[3, 1] = False
+
+    def supports(weights):
+        return [
+            weights.indices[start:stop][weights.data[start:stop] > 0.0]
+            for start, stop in zip(weights.indptr[:-1], weights.indptr[1:], strict=True)
+        ]
+
+    x_supports = supports(operator.W_x)
+    y_supports = supports(operator.W_y)
+    for mask in (valid, np.ones_like(valid)):
+        masked = np.where(mask, rate, -np.inf)
+        expected = np.empty(operator.destination_shape)
+        for destination_y, rows in enumerate(y_supports):
+            for destination_x, columns in enumerate(x_supports):
+                expected[destination_y, destination_x] = masked[
+                    np.ix_(rows, columns)
+                ].max()
+        result = operator.regrid(rate, valid_mask=mask, detail_mode="local_max")
+        np.testing.assert_array_equal(result.detail_rate_mm_per_hour, expected)
+        np.testing.assert_array_equal(result.detail_valid, np.isfinite(expected))
+
+
+def test_all_valid_fraction_cache_matches_direct_operator_application() -> None:
+    source_x = np.array([0.0, 1.0, 2.0, 4.0, 6.0])
+    source_y = np.array([0.0, 1.0, 3.0, 4.0, 6.0])
+    operator = build_context_regrid_operator(
+        source_x, source_y, destination_shape=(7, 7)
+    )
+    expected = np.clip(
+        operator.apply_linear(np.ones(operator.source_shape)), 0.0, 1.0
+    )
+    result = operator.regrid(np.full(operator.source_shape, 2.0))
+    np.testing.assert_array_equal(result.valid_fraction, expected)
+    with pytest.raises(ValueError):
+        result.valid_fraction[0, 0] = 0.5
+
+
 def test_unsafe_boundary_extrapolation_is_rejected() -> None:
     with pytest.raises(ValueError, match="negative weights"):
         build_area_integrated_weights(

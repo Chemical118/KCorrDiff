@@ -220,6 +220,31 @@ def test_future_target_values_and_validity_remain_label_only() -> None:
     )
 
 
+def test_repeated_t0_reuses_context_without_rereading_conditions() -> None:
+    base = direct_row()
+    other_t0 = replace(
+        base,
+        global_example_index=1,
+        sample_id="next-day",
+        t0_utc="2022-01-02T00:00:00+00:00",
+    )
+    repeat = replace(
+        base, global_example_index=2, sample_id="repeat", lead_hours=1.0
+    )
+    cache = RecordingCache()
+    dataset = make_dataset(cache=cache, rows_override=[base, other_t0, repeat])
+
+    first = dataset[0]
+    second = dataset[1]
+    third = dataset[2]
+
+    condition_reads = [call for call in cache.calls if call[0] == "condition"]
+    assert len(condition_reads) == 2
+    assert condition_reads[0][1] != condition_reads[1][1]
+    assert third.conditions.context is first.conditions.context
+    assert second.conditions.context is not first.conditions.context
+
+
 def test_context_history_is_inverted_then_regridded_into_named_channels() -> None:
     # CPrecNet normalized 1/3 maps to exactly 1 mm/h.  An identity-grid
     # regrid must therefore emit 1, not the stored normalized value.
